@@ -494,10 +494,13 @@ use record::RecordDecoder;
 use std::io::BufRead;
 
 mod block;
-mod cursor;
+pub(crate) mod cursor;
 mod header;
 mod record;
 mod vlq;
+
+/// Pooled decoder for zero-allocation Avro decoding
+pub mod pooled_decoder;
 
 fn is_incomplete_data(err: &ArrowError) -> bool {
     matches!(
