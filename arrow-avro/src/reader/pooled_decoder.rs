@@ -20,6 +20,15 @@
 //! This module provides [`PooledRecordDecoder`] which decodes Avro data directly
 //! into pre-allocated memory buffers, eliminating memory allocation during the
 //! decoding hot path.
+//!
+//! ## Partial Row Rollback
+//!
+//! When decoding complex nested types, the buffer may run out of capacity mid-row.
+//! The decoder implements a checkpoint mechanism:
+//! 1. Save checkpoint before each row (cursor position + column positions)
+//! 2. On capacity exceeded → restore checkpoint
+//! 3. Flush complete rows only
+//! 4. Re-decode the incomplete row into fresh buffer
 
 use crate::buffer_provider::BufferProvider;
 use crate::codec::{AvroDataType, Codec};
@@ -29,6 +38,75 @@ use arrow_buffer::{i256, Buffer, IntervalMonthDayNano, OffsetBuffer, ScalarBuffe
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema, SchemaRef, UnionFields, UnionMode};
 use std::cmp::Ordering;
 use std::sync::Arc;
+
+/// Error indicating a row decode could not complete due to capacity limits
+#[derive(Debug)]
+pub struct CapacityExceededError {
+    /// Column that exceeded capacity
+    pub column_index: usize,
+    /// Bytes that would have been written
+    pub bytes_needed: usize,
+    /// Bytes available
+    pub bytes_available: usize,
+}
+
+impl std::fmt::Display for CapacityExceededError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Capacity exceeded in column {}: needed {} bytes, only {} available",
+            self.column_index, self.bytes_needed, self.bytes_available
+        )
+    }
+}
+
+/// Checkpoint state for partial row rollback
+#[derive(Debug, Clone)]
+struct RowCheckpoint {
+    /// Cursor position at row start (reserved for future cursor rollback)
+    #[allow(dead_code)]
+    cursor_position: usize,
+    /// Per-column data positions at row start
+    data_positions: Vec<usize>,
+    /// Per-column row counts at row start
+    row_counts: Vec<usize>,
+    /// Per-column nested state snapshots (simplified - just counts/offsets)
+    nested_snapshots: Vec<NestedSnapshot>,
+}
+
+/// Snapshot of nested state for rollback
+#[derive(Debug, Clone)]
+enum NestedSnapshot {
+    None,
+    Map {
+        map_offsets_len: usize,
+        key_offsets_len: usize,
+        key_data_len: usize,
+        value_offsets_len: usize,
+        value_data_len: usize,
+        total_entries: usize,
+    },
+    Union {
+        type_ids_len: usize,
+        offsets_len: Option<usize>,
+        child_data_lens: Vec<usize>,
+        child_offsets_lens: Vec<usize>,
+        child_counts: Vec<usize>,
+    },
+    List {
+        offsets_len: usize,
+        child_data_len: usize,
+        child_data_position: usize,
+        total_elements: usize,
+    },
+    Dictionary {
+        indices_len: usize,
+    },
+    Struct {
+        field_data_lens: Vec<usize>,
+        row_count: usize,
+    },
+}
 
 /// Decode big-endian two's complement bytes to i128
 fn decode_decimal_bytes_to_i128(bytes: &[u8]) -> i128 {
@@ -67,10 +145,11 @@ fn decode_decimal_bytes_to_i256(bytes: &[u8]) -> [u8; 32] {
 
 /// Nested type state for complex types (Map, List, Union, Struct, Dictionary)
 #[derive(Debug)]
+#[allow(dead_code)]
 enum NestedState {
     /// No nested state (primitive types)
     None,
-    /// Map type: keys (strings) and values with their nested state
+    /// Map type: keys (strings) and values - always uses Vec mode
     Map {
         /// Map offsets (one per row, tracking number of entries)
         map_offsets: Vec<i32>,
@@ -78,14 +157,16 @@ enum NestedState {
         key_offsets: Vec<i32>,
         /// Key data bytes
         key_data: Vec<u8>,
-        /// Value data - stored as raw bytes for primitive values
+        /// Value offsets for variable-length values
+        value_offsets: Vec<i32>,
+        /// Value data - stored as raw bytes
         value_data: Vec<u8>,
         /// Value type
         value_type: DataType,
         /// Current total entries
         total_entries: usize,
     },
-    /// Union type: type IDs and child data
+    /// Union type: type IDs and child data - always uses Vec mode
     Union {
         /// Type IDs for each row
         type_ids: Vec<i8>,
@@ -93,6 +174,8 @@ enum NestedState {
         offsets: Option<Vec<i32>>,
         /// Child data per variant (index by type_id)
         child_data: Vec<Vec<u8>>,
+        /// Child offsets per variant for variable-length types (Utf8/Binary)
+        child_offsets: Vec<Vec<i32>>,
         /// Child counts per variant
         child_counts: Vec<usize>,
         /// Union fields info
@@ -104,12 +187,16 @@ enum NestedState {
     List {
         /// List offsets
         offsets: Vec<i32>,
-        /// Child element data
+        /// Child element data (Vec for transitional, will migrate to pre-allocated)
         child_data: Vec<u8>,
+        /// Current position in child data (for pre-allocated buffer mode)
+        child_data_position: usize,
         /// Child element type
         child_type: DataType,
         /// Total elements
         total_elements: usize,
+        /// Whether to use pre-allocated buffers (vs Vec)
+        use_preallocated: bool,
     },
     /// Dictionary type: indices and dictionary values (for Avro enum)
     Dictionary {
@@ -118,10 +205,28 @@ enum NestedState {
         /// Dictionary values (enum symbols from schema)
         dictionary: Vec<String>,
     },
+    /// Struct type: nested fields with their own data buffers
+    Struct {
+        /// Field data stored per-field (each field has its own Vec<u8>)
+        field_data: Vec<Vec<u8>>,
+        /// Field types
+        field_types: Vec<DataType>,
+        /// Field names for building StructArray
+        field_names: Vec<String>,
+        /// Field nullability
+        field_nullable: Vec<bool>,
+        /// Row count for this struct
+        row_count: usize,
+        /// Current positions per field (for pre-allocated buffer mode)
+        field_positions: Vec<usize>,
+        /// Whether to use pre-allocated buffers (vs Vec)
+        use_preallocated: bool,
+    },
 }
 
 /// Column state for pooled decoding
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ColumnState {
     /// Column index in the schema
     column_index: usize,
@@ -138,8 +243,8 @@ struct ColumnState {
 }
 
 impl ColumnState {
-    fn new(column_index: usize, field: &Field) -> Self {
-        let nested = Self::create_nested_state(field.data_type());
+    fn new(column_index: usize, field: &Field, use_preallocated: bool) -> Self {
+        let nested = Self::create_nested_state(field.data_type(), use_preallocated);
         Self {
             column_index,
             data_type: field.data_type().clone(),
@@ -150,7 +255,7 @@ impl ColumnState {
         }
     }
 
-    fn create_nested_state(data_type: &DataType) -> NestedState {
+    fn create_nested_state(data_type: &DataType, use_preallocated: bool) -> NestedState {
         match data_type {
             DataType::Map(entries_field, _) => {
                 // Extract value type from map entries struct
@@ -166,6 +271,7 @@ impl ColumnState {
                     map_offsets: vec![0],
                     key_offsets: vec![0],
                     key_data: Vec::new(),
+                    value_offsets: vec![0],
                     value_data: Vec::new(),
                     value_type,
                     total_entries: 0,
@@ -177,6 +283,7 @@ impl ColumnState {
                     type_ids: Vec::new(),
                     offsets: if *mode == UnionMode::Dense { Some(Vec::new()) } else { None },
                     child_data: (0..num_variants).map(|_| Vec::new()).collect(),
+                    child_offsets: (0..num_variants).map(|_| vec![0]).collect(),
                     child_counts: vec![0; num_variants],
                     fields: fields.clone(),
                     mode: *mode,
@@ -186,8 +293,10 @@ impl ColumnState {
                 NestedState::List {
                     offsets: vec![0],
                     child_data: Vec::new(),
+                    child_data_position: 0,
                     child_type: child_field.data_type().clone(),
                     total_elements: 0,
+                    use_preallocated,
                 }
             }
             DataType::Dictionary(_, _) => {
@@ -196,6 +305,22 @@ impl ColumnState {
                 NestedState::Dictionary {
                     indices: Vec::new(),
                     dictionary: Vec::new(),
+                }
+            }
+            DataType::Struct(fields) => {
+                let num_fields = fields.len();
+                let field_data: Vec<Vec<u8>> = fields.iter().map(|_| Vec::new()).collect();
+                let field_types: Vec<DataType> = fields.iter().map(|f| f.data_type().clone()).collect();
+                let field_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
+                let field_nullable: Vec<bool> = fields.iter().map(|f| f.is_nullable()).collect();
+                NestedState::Struct {
+                    field_data,
+                    field_types,
+                    field_names,
+                    field_nullable,
+                    row_count: 0,
+                    field_positions: vec![0; num_fields],
+                    use_preallocated,
                 }
             }
             _ => NestedState::None,
@@ -208,16 +333,18 @@ impl ColumnState {
         // Reset nested state
         match &mut self.nested {
             NestedState::None => {}
-            NestedState::Map { map_offsets, key_offsets, key_data, value_data, total_entries, .. } => {
+            NestedState::Map { map_offsets, key_offsets, key_data, value_offsets, value_data, total_entries, .. } => {
                 map_offsets.clear();
                 map_offsets.push(0);
                 key_offsets.clear();
                 key_offsets.push(0);
                 key_data.clear();
+                value_offsets.clear();
+                value_offsets.push(0);
                 value_data.clear();
                 *total_entries = 0;
             }
-            NestedState::Union { type_ids, offsets, child_data, child_counts, .. } => {
+            NestedState::Union { type_ids, offsets, child_data, child_offsets, child_counts, .. } => {
                 type_ids.clear();
                 if let Some(off) = offsets {
                     off.clear();
@@ -225,19 +352,142 @@ impl ColumnState {
                 for data in child_data.iter_mut() {
                     data.clear();
                 }
+                for offs in child_offsets.iter_mut() {
+                    offs.clear();
+                    offs.push(0);
+                }
                 for count in child_counts.iter_mut() {
                     *count = 0;
                 }
             }
-            NestedState::List { offsets, child_data, total_elements, .. } => {
+            NestedState::List { offsets, child_data, child_data_position, total_elements, .. } => {
                 offsets.clear();
                 offsets.push(0);
                 child_data.clear();
+                *child_data_position = 0;
                 *total_elements = 0;
             }
             NestedState::Dictionary { indices, dictionary: _ } => {
                 // Keep dictionary values (they come from schema), clear indices
                 indices.clear();
+            }
+            NestedState::Struct { field_data, row_count, field_positions, .. } => {
+                for data in field_data.iter_mut() {
+                    data.clear();
+                }
+                *row_count = 0;
+                for pos in field_positions.iter_mut() {
+                    *pos = 0;
+                }
+            }
+        }
+    }
+
+    /// Create a snapshot of nested state for rollback
+    fn create_snapshot(&self) -> NestedSnapshot {
+        match &self.nested {
+            NestedState::None => NestedSnapshot::None,
+            NestedState::Map { map_offsets, key_offsets, key_data, value_offsets, value_data, total_entries, .. } => {
+                NestedSnapshot::Map {
+                    map_offsets_len: map_offsets.len(),
+                    key_offsets_len: key_offsets.len(),
+                    key_data_len: key_data.len(),
+                    value_offsets_len: value_offsets.len(),
+                    value_data_len: value_data.len(),
+                    total_entries: *total_entries,
+                }
+            }
+            NestedState::Union { type_ids, offsets, child_data, child_offsets, child_counts, .. } => {
+                NestedSnapshot::Union {
+                    type_ids_len: type_ids.len(),
+                    offsets_len: offsets.as_ref().map(|o| o.len()),
+                    child_data_lens: child_data.iter().map(|d| d.len()).collect(),
+                    child_offsets_lens: child_offsets.iter().map(|o| o.len()).collect(),
+                    child_counts: child_counts.clone(),
+                }
+            }
+            NestedState::List { offsets, child_data, child_data_position, total_elements, .. } => {
+                NestedSnapshot::List {
+                    offsets_len: offsets.len(),
+                    child_data_len: child_data.len(),
+                    child_data_position: *child_data_position,
+                    total_elements: *total_elements,
+                }
+            }
+            NestedState::Dictionary { indices, .. } => {
+                NestedSnapshot::Dictionary {
+                    indices_len: indices.len(),
+                }
+            }
+            NestedState::Struct { field_data, row_count, .. } => {
+                NestedSnapshot::Struct {
+                    field_data_lens: field_data.iter().map(|d| d.len()).collect(),
+                    row_count: *row_count,
+                }
+            }
+        }
+    }
+
+    /// Restore nested state from a snapshot
+    fn restore_snapshot(&mut self, snapshot: &NestedSnapshot) {
+        match (&mut self.nested, snapshot) {
+            (NestedState::None, NestedSnapshot::None) => {}
+            (
+                NestedState::Map { map_offsets, key_offsets, key_data, value_offsets, value_data, total_entries, .. },
+                NestedSnapshot::Map {
+                    map_offsets_len, key_offsets_len, key_data_len, value_offsets_len, value_data_len,
+                    total_entries: snap_entries,
+                }
+            ) => {
+                map_offsets.truncate(*map_offsets_len);
+                key_offsets.truncate(*key_offsets_len);
+                key_data.truncate(*key_data_len);
+                value_offsets.truncate(*value_offsets_len);
+                value_data.truncate(*value_data_len);
+                *total_entries = *snap_entries;
+            }
+            (
+                NestedState::Union { type_ids, offsets, child_data, child_offsets, child_counts, .. },
+                NestedSnapshot::Union { type_ids_len, offsets_len, child_data_lens, child_offsets_lens, child_counts: snap_counts }
+            ) => {
+                type_ids.truncate(*type_ids_len);
+                if let (Some(offs), Some(len)) = (offsets.as_mut(), offsets_len) {
+                    offs.truncate(*len);
+                }
+                for (data, len) in child_data.iter_mut().zip(child_data_lens.iter()) {
+                    data.truncate(*len);
+                }
+                for (offs, len) in child_offsets.iter_mut().zip(child_offsets_lens.iter()) {
+                    offs.truncate(*len);
+                }
+                child_counts.clone_from(snap_counts);
+            }
+            (
+                NestedState::List { offsets, child_data, child_data_position, total_elements, .. },
+                NestedSnapshot::List { offsets_len, child_data_len, child_data_position: snap_position, total_elements: snap_elements }
+            ) => {
+                offsets.truncate(*offsets_len);
+                child_data.truncate(*child_data_len);
+                *child_data_position = *snap_position;
+                *total_elements = *snap_elements;
+            }
+            (
+                NestedState::Dictionary { indices, .. },
+                NestedSnapshot::Dictionary { indices_len }
+            ) => {
+                indices.truncate(*indices_len);
+            }
+            (
+                NestedState::Struct { field_data, row_count, .. },
+                NestedSnapshot::Struct { field_data_lens, row_count: snap_count }
+            ) => {
+                for (data, len) in field_data.iter_mut().zip(field_data_lens.iter()) {
+                    data.truncate(*len);
+                }
+                *row_count = *snap_count;
+            }
+            _ => {
+                // Type mismatch - this shouldn't happen
             }
         }
     }
@@ -269,20 +519,38 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             .fields()
             .iter()
             .enumerate()
-            .map(|(idx, field)| ColumnState::new(idx, field.as_ref()))
+            .map(|(idx, field)| {
+                // Check if provider has child regions configured for this column
+                // List needs child_index 0 for element data
+                let use_preallocated = provider.has_child_region(idx, 0);
+                ColumnState::new(idx, field.as_ref(), use_preallocated)
+            })
             .collect();
 
-        Ok(Self {
+        let mut decoder = Self {
             schema,
             columns,
             provider,
             row_count: 0,
             max_rows,
-        })
+        };
+
+        // Initialize buffer offsets for nested types in Pooled mode
+        decoder.initialize_nested_offsets()?;
+
+        Ok(decoder)
+    }
+
+    /// Initialize buffer-based offsets for nested types in Pooled mode.
+    /// Map and Union use Vec mode, so no buffer initialization needed for them.
+    fn initialize_nested_offsets(&mut self) -> Result<(), ArrowError> {
+        // Map and Union use Vec mode - no buffer initialization needed
+        Ok(())
     }
 
     /// Create from an AvroDataType (for compatibility with existing API)
-    pub fn try_from_avro(data_type: &AvroDataType, provider: P) -> Result<Self, ArrowError> {
+    #[allow(dead_code)]
+    pub(crate) fn try_from_avro(data_type: &AvroDataType, provider: P) -> Result<Self, ArrowError> {
         match data_type.codec() {
             Codec::Struct(fields) => {
                 let arrow_fields: Vec<FieldRef> =
@@ -316,6 +584,1263 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         self.row_count < self.max_rows
     }
 
+    /// Check if schema is "flat" - all columns are fixed-size primitive types
+    /// This enables fast batch decoding without per-value overhead
+    fn is_flat_schema(&self) -> bool {
+        self.columns.iter().all(|col| {
+            matches!(
+                col.data_type,
+                DataType::Null
+                    | DataType::Boolean
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Date32
+                    | DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Timestamp(_, _)
+            ) && matches!(col.nested, NestedState::None)
+        })
+    }
+
+    /// Get the size in bytes for a fixed-size type (None for variable-length)
+    #[inline]
+    fn get_type_size(data_type: &DataType) -> Option<usize> {
+        match data_type {
+            DataType::Null => Some(0),
+            DataType::Boolean => Some(1), // 1 byte per boolean in packed format
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) | DataType::Float32 => Some(4),
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) | DataType::Float64 => Some(8),
+            _ => None,
+        }
+    }
+
+    /// Fast batch decode for flat schemas with only fixed-size types
+    /// Returns bytes consumed from buffer
+    fn decode_batch_flat(
+        &mut self,
+        buf: &[u8],
+        count: usize,
+    ) -> Result<usize, ArrowError> {
+        let rows_to_decode = count.min(self.max_rows - self.row_count);
+        if rows_to_decode == 0 {
+            return Ok(0);
+        }
+
+        let num_columns = self.columns.len();
+
+        // Build column metadata: (column_index, data_type, type_size, start_position, base_row_count)
+        // We clone data_type to avoid borrowing issues
+        let col_meta: Vec<(usize, DataType, usize, usize, usize)> = self.columns
+            .iter()
+            .map(|col| {
+                let type_size = Self::get_type_size(&col.data_type).unwrap_or(0);
+                (col.column_index, col.data_type.clone(), type_size, col.data_position, col.row_count)
+            })
+            .collect();
+
+        // Get raw pointers for all columns upfront - this avoids borrow checker issues
+        // since column regions don't overlap
+        let mut ptrs: Vec<Option<*mut u8>> = Vec::with_capacity(num_columns);
+        for (column_index, data_type, _, start_pos, _) in &col_meta {
+            if matches!(data_type, DataType::Null) {
+                ptrs.push(None);
+            } else if matches!(data_type, DataType::Boolean) {
+                // Boolean uses bit-packed storage from the beginning of the region
+                let (ptr, _) = self.provider.get_data_ptr(*column_index, 0)?;
+                ptrs.push(Some(ptr));
+            } else {
+                let (ptr, _) = self.provider.get_data_ptr(*column_index, *start_pos)?;
+                ptrs.push(Some(ptr));
+            }
+        }
+
+        // Now decode in a tight loop using raw pointer writes
+        let mut cursor = AvroCursor::new(buf);
+
+        for row in 0..rows_to_decode {
+            for col_idx in 0..num_columns {
+                let (_, ref data_type, type_size, _, base_row_count) = col_meta[col_idx];
+
+                match data_type {
+                    DataType::Null => {
+                        // Nothing to read or write
+                    }
+                    DataType::Boolean => {
+                        let value = cursor.get_bool()?;
+                        let base_row = base_row_count + row;
+                        let byte_idx = base_row / 8;
+                        let bit_idx = base_row % 8;
+                        if let Some(ptr) = ptrs[col_idx] {
+                            // SAFETY: byte_idx is within the allocated bitmap region
+                            unsafe {
+                                let byte_ptr = ptr.add(byte_idx);
+                                if value {
+                                    *byte_ptr |= 1 << bit_idx;
+                                }
+                            }
+                        }
+                    }
+                    DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
+                        let value = cursor.get_int()?;
+                        if let Some(ptr) = ptrs[col_idx] {
+                            // SAFETY: offset is within the allocated region
+                            unsafe {
+                                let dest = ptr.add(row * type_size);
+                                std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), dest, 4);
+                            }
+                        }
+                    }
+                    DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => {
+                        let value = cursor.get_long()?;
+                        if let Some(ptr) = ptrs[col_idx] {
+                            // SAFETY: offset is within the allocated region
+                            unsafe {
+                                let dest = ptr.add(row * type_size);
+                                std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), dest, 8);
+                            }
+                        }
+                    }
+                    DataType::Float32 => {
+                        let value = cursor.get_float()?;
+                        if let Some(ptr) = ptrs[col_idx] {
+                            // SAFETY: offset is within the allocated region
+                            unsafe {
+                                let dest = ptr.add(row * type_size);
+                                std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), dest, 4);
+                            }
+                        }
+                    }
+                    DataType::Float64 => {
+                        let value = cursor.get_double()?;
+                        if let Some(ptr) = ptrs[col_idx] {
+                            // SAFETY: offset is within the allocated region
+                            unsafe {
+                                let dest = ptr.add(row * type_size);
+                                std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), dest, 8);
+                            }
+                        }
+                    }
+                    _ => {
+                        // Should not happen for flat schema
+                        return Err(ArrowError::InvalidArgumentError(
+                            "Non-flat type in batch decode".to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Update column positions and counts
+        for (col_idx, (_, _, type_size, _, _)) in col_meta.iter().enumerate() {
+            self.columns[col_idx].data_position += rows_to_decode * type_size;
+            self.columns[col_idx].row_count += rows_to_decode;
+        }
+        self.row_count += rows_to_decode;
+
+        Ok(cursor.position())
+    }
+
+    /// Check if schema has only simple types (fixed + variable-length primitives, no nested)
+    fn is_simple_schema(&self) -> bool {
+        self.columns.iter().all(|col| {
+            matches!(
+                col.data_type,
+                DataType::Null
+                    | DataType::Boolean
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::Date32
+                    | DataType::Time32(_)
+                    | DataType::Time64(_)
+                    | DataType::Timestamp(_, _)
+                    | DataType::Utf8
+                    | DataType::Binary
+                    | DataType::FixedSizeBinary(_)
+            ) && matches!(col.nested, NestedState::None)
+        })
+    }
+
+    /// Check if schema has only string/binary columns (no fixed types)
+    fn is_strings_only_schema(&self) -> bool {
+        self.columns.iter().all(|col| {
+            matches!(col.data_type, DataType::Utf8 | DataType::Binary)
+                && matches!(col.nested, NestedState::None)
+        })
+    }
+
+    /// Check if schema has only Dictionary columns (Avro enums)
+    fn is_dictionary_only_schema(&self) -> bool {
+        self.columns.iter().all(|col| {
+            matches!(col.nested, NestedState::Dictionary { .. })
+        })
+    }
+
+    /// Check if schema is a "simple nested" schema - can be batch processed
+    /// This includes flat types + Dictionary (enum) types
+    fn is_simple_nested_schema(&self) -> bool {
+        self.columns.iter().all(|col| {
+            match &col.nested {
+                NestedState::None => matches!(
+                    col.data_type,
+                    DataType::Null
+                        | DataType::Boolean
+                        | DataType::Int32
+                        | DataType::Int64
+                        | DataType::Float32
+                        | DataType::Float64
+                        | DataType::Date32
+                        | DataType::Time32(_)
+                        | DataType::Time64(_)
+                        | DataType::Timestamp(_, _)
+                        | DataType::Utf8
+                        | DataType::Binary
+                        | DataType::FixedSizeBinary(_)
+                ),
+                NestedState::Dictionary { .. } => true,
+                _ => false,
+            }
+        })
+    }
+
+    /// Batch decode for Dictionary-only schemas (Avro enums)
+    /// Enums are just varints, so this is very fast
+    #[inline(always)]
+    fn decode_batch_dictionary_only(
+        &mut self,
+        buf: &[u8],
+        count: usize,
+    ) -> Result<usize, ArrowError> {
+        let total_rows = count.min(self.max_rows - self.row_count);
+        if total_rows == 0 {
+            return Ok(0);
+        }
+
+        let num_columns = self.columns.len();
+        let mut cursor = AvroCursor::new(buf);
+
+        // Tight decode loop for enums
+        for _ in 0..total_rows {
+            for col_idx in 0..num_columns {
+                let index = cursor.get_int()?;
+                if let NestedState::Dictionary { indices, .. } = &mut self.columns[col_idx].nested {
+                    indices.push(index);
+                }
+                self.columns[col_idx].row_count += 1;
+            }
+        }
+
+        self.row_count += total_rows;
+        Ok(cursor.position())
+    }
+
+    /// Batch decode for "simple nested" schemas - flat types + Dictionary
+    /// Uses raw pointers for fixed types and Vec for dictionary indices
+    #[inline(always)]
+    fn decode_batch_simple_nested(
+        &mut self,
+        buf: &[u8],
+        count: usize,
+    ) -> Result<usize, ArrowError> {
+        let total_rows = count.min(self.max_rows - self.row_count);
+        if total_rows == 0 {
+            return Ok(0);
+        }
+
+        let num_columns = self.columns.len();
+        let mut cursor = AvroCursor::new(buf);
+
+        // Classify columns once - distinguish varint vs fixed encoding
+        #[derive(Clone, Copy)]
+        enum ColKind {
+            Int32,       // Varint -> 4 bytes output
+            Int64,       // Varint -> 8 bytes output
+            Float32,     // Fixed 4 bytes
+            Float64,     // Fixed 8 bytes
+            Boolean,     // 1 byte -> 4 bytes output (for BooleanArray stored as bytes)
+            FixedBytes { size: usize }, // Fixed-size binary
+            String,
+            Binary,
+            Dictionary,
+            Null,
+        }
+
+        let mut col_kinds: Vec<ColKind> = Vec::with_capacity(num_columns);
+        for col in &self.columns {
+            let kind = match &col.nested {
+                NestedState::Dictionary { .. } => ColKind::Dictionary,
+                NestedState::None => match &col.data_type {
+                    DataType::Boolean => ColKind::Boolean,
+                    DataType::Int32 | DataType::Date32 | DataType::Time32(_) => ColKind::Int32,
+                    DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => ColKind::Int64,
+                    DataType::Float32 => ColKind::Float32,
+                    DataType::Float64 => ColKind::Float64,
+                    DataType::Utf8 => ColKind::String,
+                    DataType::Binary => ColKind::Binary,
+                    DataType::FixedSizeBinary(n) => ColKind::FixedBytes { size: *n as usize },
+                    DataType::Null => ColKind::Null,
+                    _ => ColKind::Int64, // Fallback to varint
+                },
+                _ => return Err(ArrowError::InvalidArgumentError(
+                    "decode_batch_simple_nested called with unsupported nested type".to_string(),
+                )),
+            };
+            col_kinds.push(kind);
+        }
+
+        // Pre-compute column indices
+        let column_indices: Vec<usize> = self.columns.iter().map(|c| c.column_index).collect();
+
+        // Process in mini-batches
+        let mut rows_processed = 0;
+        while rows_processed < total_rows {
+            let batch_rows = (total_rows - rows_processed).min(Self::BATCH_SIZE);
+
+            // Get pointers for fixed and string columns
+            let mut data_ptrs: Vec<Option<*mut u8>> = Vec::with_capacity(num_columns);
+            let mut offsets_ptrs: Vec<Option<*mut u8>> = Vec::with_capacity(num_columns);
+            let mut data_capacities: Vec<usize> = Vec::with_capacity(num_columns);
+            let mut base_data_positions: Vec<usize> = Vec::with_capacity(num_columns);
+
+            for (col_idx, &column_index) in column_indices.iter().enumerate() {
+                match col_kinds[col_idx] {
+                    ColKind::Boolean => {
+                        // Boolean uses bit-packed storage from beginning of region
+                        let col = &self.columns[col_idx];
+                        let (data_ptr, cap) = self.provider.get_data_ptr(column_index, 0)?;
+                        data_ptrs.push(Some(data_ptr));
+                        offsets_ptrs.push(None);
+                        data_capacities.push(cap);
+                        base_data_positions.push(col.row_count); // Store base row count for bit indexing
+                    }
+                    ColKind::Int32 | ColKind::Int64 | ColKind::Float32 | ColKind::Float64
+                    | ColKind::FixedBytes { .. } => {
+                        let col = &self.columns[col_idx];
+                        let (data_ptr, cap) = self.provider.get_data_ptr(column_index, col.data_position)?;
+                        data_ptrs.push(Some(data_ptr));
+                        offsets_ptrs.push(None);
+                        data_capacities.push(cap);
+                        base_data_positions.push(0); // Not used for fixed types
+                    }
+                    ColKind::String | ColKind::Binary => {
+                        let col = &self.columns[col_idx];
+                        let (data_ptr, cap) = self.provider.get_data_ptr(column_index, col.data_position)?;
+                        let offsets_pos = (col.row_count + 1) * 4;
+                        let offsets_slice = self.provider.get_offsets_slice(column_index, offsets_pos, batch_rows * 4)?;
+                        data_ptrs.push(Some(data_ptr));
+                        offsets_ptrs.push(Some(offsets_slice.as_mut_ptr()));
+                        data_capacities.push(cap);
+                        base_data_positions.push(col.data_position); // Track base position for offset calculation
+                    }
+                    ColKind::Dictionary | ColKind::Null => {
+                        data_ptrs.push(None);
+                        offsets_ptrs.push(None);
+                        data_capacities.push(0);
+                        base_data_positions.push(0);
+                    }
+                }
+            }
+
+            // Track positions within this batch
+            let mut fixed_offsets: Vec<usize> = vec![0; num_columns];
+            let mut var_data_offsets: Vec<usize> = vec![0; num_columns];
+
+            // Decode batch
+            for row in 0..batch_rows {
+                for col_idx in 0..num_columns {
+                    match col_kinds[col_idx] {
+                        ColKind::Null => {
+                            // Skip - nothing to read or write
+                        }
+                        ColKind::Boolean => {
+                            let val = cursor.get_bool()?;
+                            // Bit-packed boolean storage
+                            let base_row = base_data_positions[col_idx] + row;
+                            let byte_idx = base_row / 8;
+                            let bit_idx = base_row % 8;
+                            unsafe {
+                                let byte_ptr = data_ptrs[col_idx].unwrap().add(byte_idx);
+                                if val {
+                                    *byte_ptr |= 1 << bit_idx;
+                                }
+                            }
+                        }
+                        ColKind::Int32 => {
+                            let val = cursor.get_int()?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), dest, 4);
+                            }
+                            fixed_offsets[col_idx] += 4;
+                        }
+                        ColKind::Int64 => {
+                            let val = cursor.get_long()?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), dest, 8);
+                            }
+                            fixed_offsets[col_idx] += 8;
+                        }
+                        ColKind::Float32 => {
+                            let bytes = cursor.get_fixed(4)?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, 4);
+                            }
+                            fixed_offsets[col_idx] += 4;
+                        }
+                        ColKind::Float64 => {
+                            let bytes = cursor.get_fixed(8)?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, 8);
+                            }
+                            fixed_offsets[col_idx] += 8;
+                        }
+                        ColKind::FixedBytes { size } => {
+                            let bytes = cursor.get_fixed(size)?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, size);
+                            }
+                            fixed_offsets[col_idx] += size;
+                        }
+                        ColKind::String | ColKind::Binary => {
+                            let bytes = cursor.get_bytes()?;
+                            let len = bytes.len();
+                            let current_offset = var_data_offsets[col_idx];
+
+                            if current_offset + len > data_capacities[col_idx] {
+                                return Err(ArrowError::InvalidArgumentError(format!(
+                                    "Capacity exceeded for column {}", col_idx
+                                )));
+                            }
+
+                            // Write data
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(current_offset);
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
+                            }
+
+                            // Write offset - must be absolute position (base + batch_offset + len)
+                            let new_end = (base_data_positions[col_idx] + current_offset + len) as i32;
+                            unsafe {
+                                let offsets_ptr = offsets_ptrs[col_idx].unwrap().add(row * 4);
+                                std::ptr::copy_nonoverlapping(new_end.to_le_bytes().as_ptr(), offsets_ptr, 4);
+                            }
+                            var_data_offsets[col_idx] = current_offset + len;
+                        }
+                        ColKind::Dictionary => {
+                            let index = cursor.get_int()?;
+                            if let NestedState::Dictionary { indices, .. } = &mut self.columns[col_idx].nested {
+                                indices.push(index);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Update positions and row_count AFTER processing entire batch
+            for col_idx in 0..num_columns {
+                match col_kinds[col_idx] {
+                    ColKind::Int32 | ColKind::Float32 => {
+                        self.columns[col_idx].data_position += 4 * batch_rows;
+                    }
+                    ColKind::Int64 | ColKind::Float64 => {
+                        self.columns[col_idx].data_position += 8 * batch_rows;
+                    }
+                    ColKind::Boolean => {
+                        // Boolean uses bit-packing, no data_position update needed
+                    }
+                    ColKind::FixedBytes { size } => {
+                        self.columns[col_idx].data_position += size * batch_rows;
+                    }
+                    ColKind::String | ColKind::Binary => {
+                        self.columns[col_idx].data_position += var_data_offsets[col_idx];
+                    }
+                    ColKind::Dictionary | ColKind::Null => {}
+                }
+                self.columns[col_idx].row_count += batch_rows;
+            }
+
+            rows_processed += batch_rows;
+        }
+
+        self.row_count += total_rows;
+        Ok(cursor.position())
+    }
+
+    /// Universal batch decode for schemas with complex nested types (List, Map, Union, Struct)
+    /// Uses pre-fetched pointers and inlined complex type decoding for optimal performance.
+    #[inline(always)]
+    fn decode_batch_universal(
+        &mut self,
+        buf: &[u8],
+        count: usize,
+    ) -> Result<usize, ArrowError> {
+        let total_rows = count.min(self.max_rows - self.row_count);
+        if total_rows == 0 {
+            return Ok(0);
+        }
+
+        let num_columns = self.columns.len();
+        let mut cursor = AvroCursor::new(buf);
+
+        // Pre-classify column types for efficient dispatch
+        #[derive(Clone)]
+        enum ColKind {
+            Null,
+            Boolean,
+            Int32,
+            Int64,
+            Float32,
+            Float64,
+            String,
+            Binary,
+            FixedBytes { size: usize },
+            Dictionary,
+            List { child_type: DataType, fixed_elem_size: Option<usize>, use_preallocated: bool },
+            Map { value_type: DataType },
+            Union { num_variants: usize, field_type_ids: Vec<i8>, child_types: Vec<DataType> },
+            Struct { field_types: Vec<DataType>, use_preallocated: bool },
+        }
+
+        // Pre-extract type info from nested state to avoid repeated pattern matching
+        let col_kinds: Vec<ColKind> = self.columns.iter().map(|col| {
+            match &col.nested {
+                NestedState::Dictionary { .. } => ColKind::Dictionary,
+                NestedState::List { child_type, use_preallocated, .. } => {
+                    let fixed_elem_size = Self::get_fixed_element_size(child_type);
+                    ColKind::List { child_type: child_type.clone(), fixed_elem_size, use_preallocated: *use_preallocated }
+                }
+                NestedState::Map { value_type, .. } => {
+                    ColKind::Map { value_type: value_type.clone() }
+                }
+                NestedState::Union { fields, .. } => {
+                    let field_type_ids: Vec<i8> = fields.iter().map(|(id, _)| id).collect();
+                    let child_types: Vec<DataType> = fields.iter().map(|(_, f)| f.data_type().clone()).collect();
+                    ColKind::Union { num_variants: fields.len(), field_type_ids, child_types }
+                }
+                NestedState::Struct { field_types, use_preallocated, .. } => ColKind::Struct { field_types: field_types.clone(), use_preallocated: *use_preallocated },
+                NestedState::None => match &col.data_type {
+                    DataType::Null => ColKind::Null,
+                    DataType::Boolean => ColKind::Boolean,
+                    DataType::Int32 | DataType::Date32 | DataType::Time32(_) => ColKind::Int32,
+                    DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => ColKind::Int64,
+                    DataType::Float32 => ColKind::Float32,
+                    DataType::Float64 => ColKind::Float64,
+                    DataType::Utf8 => ColKind::String,
+                    DataType::Binary => ColKind::Binary,
+                    DataType::FixedSizeBinary(n) => ColKind::FixedBytes { size: *n as usize },
+                    _ => ColKind::Int64, // Fallback
+                },
+            }
+        }).collect();
+
+        // Pre-compute column indices
+        let column_indices: Vec<usize> = self.columns.iter().map(|c| c.column_index).collect();
+
+        // Process in mini-batches for better cache efficiency
+        let mut rows_processed = 0;
+        while rows_processed < total_rows {
+            let batch_rows = (total_rows - rows_processed).min(Self::BATCH_SIZE);
+
+            // Pre-fetch pointers for primitive columns in this batch
+            let mut data_ptrs: Vec<Option<*mut u8>> = Vec::with_capacity(num_columns);
+            let mut offsets_ptrs: Vec<Option<*mut u8>> = Vec::with_capacity(num_columns);
+            let mut data_capacities: Vec<usize> = Vec::with_capacity(num_columns);
+            let mut base_data_positions: Vec<usize> = Vec::with_capacity(num_columns);
+            let mut base_row_counts: Vec<usize> = Vec::with_capacity(num_columns);
+
+            for (col_idx, &column_index) in column_indices.iter().enumerate() {
+                match &col_kinds[col_idx] {
+                    ColKind::Boolean => {
+                        let (data_ptr, cap) = self.provider.get_data_ptr(column_index, 0)?;
+                        data_ptrs.push(Some(data_ptr));
+                        offsets_ptrs.push(None);
+                        data_capacities.push(cap);
+                        base_data_positions.push(0);
+                        base_row_counts.push(self.columns[col_idx].row_count);
+                    }
+                    ColKind::Int32 | ColKind::Int64 | ColKind::Float32 | ColKind::Float64
+                    | ColKind::FixedBytes { .. } => {
+                        let col = &self.columns[col_idx];
+                        let (data_ptr, cap) = self.provider.get_data_ptr(column_index, col.data_position)?;
+                        data_ptrs.push(Some(data_ptr));
+                        offsets_ptrs.push(None);
+                        data_capacities.push(cap);
+                        base_data_positions.push(0);
+                        base_row_counts.push(col.row_count);
+                    }
+                    ColKind::String | ColKind::Binary => {
+                        let col = &self.columns[col_idx];
+                        let (data_ptr, cap) = self.provider.get_data_ptr(column_index, col.data_position)?;
+                        let offsets_pos = (col.row_count + 1) * 4;
+                        let offsets_slice = self.provider.get_offsets_slice(column_index, offsets_pos, batch_rows * 4)?;
+                        data_ptrs.push(Some(data_ptr));
+                        offsets_ptrs.push(Some(offsets_slice.as_mut_ptr()));
+                        data_capacities.push(cap);
+                        base_data_positions.push(col.data_position);
+                        base_row_counts.push(col.row_count);
+                    }
+                    ColKind::Null | ColKind::Dictionary | ColKind::List { .. } | ColKind::Map { .. }
+                    | ColKind::Union { .. } | ColKind::Struct { .. } => {
+                        data_ptrs.push(None);
+                        offsets_ptrs.push(None);
+                        data_capacities.push(0);
+                        base_data_positions.push(0);
+                        base_row_counts.push(self.columns[col_idx].row_count);
+                    }
+                }
+            }
+
+            // Track offsets within this batch for primitive columns
+            let mut fixed_offsets: Vec<usize> = vec![0; num_columns];
+            let mut var_data_offsets: Vec<usize> = vec![0; num_columns];
+
+            // Tight decode loop
+            for row in 0..batch_rows {
+                for col_idx in 0..num_columns {
+                    match &col_kinds[col_idx] {
+                        ColKind::Null => {}
+                        ColKind::Boolean => {
+                            let val = cursor.get_bool()?;
+                            let base_row = base_row_counts[col_idx] + row;
+                            let byte_idx = base_row / 8;
+                            let bit_idx = base_row % 8;
+                            unsafe {
+                                let byte_ptr = data_ptrs[col_idx].unwrap().add(byte_idx);
+                                if val { *byte_ptr |= 1 << bit_idx; }
+                            }
+                        }
+                        ColKind::Int32 => {
+                            let val = cursor.get_int()?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), dest, 4);
+                            }
+                            fixed_offsets[col_idx] += 4;
+                        }
+                        ColKind::Int64 => {
+                            let val = cursor.get_long()?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(val.to_le_bytes().as_ptr(), dest, 8);
+                            }
+                            fixed_offsets[col_idx] += 8;
+                        }
+                        ColKind::Float32 => {
+                            let bytes = cursor.get_fixed(4)?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, 4);
+                            }
+                            fixed_offsets[col_idx] += 4;
+                        }
+                        ColKind::Float64 => {
+                            let bytes = cursor.get_fixed(8)?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, 8);
+                            }
+                            fixed_offsets[col_idx] += 8;
+                        }
+                        ColKind::FixedBytes { size } => {
+                            let bytes = cursor.get_fixed(*size)?;
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, *size);
+                            }
+                            fixed_offsets[col_idx] += size;
+                        }
+                        ColKind::String | ColKind::Binary => {
+                            let bytes = cursor.get_bytes()?;
+                            let len = bytes.len();
+                            let current_offset = var_data_offsets[col_idx];
+                            if current_offset + len > data_capacities[col_idx] {
+                                return Err(ArrowError::InvalidArgumentError(format!(
+                                    "Capacity exceeded for column {}", col_idx
+                                )));
+                            }
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(current_offset);
+                                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
+                            }
+                            let new_end = (base_data_positions[col_idx] + current_offset + len) as i32;
+                            unsafe {
+                                let offsets_ptr = offsets_ptrs[col_idx].unwrap().add(row * 4);
+                                std::ptr::copy_nonoverlapping(new_end.to_le_bytes().as_ptr(), offsets_ptr, 4);
+                            }
+                            var_data_offsets[col_idx] = current_offset + len;
+                        }
+                        ColKind::Dictionary => {
+                            // Inlined dictionary decode
+                            let index = cursor.get_int()?;
+                            if let NestedState::Dictionary { indices, .. } = &mut self.columns[col_idx].nested {
+                                indices.push(index);
+                            }
+                            self.columns[col_idx].row_count += 1;
+                        }
+                        ColKind::List { child_type, fixed_elem_size, use_preallocated } => {
+                            // Inlined list decode - read blocks until 0 count
+                            let mut elements_in_row = 0usize;
+                            loop {
+                                let block_count = cursor.get_long()?;
+                                if block_count == 0 { break; }
+                                let count = if block_count < 0 {
+                                    let _size = cursor.get_long()?;
+                                    (-block_count) as usize
+                                } else {
+                                    block_count as usize
+                                };
+
+                                if *use_preallocated {
+                                    // Pre-allocated path: decode directly into provider's child region
+                                    let provider_col_idx = column_indices[col_idx];
+                                    if let NestedState::List { child_data_position, .. } = &mut self.columns[col_idx].nested {
+                                        if let Some(elem_size) = fixed_elem_size {
+                                            // Fixed-size elements directly into pre-allocated buffer
+                                            let needed = count * elem_size;
+                                            let pos = *child_data_position;
+                                            let slice = self.provider.get_child_data_slice(provider_col_idx, 0, pos, needed)?;
+                                            Self::decode_fixed_elements_batch(child_type, &mut cursor, slice, count, *elem_size)?;
+                                            *child_data_position += needed;
+                                        } else {
+                                            // Variable-length elements - decode each
+                                            for _ in 0..count {
+                                                let pos = *child_data_position;
+                                                let bytes = cursor.get_bytes()?;
+                                                let slice = self.provider.get_child_data_slice(provider_col_idx, 0, pos, bytes.len())?;
+                                                slice.copy_from_slice(bytes);
+                                                *child_data_position += bytes.len();
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Vec fallback path
+                                    if let NestedState::List { child_data, .. } = &mut self.columns[col_idx].nested {
+                                        if let Some(elem_size) = fixed_elem_size {
+                                            // Fast path: fixed-size elements
+                                            let old_len = child_data.len();
+                                            child_data.reserve(count * elem_size);
+                                            unsafe { child_data.set_len(old_len + count * elem_size); }
+                                            Self::decode_fixed_elements_batch(child_type, &mut cursor, &mut child_data[old_len..], count, *elem_size)?;
+                                        } else {
+                                            // Variable-length elements
+                                            for _ in 0..count {
+                                                Self::decode_value_to_vec(child_type, &mut cursor, child_data)?;
+                                            }
+                                        }
+                                    }
+                                }
+                                elements_in_row += count;
+                            }
+                            // Update offsets
+                            if let NestedState::List { offsets, total_elements, .. } = &mut self.columns[col_idx].nested {
+                                *total_elements += elements_in_row;
+                                offsets.push(*total_elements as i32);
+                            }
+                            self.columns[col_idx].row_count += 1;
+                        }
+                        ColKind::Map { value_type, .. } => {
+                            // Map decode using Vec mode (more efficient for nested types)
+                            let mut entries_in_row = 0usize;
+                            loop {
+                                let block_count = cursor.get_long()?;
+                                if block_count == 0 { break; }
+                                let count = if block_count < 0 {
+                                    let _size = cursor.get_long()?;
+                                    (-block_count) as usize
+                                } else {
+                                    block_count as usize
+                                };
+
+                                if let NestedState::Map { key_offsets, key_data, value_offsets, value_data, .. } = &mut self.columns[col_idx].nested {
+                                    let needs_value_offsets = matches!(value_type, DataType::Utf8 | DataType::Binary);
+                                    for _ in 0..count {
+                                        let key_bytes = cursor.get_bytes()?;
+                                        key_data.extend_from_slice(key_bytes);
+                                        key_offsets.push(key_data.len() as i32);
+                                        Self::decode_value_to_vec(value_type, &mut cursor, value_data)?;
+                                        // Track offsets for variable-length value types
+                                        if needs_value_offsets {
+                                            value_offsets.push(value_data.len() as i32);
+                                        }
+                                    }
+                                }
+                                entries_in_row += count;
+                            }
+                            if let NestedState::Map { map_offsets, total_entries, .. } = &mut self.columns[col_idx].nested {
+                                *total_entries += entries_in_row;
+                                map_offsets.push(*total_entries as i32);
+                            }
+                            self.columns[col_idx].row_count += 1;
+                        }
+                        ColKind::Union { num_variants, field_type_ids, child_types } => {
+                            // Union decode using Vec mode with O(1) lookups
+                            let type_index = cursor.get_long()? as usize;
+                            if type_index >= *num_variants {
+                                return Err(ArrowError::ParseError(format!(
+                                    "Union type index {} out of bounds", type_index
+                                )));
+                            }
+
+                            // O(1) lookup from pre-extracted arrays
+                            let field_type_id = field_type_ids[type_index];
+                            let child_type = &child_types[type_index];
+
+                            if let NestedState::Union { type_ids, offsets, child_data, child_counts, .. } = &mut self.columns[col_idx].nested {
+                                type_ids.push(field_type_id);
+                                if let Some(offs) = offsets {
+                                    offs.push(child_counts[type_index] as i32);
+                                }
+                                Self::decode_value_to_vec(child_type, &mut cursor, &mut child_data[type_index])?;
+                                child_counts[type_index] += 1;
+                            }
+                            self.columns[col_idx].row_count += 1;
+                        }
+                        ColKind::Struct { field_types, use_preallocated } => {
+                            // Inlined struct decode
+                            if *use_preallocated {
+                                // Pre-allocated path: decode each field into provider's child region
+                                // child_index maps to field_idx for Struct fields
+                                let provider_col_idx = column_indices[col_idx];
+                                if let NestedState::Struct { row_count, field_positions, .. } = &mut self.columns[col_idx].nested {
+                                    for (field_idx, field_type) in field_types.iter().enumerate() {
+                                        let pos = field_positions[field_idx];
+                                        let value_size = Self::get_fixed_element_size(field_type);
+                                        if let Some(fixed_size) = value_size {
+                                            // Fixed-size field
+                                            let slice = self.provider.get_child_data_slice(provider_col_idx, field_idx, pos, fixed_size)?;
+                                            Self::decode_fixed_elements_batch(field_type, &mut cursor, slice, 1, fixed_size)?;
+                                            field_positions[field_idx] += fixed_size;
+                                        } else {
+                                            // Variable-length field
+                                            let bytes = cursor.get_bytes()?;
+                                            let slice = self.provider.get_child_data_slice(provider_col_idx, field_idx, pos, bytes.len())?;
+                                            slice.copy_from_slice(bytes);
+                                            field_positions[field_idx] += bytes.len();
+                                        }
+                                    }
+                                    *row_count += 1;
+                                }
+                            } else {
+                                // Vec fallback path
+                                if let NestedState::Struct { field_data, row_count, .. } = &mut self.columns[col_idx].nested {
+                                    for (field_idx, field_type) in field_types.iter().enumerate() {
+                                        Self::decode_value_to_vec(field_type, &mut cursor, &mut field_data[field_idx])?;
+                                    }
+                                    *row_count += 1;
+                                }
+                            }
+                            self.columns[col_idx].row_count += 1;
+                        }
+                    }
+                }
+            }
+
+            // Update positions and row counts after processing batch
+            for col_idx in 0..num_columns {
+                match &col_kinds[col_idx] {
+                    ColKind::Int32 | ColKind::Float32 => {
+                        self.columns[col_idx].data_position += 4 * batch_rows;
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    ColKind::Int64 | ColKind::Float64 => {
+                        self.columns[col_idx].data_position += 8 * batch_rows;
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    ColKind::Boolean => {
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    ColKind::FixedBytes { size } => {
+                        self.columns[col_idx].data_position += size * batch_rows;
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    ColKind::String | ColKind::Binary => {
+                        self.columns[col_idx].data_position += var_data_offsets[col_idx];
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    ColKind::Null => {
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    // Complex types update row_count inline
+                    ColKind::Dictionary | ColKind::List { .. } | ColKind::Map { .. }
+                    | ColKind::Union { .. } | ColKind::Struct { .. } => {}
+                }
+            }
+
+            self.row_count += batch_rows;
+            rows_processed += batch_rows;
+        }
+
+        Ok(cursor.position())
+    }
+
+    /// Batch decode for schemas with mixed fixed and variable-length types
+    /// Processes in mini-batches of BATCH_SIZE rows for efficient pointer management
+    const BATCH_SIZE: usize = 1024;
+
+    /// Ultra-fast batch decode for string-only schemas
+    /// Optimized tight loop without type dispatch overhead
+    #[inline(always)]
+    fn decode_batch_strings_only(
+        &mut self,
+        buf: &[u8],
+        count: usize,
+    ) -> Result<usize, ArrowError> {
+        let total_rows = count.min(self.max_rows - self.row_count);
+        if total_rows == 0 {
+            return Ok(0);
+        }
+
+        let num_columns = self.columns.len();
+        let mut cursor = AvroCursor::new(buf);
+
+        // Pre-compute column info once (not per-batch)
+        let column_indices: Vec<usize> = self.columns.iter().map(|c| c.column_index).collect();
+
+        // Process in mini-batches
+        let mut rows_processed = 0;
+        while rows_processed < total_rows {
+            let batch_rows = (total_rows - rows_processed).min(Self::BATCH_SIZE);
+
+            // Get pointers for this batch - minimal overhead
+            let mut data_ptrs: Vec<*mut u8> = Vec::with_capacity(num_columns);
+            let mut offsets_ptrs: Vec<*mut u8> = Vec::with_capacity(num_columns);
+            let mut data_capacities: Vec<usize> = Vec::with_capacity(num_columns);
+            let mut base_data_positions: Vec<usize> = Vec::with_capacity(num_columns);
+
+            for (col_idx, &column_index) in column_indices.iter().enumerate() {
+                let col = &self.columns[col_idx];
+                let (data_ptr, data_cap) = self.provider.get_data_ptr(column_index, col.data_position)?;
+                data_ptrs.push(data_ptr);
+                data_capacities.push(data_cap);
+                base_data_positions.push(col.data_position);
+
+                let offsets_pos = (col.row_count + 1) * 4;
+                let offsets_slice = self.provider.get_offsets_slice(column_index, offsets_pos, batch_rows * 4)?;
+                offsets_ptrs.push(offsets_slice.as_mut_ptr());
+            }
+
+            // Track positions within batch
+            let mut var_data_offsets: Vec<usize> = vec![0; num_columns];
+
+            // Tight decode loop - no type dispatch needed
+            for row in 0..batch_rows {
+                for col_idx in 0..num_columns {
+                    let bytes = cursor.get_bytes()?;
+                    let len = bytes.len();
+                    let current_offset = var_data_offsets[col_idx];
+
+                    // Check capacity
+                    if current_offset + len > data_capacities[col_idx] {
+                        return Err(ArrowError::InvalidArgumentError(format!(
+                            "String data capacity exceeded for column {}",
+                            col_idx
+                        )));
+                    }
+
+                    // Write data directly
+                    unsafe {
+                        let dest = data_ptrs[col_idx].add(current_offset);
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
+                    }
+
+                    // Write offset
+                    let new_end = (base_data_positions[col_idx] + current_offset + len) as i32;
+                    unsafe {
+                        let dest = offsets_ptrs[col_idx].add(row * 4);
+                        std::ptr::copy_nonoverlapping(new_end.to_le_bytes().as_ptr(), dest, 4);
+                    }
+
+                    var_data_offsets[col_idx] += len;
+                }
+            }
+
+            // Update positions after batch
+            for col_idx in 0..num_columns {
+                self.columns[col_idx].data_position += var_data_offsets[col_idx];
+                self.columns[col_idx].row_count += batch_rows;
+            }
+
+            rows_processed += batch_rows;
+            self.row_count += batch_rows;
+        }
+
+        Ok(cursor.position())
+    }
+
+    fn decode_batch_mixed(
+        &mut self,
+        buf: &[u8],
+        count: usize,
+    ) -> Result<usize, ArrowError> {
+        let total_rows = count.min(self.max_rows - self.row_count);
+        if total_rows == 0 {
+            return Ok(0);
+        }
+
+        let num_columns = self.columns.len();
+        let mut cursor = AvroCursor::new(buf);
+
+        // Process in mini-batches
+        let mut rows_processed = 0;
+        while rows_processed < total_rows {
+            let batch_rows = (total_rows - rows_processed).min(Self::BATCH_SIZE);
+
+            // Build column metadata for this batch
+            let col_meta: Vec<(usize, DataType, Option<usize>, usize, usize)> = self.columns
+                .iter()
+                .map(|col| {
+                    let type_size = Self::get_type_size(&col.data_type);
+                    (col.column_index, col.data_type.clone(), type_size, col.data_position, col.row_count)
+                })
+                .collect();
+
+            // Get raw pointers for fixed-size columns
+            // For variable-length columns, we'll get pointers to data and offsets regions
+            let mut data_ptrs: Vec<Option<*mut u8>> = Vec::with_capacity(num_columns);
+            let mut offsets_ptrs: Vec<Option<*mut u8>> = Vec::with_capacity(num_columns);
+            let mut data_capacities: Vec<usize> = Vec::with_capacity(num_columns);
+
+            for (column_index, data_type, type_size, start_pos, row_count) in &col_meta {
+                match data_type {
+                    DataType::Null => {
+                        data_ptrs.push(None);
+                        offsets_ptrs.push(None);
+                        data_capacities.push(0);
+                    }
+                    DataType::Boolean => {
+                        let (ptr, cap) = self.provider.get_data_ptr(*column_index, 0)?;
+                        data_ptrs.push(Some(ptr));
+                        offsets_ptrs.push(None);
+                        data_capacities.push(cap);
+                    }
+                    DataType::Utf8 | DataType::Binary => {
+                        // Get data pointer at current position
+                        let (data_ptr, data_cap) = self.provider.get_data_ptr(*column_index, *start_pos)?;
+                        data_ptrs.push(Some(data_ptr));
+                        data_capacities.push(data_cap);
+                        // Get offsets pointer - offsets start at (row_count + 1) * 4
+                        let offsets_pos = (*row_count + 1) * 4;
+                        let offsets_slice = self.provider.get_offsets_slice(*column_index, offsets_pos, batch_rows * 4)?;
+                        offsets_ptrs.push(Some(offsets_slice.as_mut_ptr()));
+                    }
+                    DataType::FixedSizeBinary(size) => {
+                        let (ptr, cap) = self.provider.get_data_ptr(*column_index, *start_pos)?;
+                        data_ptrs.push(Some(ptr));
+                        offsets_ptrs.push(None);
+                        data_capacities.push(cap.min(batch_rows * (*size as usize)));
+                    }
+                    _ => {
+                        // Fixed-size types
+                        if let Some(ts) = type_size {
+                            let (ptr, cap) = self.provider.get_data_ptr(*column_index, *start_pos)?;
+                            data_ptrs.push(Some(ptr));
+                            offsets_ptrs.push(None);
+                            data_capacities.push(cap.min(batch_rows * ts));
+                        } else {
+                            data_ptrs.push(None);
+                            offsets_ptrs.push(None);
+                            data_capacities.push(0);
+                        }
+                    }
+                }
+            }
+
+            // Track data positions for variable-length columns within this batch
+            let mut var_data_offsets: Vec<usize> = vec![0; num_columns];
+            let mut var_offset_idx: Vec<usize> = vec![0; num_columns];
+
+            // Decode batch
+            for row in 0..batch_rows {
+                for col_idx in 0..num_columns {
+                    let (_, ref data_type, _type_size, _, base_row_count) = col_meta[col_idx];
+
+                    match data_type {
+                        DataType::Null => {}
+                        DataType::Boolean => {
+                            let value = cursor.get_bool()?;
+                            let base_row = base_row_count + row;
+                            let byte_idx = base_row / 8;
+                            let bit_idx = base_row % 8;
+                            if let Some(ptr) = data_ptrs[col_idx] {
+                                unsafe {
+                                    let byte_ptr = ptr.add(byte_idx);
+                                    if value {
+                                        *byte_ptr |= 1 << bit_idx;
+                                    }
+                                }
+                            }
+                        }
+                        DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
+                            let value = cursor.get_int()?;
+                            if let Some(ptr) = data_ptrs[col_idx] {
+                                unsafe {
+                                    let dest = ptr.add(row * 4);
+                                    std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), dest, 4);
+                                }
+                            }
+                        }
+                        DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => {
+                            let value = cursor.get_long()?;
+                            if let Some(ptr) = data_ptrs[col_idx] {
+                                unsafe {
+                                    let dest = ptr.add(row * 8);
+                                    std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), dest, 8);
+                                }
+                            }
+                        }
+                        DataType::Float32 => {
+                            let value = cursor.get_float()?;
+                            if let Some(ptr) = data_ptrs[col_idx] {
+                                unsafe {
+                                    let dest = ptr.add(row * 4);
+                                    std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), dest, 4);
+                                }
+                            }
+                        }
+                        DataType::Float64 => {
+                            let value = cursor.get_double()?;
+                            if let Some(ptr) = data_ptrs[col_idx] {
+                                unsafe {
+                                    let dest = ptr.add(row * 8);
+                                    std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), dest, 8);
+                                }
+                            }
+                        }
+                        DataType::Utf8 | DataType::Binary => {
+                            let bytes = cursor.get_bytes()?;
+                            let len = bytes.len();
+                            let current_offset = var_data_offsets[col_idx];
+
+                            // Check capacity
+                            if current_offset + len > data_capacities[col_idx] {
+                                return Err(ArrowError::InvalidArgumentError(format!(
+                                    "Variable data capacity exceeded for column {}",
+                                    col_idx
+                                )));
+                            }
+
+                            // Write data
+                            if let Some(ptr) = data_ptrs[col_idx] {
+                                unsafe {
+                                    let dest = ptr.add(current_offset);
+                                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
+                                }
+                            }
+
+                            // Write offset (end position for this string)
+                            let new_end = (col_meta[col_idx].3 + current_offset + len) as i32;
+                            if let Some(ptr) = offsets_ptrs[col_idx] {
+                                unsafe {
+                                    let dest = ptr.add(var_offset_idx[col_idx] * 4);
+                                    std::ptr::copy_nonoverlapping(new_end.to_le_bytes().as_ptr(), dest, 4);
+                                }
+                            }
+
+                            var_data_offsets[col_idx] += len;
+                            var_offset_idx[col_idx] += 1;
+                        }
+                        DataType::FixedSizeBinary(size) => {
+                            let bytes = cursor.get_fixed(*size as usize)?;
+                            if let Some(ptr) = data_ptrs[col_idx] {
+                                unsafe {
+                                    let dest = ptr.add(row * (*size as usize));
+                                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, *size as usize);
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(ArrowError::InvalidArgumentError(
+                                "Unsupported type in batch decode".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            // Update column positions and counts after batch
+            for col_idx in 0..num_columns {
+                let (_, ref data_type, type_size, _, _) = col_meta[col_idx];
+                match data_type {
+                    DataType::Null => {
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    DataType::Boolean => {
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    DataType::Utf8 | DataType::Binary => {
+                        self.columns[col_idx].data_position += var_data_offsets[col_idx];
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    _ => {
+                        if let Some(ts) = type_size {
+                            self.columns[col_idx].data_position += batch_rows * ts;
+                        }
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                }
+            }
+
+            rows_processed += batch_rows;
+            self.row_count += batch_rows;
+        }
+
+        Ok(cursor.position())
+    }
+
+    /// Create a checkpoint of current decoder state for potential rollback
+    fn create_checkpoint(&self, cursor_position: usize) -> RowCheckpoint {
+        RowCheckpoint {
+            cursor_position,
+            data_positions: self.columns.iter().map(|c| c.data_position).collect(),
+            row_counts: self.columns.iter().map(|c| c.row_count).collect(),
+            nested_snapshots: self.columns.iter().map(|c| c.create_snapshot()).collect(),
+        }
+    }
+
+    /// Restore decoder state from a checkpoint (rollback partial row)
+    fn restore_checkpoint(&mut self, checkpoint: &RowCheckpoint) {
+        for (col_idx, col) in self.columns.iter_mut().enumerate() {
+            col.data_position = checkpoint.data_positions[col_idx];
+            col.row_count = checkpoint.row_counts[col_idx];
+            col.restore_snapshot(&checkpoint.nested_snapshots[col_idx]);
+        }
+    }
+
+    /// Check if there's capacity for a fixed-size write
+    #[allow(dead_code)]
+    fn check_fixed_capacity(
+        &self,
+        column_index: usize,
+        bytes_needed: usize,
+    ) -> Result<(), CapacityExceededError> {
+        if !self.provider.has_capacity_for_variable_data(column_index, bytes_needed) {
+            Err(CapacityExceededError {
+                column_index,
+                bytes_needed,
+                bytes_available: 0, // We don't have exact info, provider just says no
+            })
+        } else {
+            Ok(())
+        }
+    }
+
     /// Set dictionary values for a Dictionary column (Avro enum symbols)
     ///
     /// This must be called before decoding for Dictionary columns,
@@ -340,21 +1865,81 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         }
     }
 
+    /// Enable pre-allocated buffer mode for a List column
+    ///
+    /// When enabled, list child data is written directly to the provider's
+    /// pre-allocated buffer instead of growing a Vec. This enables zero-allocation
+    /// decoding for List types.
+    ///
+    /// The provider must have child regions configured for the specified column.
+    pub fn enable_preallocated_list(&mut self, col_idx: usize) -> Result<(), ArrowError> {
+        if col_idx >= self.columns.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Column index {} out of bounds (max {})",
+                col_idx, self.columns.len()
+            )));
+        }
+
+        let col = &mut self.columns[col_idx];
+        if let NestedState::List { use_preallocated, .. } = &mut col.nested {
+            *use_preallocated = true;
+            Ok(())
+        } else {
+            Err(ArrowError::InvalidArgumentError(format!(
+                "Column {} is not a List type",
+                col_idx
+            )))
+        }
+    }
+
     /// Decode a single row from the cursor
-    pub fn decode_row(&mut self, cursor: &mut AvroCursor<'_>) -> Result<(), ArrowError> {
+    ///
+    /// This method uses checkpointing for partial row rollback. If any column
+    /// decode fails due to capacity limits, the entire row is rolled back
+    /// and a `CapacityExceeded` error is returned.
+    pub(crate) fn decode_row(&mut self, cursor: &mut AvroCursor<'_>) -> Result<(), ArrowError> {
         if self.row_count >= self.max_rows {
             return Err(ArrowError::InvalidArgumentError(
                 "Decoder at capacity".to_string(),
             ));
         }
 
+        // Create checkpoint before decoding row
+        let checkpoint = self.create_checkpoint(cursor.position());
+
         let num_columns = self.columns.len();
         for col_idx in 0..num_columns {
-            self.decode_column_value(col_idx, cursor)?;
+            match self.decode_column_value(col_idx, cursor) {
+                Ok(()) => {}
+                Err(e) => {
+                    // Rollback to checkpoint on any error
+                    self.restore_checkpoint(&checkpoint);
+                    return Err(e);
+                }
+            }
         }
 
         self.row_count += 1;
         Ok(())
+    }
+
+    /// Decode a single row with explicit capacity error handling
+    ///
+    /// Returns `Ok(true)` if row was decoded successfully.
+    /// Returns `Ok(false)` if capacity was exceeded (row was rolled back).
+    /// Returns `Err` for other errors.
+    pub(crate) fn try_decode_row(&mut self, cursor: &mut AvroCursor<'_>) -> Result<bool, ArrowError> {
+        if self.row_count >= self.max_rows {
+            return Ok(false); // Capacity exceeded
+        }
+
+        match self.decode_row(cursor) {
+            Ok(()) => Ok(true),
+            Err(ArrowError::InvalidArgumentError(msg)) if msg.contains("exceeds capacity") => {
+                Ok(false) // Capacity exceeded, row was rolled back
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Decode a column value directly into the buffer
@@ -500,6 +2085,10 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 // Decode Avro enum (varint index into symbols)
                 self.decode_dictionary_value(col_idx, cursor)?;
             }
+            DataType::Struct(_) => {
+                // Decode Avro record (nested fields in order)
+                self.decode_struct_value(col_idx, cursor)?;
+            }
             other => {
                 return Err(ArrowError::NotYetImplemented(format!(
                     "Pooled decoding not yet implemented for {:?}",
@@ -531,68 +2120,97 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         }
     }
 
-    /// Decode a Map value from Avro block encoding
-    /// Avro maps: { key: string, value: T } with block encoding
-    fn decode_map_value(
+    /// Decode a Struct value (Avro record - fields in schema order)
+    fn decode_struct_value(
         &mut self,
         col_idx: usize,
         cursor: &mut AvroCursor<'_>,
     ) -> Result<(), ArrowError> {
         let col = &mut self.columns[col_idx];
 
-        if let NestedState::Map {
-            map_offsets, key_offsets, key_data, value_data, value_type, total_entries
-        } = &mut col.nested {
-            let value_type_clone = value_type.clone();
-            let mut entries_in_row = 0usize;
+        if let NestedState::Struct { field_data, field_types, row_count, .. } = &mut col.nested {
+            let num_fields = field_types.len();
+            let field_types_clone: Vec<DataType> = field_types.clone();
 
-            // Read blocks until we get a 0 count
-            loop {
-                let block_count = cursor.get_long()?;
-                match block_count.cmp(&0) {
-                    Ordering::Equal => break,
-                    Ordering::Less => {
-                        let count = (-block_count) as usize;
-                        let _size_in_bytes = cursor.get_long()?; // Skip size hint
-                        for _ in 0..count {
-                            // Read key (string)
-                            let key_bytes = cursor.get_bytes()?;
-                            key_data.extend_from_slice(key_bytes);
-                            let new_offset = key_data.len() as i32;
-                            key_offsets.push(new_offset);
-
-                            // Read value based on type
-                            Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
-                        }
-                        entries_in_row += count;
-                    }
-                    Ordering::Greater => {
-                        let count = block_count as usize;
-                        for _ in 0..count {
-                            // Read key (string)
-                            let key_bytes = cursor.get_bytes()?;
-                            key_data.extend_from_slice(key_bytes);
-                            let new_offset = key_data.len() as i32;
-                            key_offsets.push(new_offset);
-
-                            // Read value based on type
-                            Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
-                        }
-                        entries_in_row += count;
-                    }
-                }
+            // Avro records encode fields in schema order
+            for field_idx in 0..num_fields {
+                let field_type = &field_types_clone[field_idx];
+                Self::decode_value_to_vec(field_type, cursor, &mut field_data[field_idx])?;
             }
 
-            *total_entries += entries_in_row;
-            let new_map_offset = *total_entries as i32;
-            map_offsets.push(new_map_offset);
-            col.row_count += 1;
+            *row_count += 1;
+            // Also increment column row count
+            self.columns[col_idx].row_count += 1;
             Ok(())
         } else {
             Err(ArrowError::InvalidArgumentError(
-                "Map column missing nested state".to_string()
+                "Struct column missing nested state".to_string()
             ))
         }
+    }
+
+    /// Decode a Map value from Avro block encoding (Vec mode only)
+    /// Avro maps: { key: string, value: T } with block encoding
+    fn decode_map_value(
+        &mut self,
+        col_idx: usize,
+        cursor: &mut AvroCursor<'_>,
+    ) -> Result<(), ArrowError> {
+        // Extract value type from nested state
+        let value_type_clone = {
+            let col = &self.columns[col_idx];
+            if let NestedState::Map { value_type, .. } = &col.nested {
+                value_type.clone()
+            } else {
+                return Err(ArrowError::InvalidArgumentError(
+                    "Map column missing nested state".to_string()
+                ));
+            }
+        };
+
+        let mut entries_in_row = 0usize;
+
+        // Read blocks until we get a 0 count
+        loop {
+            let block_count = cursor.get_long()?;
+            match block_count.cmp(&0) {
+                Ordering::Equal => break,
+                Ordering::Less => {
+                    let count = (-block_count) as usize;
+                    let _size_in_bytes = cursor.get_long()?; // Skip size hint
+                    if let NestedState::Map { key_offsets, key_data, value_data, .. } = &mut self.columns[col_idx].nested {
+                        for _ in 0..count {
+                            let key_bytes = cursor.get_bytes()?;
+                            key_data.extend_from_slice(key_bytes);
+                            key_offsets.push(key_data.len() as i32);
+                            Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
+                        }
+                    }
+                    entries_in_row += count;
+                }
+                Ordering::Greater => {
+                    let count = block_count as usize;
+                    if let NestedState::Map { key_offsets, key_data, value_data, .. } = &mut self.columns[col_idx].nested {
+                        for _ in 0..count {
+                            let key_bytes = cursor.get_bytes()?;
+                            key_data.extend_from_slice(key_bytes);
+                            key_offsets.push(key_data.len() as i32);
+                            Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
+                        }
+                    }
+                    entries_in_row += count;
+                }
+            }
+        }
+
+        // Update final state
+        let col = &mut self.columns[col_idx];
+        if let NestedState::Map { map_offsets, total_entries, .. } = &mut col.nested {
+            *total_entries += entries_in_row;
+            map_offsets.push(*total_entries as i32);
+        }
+        col.row_count += 1;
+        Ok(())
     }
 
     /// Decode a Union value (type tag + value)
@@ -604,7 +2222,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         let col = &mut self.columns[col_idx];
 
         if let NestedState::Union {
-            type_ids, offsets, child_data, child_counts, fields, mode: _
+            type_ids, offsets, child_data, child_counts, fields, ..
         } = &mut col.nested {
             // Read the type tag (varint index into union variants)
             let type_index = cursor.get_long()? as usize;
@@ -647,48 +2265,310 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         col_idx: usize,
         cursor: &mut AvroCursor<'_>,
     ) -> Result<(), ArrowError> {
-        let col = &mut self.columns[col_idx];
+        // Extract info we need from nested state first
+        let (child_type_clone, use_prealloc, mut current_position) = {
+            let col = &self.columns[col_idx];
+            if let NestedState::List { child_type, use_preallocated, child_data_position, .. } = &col.nested {
+                (child_type.clone(), *use_preallocated, *child_data_position)
+            } else {
+                return Err(ArrowError::InvalidArgumentError(
+                    "List column missing nested state".to_string()
+                ));
+            }
+        };
 
-        if let NestedState::List { offsets, child_data, child_type, total_elements } = &mut col.nested {
-            let child_type_clone = child_type.clone();
-            let mut elements_in_row = 0usize;
+        // For fixed-size types, calculate element size once
+        let fixed_element_size = Self::get_fixed_element_size(&child_type_clone);
 
-            // Read blocks until we get a 0 count
-            loop {
-                let block_count = cursor.get_long()?;
-                match block_count.cmp(&0) {
-                    Ordering::Equal => break,
-                    Ordering::Less => {
-                        let count = (-block_count) as usize;
-                        let _size_in_bytes = cursor.get_long()?;
-                        for _ in 0..count {
-                            Self::decode_value_to_vec(&child_type_clone, cursor, child_data)?;
-                        }
-                        elements_in_row += count;
+        let mut elements_in_row = 0usize;
+
+        // Read blocks until we get a 0 count
+        loop {
+            let block_count = cursor.get_long()?;
+            match block_count.cmp(&0) {
+                Ordering::Equal => break,
+                Ordering::Less => {
+                    let count = (-block_count) as usize;
+                    let _size_in_bytes = cursor.get_long()?;
+                    if use_prealloc {
+                        current_position = self.decode_list_block_preallocated(
+                            col_idx, cursor, count, &child_type_clone,
+                            fixed_element_size, current_position
+                        )?;
+                    } else {
+                        current_position = self.decode_list_block_vec(
+                            col_idx, cursor, count, &child_type_clone
+                        )?;
                     }
-                    Ordering::Greater => {
-                        let count = block_count as usize;
-                        for _ in 0..count {
-                            Self::decode_value_to_vec(&child_type_clone, cursor, child_data)?;
-                        }
-                        elements_in_row += count;
+                    elements_in_row += count;
+                }
+                Ordering::Greater => {
+                    let count = block_count as usize;
+                    if use_prealloc {
+                        current_position = self.decode_list_block_preallocated(
+                            col_idx, cursor, count, &child_type_clone,
+                            fixed_element_size, current_position
+                        )?;
+                    } else {
+                        current_position = self.decode_list_block_vec(
+                            col_idx, cursor, count, &child_type_clone
+                        )?;
                     }
+                    elements_in_row += count;
                 }
             }
+        }
 
+        // Update final state
+        let col = &mut self.columns[col_idx];
+        if let NestedState::List { offsets, child_data_position, total_elements, .. } = &mut col.nested {
+            *child_data_position = current_position;
             *total_elements += elements_in_row;
             let new_offset = *total_elements as i32;
             offsets.push(new_offset);
-            col.row_count += 1;
-            Ok(())
-        } else {
-            Err(ArrowError::InvalidArgumentError(
-                "List column missing nested state".to_string()
-            ))
+        }
+        col.row_count += 1;
+        Ok(())
+    }
+
+    /// Get fixed element size for a type, or None if variable-length
+    #[inline]
+    fn get_fixed_element_size(data_type: &DataType) -> Option<usize> {
+        match data_type {
+            DataType::Null => Some(0),
+            DataType::Boolean => Some(1),
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) => Some(4),
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => Some(8),
+            DataType::Float32 => Some(4),
+            DataType::Float64 => Some(8),
+            DataType::FixedSizeBinary(size) => Some(*size as usize),
+            _ => None, // Variable-length types
         }
     }
 
-    /// Helper to decode a primitive value directly into a Vec<u8>
+    /// Decode a block of list elements using pre-allocated buffer (optimized)
+    #[inline]
+    fn decode_list_block_preallocated(
+        &mut self,
+        col_idx: usize,
+        cursor: &mut AvroCursor<'_>,
+        count: usize,
+        child_type: &DataType,
+        fixed_element_size: Option<usize>,
+        start_position: usize,
+    ) -> Result<usize, ArrowError> {
+        // Get the provider column index
+        let provider_col_idx = self.columns[col_idx].column_index;
+
+        if let Some(elem_size) = fixed_element_size {
+            // FAST PATH: Fixed-size elements - get one large slice, decode all elements
+            let total_bytes = count * elem_size;
+
+            // Single capacity check for entire block
+            if !self.provider.has_capacity_for_child_data(provider_col_idx, 0, total_bytes) {
+                return Err(ArrowError::InvalidArgumentError(
+                    "List child data capacity exceeded".to_string()
+                ));
+            }
+
+            // Get single slice for entire block
+            let slice = self.provider.get_child_data_slice(provider_col_idx, 0, start_position, total_bytes)?;
+
+            // Decode all elements directly into the slice
+            Self::decode_fixed_elements_batch(child_type, cursor, slice, count, elem_size)?;
+
+            Ok(start_position + total_bytes)
+        } else {
+            // SLOW PATH: Variable-length elements - decode one at a time
+            let mut current_position = start_position;
+            for _ in 0..count {
+                let bytes_needed = Self::get_value_size(child_type, cursor)?;
+
+                if !self.provider.has_capacity_for_child_data(provider_col_idx, 0, bytes_needed) {
+                    return Err(ArrowError::InvalidArgumentError(
+                        "List child data capacity exceeded".to_string()
+                    ));
+                }
+
+                let slice = self.provider.get_child_data_slice(provider_col_idx, 0, current_position, bytes_needed)?;
+                Self::decode_value_to_slice(child_type, cursor, slice)?;
+                current_position += bytes_needed;
+            }
+            Ok(current_position)
+        }
+    }
+
+    /// Decode a block of list elements using Vec (original approach)
+    #[inline]
+    fn decode_list_block_vec(
+        &mut self,
+        col_idx: usize,
+        cursor: &mut AvroCursor<'_>,
+        count: usize,
+        child_type: &DataType,
+    ) -> Result<usize, ArrowError> {
+        for _ in 0..count {
+            let col = &mut self.columns[col_idx];
+            if let NestedState::List { child_data, .. } = &mut col.nested {
+                Self::decode_value_to_vec(child_type, cursor, child_data)?;
+            }
+        }
+        // Return final position
+        let col = &self.columns[col_idx];
+        if let NestedState::List { child_data, .. } = &col.nested {
+            Ok(child_data.len())
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Batch decode fixed-size elements directly into a slice (optimized hot path)
+    #[inline]
+    fn decode_fixed_elements_batch(
+        data_type: &DataType,
+        cursor: &mut AvroCursor<'_>,
+        output: &mut [u8],
+        count: usize,
+        elem_size: usize,
+    ) -> Result<(), ArrowError> {
+        match data_type {
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
+                for i in 0..count {
+                    let value = cursor.get_int()?;
+                    let offset = i * elem_size;
+                    output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => {
+                for i in 0..count {
+                    let value = cursor.get_long()?;
+                    let offset = i * elem_size;
+                    output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            DataType::Float32 => {
+                for i in 0..count {
+                    let value = cursor.get_float()?;
+                    let offset = i * elem_size;
+                    output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            DataType::Float64 => {
+                for i in 0..count {
+                    let value = cursor.get_double()?;
+                    let offset = i * elem_size;
+                    output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+            DataType::Boolean => {
+                for i in 0..count {
+                    let value = cursor.get_bool()?;
+                    output[i] = if value { 1 } else { 0 };
+                }
+            }
+            DataType::Null => {
+                // Nothing to decode for null type
+            }
+            DataType::FixedSizeBinary(size) => {
+                let size = *size as usize;
+                for i in 0..count {
+                    let bytes = cursor.get_fixed(size)?;
+                    let offset = i * size;
+                    output[offset..offset + size].copy_from_slice(bytes);
+                }
+            }
+            _ => {
+                return Err(ArrowError::NotYetImplemented(format!(
+                    "decode_fixed_elements_batch not implemented for {:?}",
+                    data_type
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Get the size in bytes needed to decode a value (for capacity checking)
+    fn get_value_size(data_type: &DataType, cursor: &mut AvroCursor<'_>) -> Result<usize, ArrowError> {
+        match data_type {
+            DataType::Null => Ok(0),
+            DataType::Boolean => Ok(1),
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) => Ok(4),
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => Ok(8),
+            DataType::Float32 => Ok(4),
+            DataType::Float64 => Ok(8),
+            DataType::Utf8 | DataType::Binary => {
+                // Peek at length without consuming
+                let len = cursor.peek_long()? as usize;
+                Ok(4 + len) // 4 bytes for length prefix + data
+            }
+            DataType::FixedSizeBinary(size) => Ok(*size as usize),
+            other => Err(ArrowError::NotYetImplemented(format!(
+                "get_value_size not implemented for {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Helper to decode a primitive value directly into a pre-allocated slice
+    fn decode_value_to_slice(
+        data_type: &DataType,
+        cursor: &mut AvroCursor<'_>,
+        output: &mut [u8],
+    ) -> Result<usize, ArrowError> {
+        match data_type {
+            DataType::Null => Ok(0),
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
+                let value = cursor.get_int()?;
+                output[..4].copy_from_slice(&value.to_le_bytes());
+                Ok(4)
+            }
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => {
+                let value = cursor.get_long()?;
+                output[..8].copy_from_slice(&value.to_le_bytes());
+                Ok(8)
+            }
+            DataType::Float32 => {
+                let value = cursor.get_float()?;
+                output[..4].copy_from_slice(&value.to_le_bytes());
+                Ok(4)
+            }
+            DataType::Float64 => {
+                let value = cursor.get_double()?;
+                output[..8].copy_from_slice(&value.to_le_bytes());
+                Ok(8)
+            }
+            DataType::Boolean => {
+                let value = cursor.get_bool()?;
+                output[0] = if value { 1 } else { 0 };
+                Ok(1)
+            }
+            DataType::Utf8 | DataType::Binary => {
+                let bytes = cursor.get_bytes()?;
+                let len = bytes.len();
+                output[..4].copy_from_slice(&(len as i32).to_le_bytes());
+                output[4..4 + len].copy_from_slice(bytes);
+                Ok(4 + len)
+            }
+            DataType::FixedSizeBinary(size) => {
+                let bytes = cursor.get_fixed(*size as usize)?;
+                output[..*size as usize].copy_from_slice(bytes);
+                Ok(*size as usize)
+            }
+            other => Err(ArrowError::NotYetImplemented(format!(
+                "Nested value decoding to slice not implemented for {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Helper to decode a value directly into a Vec<u8> (recursive for nested types)
+    ///
+    /// Serialization format for complex types:
+    /// - List: [count:i32][elem0][elem1]... (count=0 means empty)
+    /// - Map: [count:i32][key_len:i32][key_bytes][value]... per entry
+    /// - Struct: [field0][field1]... (fields in schema order)
+    /// - Union: [tag:i32][value] (tag is variant index)
+    /// - Dictionary: [index:i32]
     fn decode_value_to_vec(
         data_type: &DataType,
         cursor: &mut AvroCursor<'_>,
@@ -728,6 +2608,63 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 let bytes = cursor.get_fixed(*size as usize)?;
                 output.extend_from_slice(bytes);
             }
+            DataType::Decimal128(_, _) => {
+                let bytes = cursor.get_bytes()?;
+                let value = decode_decimal_bytes_to_i128(bytes);
+                output.extend_from_slice(&value.to_le_bytes());
+            }
+            DataType::Decimal256(_, _) => {
+                let bytes = cursor.get_bytes()?;
+                let value = decode_decimal_bytes_to_i256(bytes);
+                output.extend_from_slice(&value);
+            }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                // Avro duration: 12 bytes (months u32 LE, days u32 LE, millis u32 LE)
+                let bytes = cursor.get_fixed(12)?;
+                let months = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as i32;
+                let days = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as i32;
+                let millis = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+                let nanos = (millis as i64) * 1_000_000;
+                let interval = IntervalMonthDayNano::new(months, days, nanos);
+                let interval_bytes: [u8; 16] = unsafe { std::mem::transmute(interval) };
+                output.extend_from_slice(&interval_bytes);
+            }
+            // Recursive: List<T>
+            DataType::List(child_field) => {
+                Self::decode_list_to_vec(child_field.data_type(), cursor, output)?;
+            }
+            // Recursive: Map<K, V>
+            DataType::Map(entries_field, _) => {
+                let value_type = if let DataType::Struct(fields) = entries_field.data_type() {
+                    fields.iter().nth(1)
+                        .map(|f| f.data_type().clone())
+                        .unwrap_or(DataType::Utf8)
+                } else {
+                    DataType::Utf8
+                };
+                Self::decode_map_to_vec(&value_type, cursor, output)?;
+            }
+            // Recursive: Struct
+            DataType::Struct(fields) => {
+                for field in fields.iter() {
+                    Self::decode_value_to_vec(field.data_type(), cursor, output)?;
+                }
+            }
+            // Recursive: Union
+            DataType::Union(union_fields, _) => {
+                let tag = cursor.get_int()? as i32;
+                output.extend_from_slice(&tag.to_le_bytes());
+                if let Some((_, field)) = union_fields.iter().find(|(id, _)| *id == tag as i8) {
+                    if !matches!(field.data_type(), DataType::Null) {
+                        Self::decode_value_to_vec(field.data_type(), cursor, output)?;
+                    }
+                }
+            }
+            // Dictionary (Avro enum) - just store the index
+            DataType::Dictionary(_, _) => {
+                let index = cursor.get_int()?;
+                output.extend_from_slice(&index.to_le_bytes());
+            }
             other => {
                 return Err(ArrowError::NotYetImplemented(format!(
                     "Nested value decoding not implemented for {:?}",
@@ -738,16 +2675,160 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         Ok(())
     }
 
-    /// Decode multiple rows from a buffer
-    pub fn decode(&mut self, buf: &[u8], count: usize) -> Result<usize, ArrowError> {
-        let mut cursor = AvroCursor::new(buf);
-        let rows_to_decode = count.min(self.max_rows - self.row_count);
+    /// Decode an Avro array (List) into Vec<u8> with format: [total_count:i32][elem0][elem1]...
+    fn decode_list_to_vec(
+        child_type: &DataType,
+        cursor: &mut AvroCursor<'_>,
+        output: &mut Vec<u8>,
+    ) -> Result<(), ArrowError> {
+        // Reserve space for count, will fill in later
+        let count_pos = output.len();
+        output.extend_from_slice(&0i32.to_le_bytes());
 
-        for _ in 0..rows_to_decode {
-            self.decode_row(&mut cursor)?;
+        let mut total_count = 0i32;
+
+        // Read Avro array blocks
+        loop {
+            let block_count = cursor.get_long()?;
+            match block_count.cmp(&0) {
+                Ordering::Equal => break,
+                Ordering::Less => {
+                    let count = (-block_count) as usize;
+                    let _size = cursor.get_long()?; // skip size hint
+                    for _ in 0..count {
+                        Self::decode_value_to_vec(child_type, cursor, output)?;
+                    }
+                    total_count += count as i32;
+                }
+                Ordering::Greater => {
+                    let count = block_count as usize;
+                    for _ in 0..count {
+                        Self::decode_value_to_vec(child_type, cursor, output)?;
+                    }
+                    total_count += count as i32;
+                }
+            }
         }
 
-        Ok(cursor.position())
+        // Write final count at reserved position
+        output[count_pos..count_pos + 4].copy_from_slice(&total_count.to_le_bytes());
+        Ok(())
+    }
+
+    /// Decode an Avro map into Vec<u8> with format: [total_count:i32][key_len:i32][key][value]...
+    fn decode_map_to_vec(
+        value_type: &DataType,
+        cursor: &mut AvroCursor<'_>,
+        output: &mut Vec<u8>,
+    ) -> Result<(), ArrowError> {
+        // Reserve space for count
+        let count_pos = output.len();
+        output.extend_from_slice(&0i32.to_le_bytes());
+
+        let mut total_count = 0i32;
+
+        // Read Avro map blocks
+        loop {
+            let block_count = cursor.get_long()?;
+            match block_count.cmp(&0) {
+                Ordering::Equal => break,
+                Ordering::Less => {
+                    let count = (-block_count) as usize;
+                    let _size = cursor.get_long()?;
+                    for _ in 0..count {
+                        // Key is always string
+                        let key = cursor.get_bytes()?;
+                        output.extend_from_slice(&(key.len() as i32).to_le_bytes());
+                        output.extend_from_slice(key);
+                        // Value is recursive
+                        Self::decode_value_to_vec(value_type, cursor, output)?;
+                    }
+                    total_count += count as i32;
+                }
+                Ordering::Greater => {
+                    let count = block_count as usize;
+                    for _ in 0..count {
+                        let key = cursor.get_bytes()?;
+                        output.extend_from_slice(&(key.len() as i32).to_le_bytes());
+                        output.extend_from_slice(key);
+                        Self::decode_value_to_vec(value_type, cursor, output)?;
+                    }
+                    total_count += count as i32;
+                }
+            }
+        }
+
+        output[count_pos..count_pos + 4].copy_from_slice(&total_count.to_le_bytes());
+        Ok(())
+    }
+
+    /// Decode multiple rows from a buffer
+    ///
+    /// Returns the number of bytes consumed from the buffer.
+    /// If capacity is exceeded mid-decode, complete rows are kept and
+    /// the cursor position reflects only successfully decoded rows.
+    pub fn decode(&mut self, buf: &[u8], count: usize) -> Result<usize, ArrowError> {
+        // Use fast path for flat schemas (all fixed-size primitive types)
+        if self.is_flat_schema() {
+            return self.decode_batch_flat(buf, count);
+        }
+
+        // Use ultra-fast path for strings-only schemas
+        if self.is_strings_only_schema() {
+            return self.decode_batch_strings_only(buf, count);
+        }
+
+        // Use batched path for simple schemas (fixed + variable-length primitives)
+        if self.is_simple_schema() {
+            return self.decode_batch_mixed(buf, count);
+        }
+
+        // Use fast path for dictionary-only schemas (Avro enums)
+        if self.is_dictionary_only_schema() {
+            return self.decode_batch_dictionary_only(buf, count);
+        }
+
+        // Use batched path for simple nested schemas (flat types + Dictionary)
+        if self.is_simple_nested_schema() {
+            return self.decode_batch_simple_nested(buf, count);
+        }
+
+        // Use universal batch decode for complex/nested schemas (Map, Union, Struct, List)
+        // No row-by-row fallback - all types handled in batch
+        self.decode_batch_universal(buf, count)
+    }
+
+    /// Decode multiple rows with capacity handling
+    ///
+    /// Returns `(bytes_consumed, rows_decoded, capacity_exceeded)`.
+    /// If capacity is exceeded, the last partial row is rolled back
+    /// and only complete rows are returned.
+    ///
+    /// `capacity_exceeded` is true if:
+    /// - More rows were requested than could fit (count > available capacity)
+    /// - A row decode failed due to buffer capacity limits
+    pub fn decode_with_capacity(
+        &mut self,
+        buf: &[u8],
+        count: usize,
+    ) -> Result<(usize, usize, bool), ArrowError> {
+        let mut cursor = AvroCursor::new(buf);
+        let available_rows = self.max_rows - self.row_count;
+        let rows_to_decode = count.min(available_rows);
+        let mut rows_decoded = 0;
+        let mut capacity_exceeded = count > available_rows; // Exceeded if more requested than available
+
+        for _ in 0..rows_to_decode {
+            match self.try_decode_row(&mut cursor)? {
+                true => rows_decoded += 1,
+                false => {
+                    capacity_exceeded = true;
+                    break;
+                }
+            }
+        }
+
+        Ok((cursor.position(), rows_decoded, capacity_exceeded))
     }
 
     /// Flush decoded data to a RecordBatch
@@ -913,6 +2994,9 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             DataType::Dictionary(key_type, value_type) => {
                 self.flush_dictionary_column(col_idx, key_type.clone(), value_type.clone())
             }
+            DataType::Struct(fields) => {
+                self.flush_struct_column(col_idx, fields.clone())
+            }
             other => Err(ArrowError::NotYetImplemented(format!(
                 "Pooled flush not yet implemented for {:?}",
                 other
@@ -985,7 +3069,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         }
     }
 
-    /// Flush a Map column from nested state to Arrow MapArray
+    /// Flush a Map column from nested state to Arrow MapArray (Vec mode only)
     fn flush_map_column(
         &mut self,
         col_idx: usize,
@@ -995,12 +3079,20 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         let col = &mut self.columns[col_idx];
 
         if let NestedState::Map {
-            map_offsets, key_offsets, key_data, value_data, value_type, ..
+            map_offsets, key_offsets, key_data, value_offsets, value_data, value_type, ..
         } = &mut col.nested {
 
-            // Create key array (StringArray)
-            let key_offsets_buffer = Buffer::from_slice_ref(key_offsets);
+            // Vec mode: use the Vec buffers directly
             let key_data_buffer = Buffer::from_slice_ref(key_data);
+            let key_offsets_buffer = Buffer::from_slice_ref(key_offsets);
+            let value_data_buffer = Buffer::from_slice_ref(value_data);
+            let value_offsets_buffer = if matches!(value_type, DataType::Utf8 | DataType::Binary) {
+                Some(Buffer::from_slice_ref(value_offsets))
+            } else {
+                None
+            };
+
+            // Create key array (StringArray)
             let key_array = StringArray::try_new(
                 OffsetBuffer::new(ScalarBuffer::<i32>::from(key_offsets_buffer)),
                 key_data_buffer,
@@ -1008,7 +3100,25 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             )?;
 
             // Create value array based on type
-            let value_array = Self::build_array_from_vec(value_type.clone(), value_data)?;
+            let value_array: ArrayRef = if let Some(value_off_buf) = value_offsets_buffer {
+                // Variable-length values: build directly from offsets
+                match value_type {
+                    DataType::Utf8 => Arc::new(StringArray::try_new(
+                        OffsetBuffer::new(ScalarBuffer::<i32>::from(value_off_buf)),
+                        value_data_buffer,
+                        None,
+                    )?),
+                    DataType::Binary => Arc::new(BinaryArray::try_new(
+                        OffsetBuffer::new(ScalarBuffer::<i32>::from(value_off_buf)),
+                        value_data_buffer,
+                        None,
+                    )?),
+                    _ => Self::build_array_from_vec(value_type.clone(), value_data_buffer.as_slice())?,
+                }
+            } else {
+                // Fixed-size values: use build_array_from_vec
+                Self::build_array_from_vec(value_type.clone(), value_data_buffer.as_slice())?
+            };
 
             // Create entries struct array
             let entries_struct = StructArray::new(
@@ -1041,7 +3151,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         }
     }
 
-    /// Flush a Union column from nested state to Arrow UnionArray
+    /// Flush a Union column from nested state to Arrow UnionArray (Vec mode only)
     fn flush_union_column(
         &mut self,
         col_idx: usize,
@@ -1051,12 +3161,12 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         let col = &mut self.columns[col_idx];
 
         if let NestedState::Union {
-            type_ids, offsets, child_data, child_counts, fields: _nested_fields, ..
+            type_ids, offsets, child_data, child_counts, ..
         } = &mut col.nested {
             // Build type_ids buffer
             let type_ids_buffer = ScalarBuffer::<i8>::from(Buffer::from_slice_ref(type_ids));
 
-            // Build child arrays - use child_counts for Null types since they have no data
+            // Build child arrays using Vec mode
             let mut children: Vec<ArrayRef> = Vec::with_capacity(fields.len());
             for (i, (_, field)) in fields.iter().enumerate() {
                 let child_type = field.data_type().clone();
@@ -1066,7 +3176,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                         children.push(Arc::new(NullArray::new(child_counts[i])));
                     }
                     _ => {
-                        let child_array = Self::build_array_from_vec(child_type, &mut child_data[i])?;
+                        let child_array = Self::build_array_from_vec(child_type, &child_data[i])?;
                         children.push(child_array);
                     }
                 }
@@ -1098,23 +3208,139 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         col_idx: usize,
         child_field: FieldRef,
     ) -> Result<ArrayRef, ArrowError> {
+        // Extract info we need first to avoid borrow conflicts
+        let (offsets_clone, child_type_clone, child_data_position, use_prealloc) = {
+            let col = &self.columns[col_idx];
+            if let NestedState::List { offsets, child_type, child_data_position, use_preallocated, .. } = &col.nested {
+                (offsets.clone(), child_type.clone(), *child_data_position, *use_preallocated)
+            } else {
+                return Err(ArrowError::InvalidArgumentError(
+                    "List column missing nested state".to_string()
+                ));
+            }
+        };
+
+        // Build child array based on mode
+        let child_array = if use_prealloc {
+            // Pre-allocated mode: get buffer from provider
+            let child_data_buffer = self.provider.finalize_child_data_buffer(col_idx, 0, child_data_position)?;
+            Self::build_array_from_buffer(child_type_clone, child_data_buffer)?
+        } else {
+            // Vec mode: use existing approach
+            let col = &mut self.columns[col_idx];
+            if let NestedState::List { child_data, child_type, .. } = &mut col.nested {
+                Self::build_array_from_vec(child_type.clone(), child_data)?
+            } else {
+                return Err(ArrowError::InvalidArgumentError(
+                    "List column missing nested state".to_string()
+                ));
+            }
+        };
+
+        // Create offsets
+        let offsets_buffer = Buffer::from_slice_ref(&offsets_clone);
+        let list_offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
+
+        // Create ListArray
+        let list_array = ListArray::new(child_field, list_offsets, child_array, None);
+
+        Ok(Arc::new(list_array))
+    }
+
+    /// Build an Arrow array from a pre-allocated buffer
+    fn build_array_from_buffer(data_type: DataType, buffer: Buffer) -> Result<ArrayRef, ArrowError> {
+        // Handle empty buffers specially - ScalarBuffer::from panics on unaligned empty buffers
+        if buffer.is_empty() {
+            return match data_type {
+                DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
+                    Ok(Arc::new(Int32Array::new_null(0)))
+                }
+                DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => {
+                    Ok(Arc::new(Int64Array::new_null(0)))
+                }
+                DataType::Float32 => Ok(Arc::new(Float32Array::new_null(0))),
+                DataType::Float64 => Ok(Arc::new(Float64Array::new_null(0))),
+                DataType::Boolean => Ok(Arc::new(BooleanArray::new_null(0))),
+                other => Err(ArrowError::NotYetImplemented(format!(
+                    "build_array_from_buffer not implemented for {:?}",
+                    other
+                ))),
+            };
+        }
+
+        match data_type {
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
+                let scalar_buffer = ScalarBuffer::<i32>::from(buffer);
+                let array = Int32Array::new(scalar_buffer, None);
+                Ok(Arc::new(array))
+            }
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => {
+                let scalar_buffer = ScalarBuffer::<i64>::from(buffer);
+                let array = Int64Array::new(scalar_buffer, None);
+                Ok(Arc::new(array))
+            }
+            DataType::Float32 => {
+                let scalar_buffer = ScalarBuffer::<f32>::from(buffer);
+                let array = Float32Array::new(scalar_buffer, None);
+                Ok(Arc::new(array))
+            }
+            DataType::Float64 => {
+                let scalar_buffer = ScalarBuffer::<f64>::from(buffer);
+                let array = Float64Array::new(scalar_buffer, None);
+                Ok(Arc::new(array))
+            }
+            DataType::Boolean => {
+                // For booleans in list, each value is stored as a byte (0 or 1)
+                let values: Vec<bool> = buffer.iter().map(|&b| b != 0).collect();
+                let array = BooleanArray::from(values);
+                Ok(Arc::new(array))
+            }
+            other => Err(ArrowError::NotYetImplemented(format!(
+                "build_array_from_buffer not implemented for {:?}",
+                other
+            ))),
+        }
+    }
+
+    /// Flush a Struct column from nested state to Arrow StructArray
+    fn flush_struct_column(
+        &mut self,
+        col_idx: usize,
+        _fields: Fields,
+    ) -> Result<ArrayRef, ArrowError> {
         let col = &mut self.columns[col_idx];
 
-        if let NestedState::List { offsets, child_data, child_type, .. } = &mut col.nested {
-            // Build child array
-            let child_array = Self::build_array_from_vec(child_type.clone(), child_data)?;
+        if let NestedState::Struct {
+            field_data, field_types, field_names, field_nullable, ..
+        } = &mut col.nested {
+            // Build child arrays from field data
+            let mut child_arrays: Vec<ArrayRef> = Vec::with_capacity(field_types.len());
 
-            // Create offsets
-            let offsets_buffer = Buffer::from_slice_ref(offsets);
-            let list_offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
+            for (i, field_type) in field_types.iter().enumerate() {
+                let child_array = Self::build_array_from_vec(field_type.clone(), &field_data[i])?;
+                child_arrays.push(child_array);
+            }
 
-            // Create ListArray
-            let list_array = ListArray::new(child_field, list_offsets, child_array, None);
+            // Build struct fields
+            let struct_fields: Vec<FieldRef> = field_names.iter()
+                .zip(field_types.iter())
+                .zip(field_nullable.iter())
+                .map(|((name, dtype), nullable)| {
+                    Arc::new(Field::new(name, dtype.clone(), *nullable))
+                })
+                .collect();
 
-            Ok(Arc::new(list_array))
+            // Create StructArray
+            let struct_array = StructArray::new(
+                Fields::from(struct_fields),
+                child_arrays,
+                None,
+            );
+
+            Ok(Arc::new(struct_array))
         } else {
             Err(ArrowError::InvalidArgumentError(
-                "List column missing nested state".to_string()
+                "Struct column missing nested state".to_string()
             ))
         }
     }
@@ -1188,10 +3414,307 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 }
                 Ok(Arc::new(BinaryArray::from(binaries)))
             }
+            DataType::FixedSizeBinary(size) => {
+                let element_size = size as usize;
+                let count = data.len() / element_size;
+                let builder = FixedSizeBinaryArray::try_from_iter(
+                    data.chunks_exact(element_size).take(count)
+                )?;
+                Ok(Arc::new(builder))
+            }
+            DataType::Decimal128(precision, scale) => {
+                let buffer = Buffer::from_slice_ref(data);
+                let values = ScalarBuffer::<i128>::from(buffer);
+                Ok(Arc::new(Decimal128Array::new(values, None)
+                    .with_precision_and_scale(precision, scale)?))
+            }
+            DataType::Date32 => {
+                let buffer = Buffer::from_slice_ref(data);
+                let values = ScalarBuffer::<i32>::from(buffer);
+                Ok(Arc::new(Date32Array::new(values, None)))
+            }
+            DataType::Time32(unit) => {
+                let buffer = Buffer::from_slice_ref(data);
+                let values = ScalarBuffer::<i32>::from(buffer);
+                match unit {
+                    arrow_schema::TimeUnit::Second => {
+                        Ok(Arc::new(Time32SecondArray::new(values, None)))
+                    }
+                    arrow_schema::TimeUnit::Millisecond => {
+                        Ok(Arc::new(Time32MillisecondArray::new(values, None)))
+                    }
+                    _ => Err(ArrowError::InvalidArgumentError(format!(
+                        "Invalid Time32 unit: {:?}",
+                        unit
+                    ))),
+                }
+            }
+            DataType::Time64(unit) => {
+                let buffer = Buffer::from_slice_ref(data);
+                let values = ScalarBuffer::<i64>::from(buffer);
+                match unit {
+                    arrow_schema::TimeUnit::Microsecond => {
+                        Ok(Arc::new(Time64MicrosecondArray::new(values, None)))
+                    }
+                    arrow_schema::TimeUnit::Nanosecond => {
+                        Ok(Arc::new(Time64NanosecondArray::new(values, None)))
+                    }
+                    _ => Err(ArrowError::InvalidArgumentError(format!(
+                        "Invalid Time64 unit: {:?}",
+                        unit
+                    ))),
+                }
+            }
+            DataType::Timestamp(unit, tz) => {
+                let buffer = Buffer::from_slice_ref(data);
+                let values = ScalarBuffer::<i64>::from(buffer);
+                match unit {
+                    arrow_schema::TimeUnit::Second => {
+                        let arr = TimestampSecondArray::new(values, None);
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                    arrow_schema::TimeUnit::Millisecond => {
+                        let arr = TimestampMillisecondArray::new(values, None);
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                    arrow_schema::TimeUnit::Microsecond => {
+                        let arr = TimestampMicrosecondArray::new(values, None);
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                    arrow_schema::TimeUnit::Nanosecond => {
+                        let arr = TimestampNanosecondArray::new(values, None);
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                }
+            }
+            DataType::Interval(IntervalUnit::MonthDayNano) => {
+                // Each interval is 16 bytes
+                let count = data.len() / 16;
+                let mut builder = IntervalMonthDayNanoArray::builder(count);
+                for chunk in data.chunks_exact(16).take(count) {
+                    let interval: IntervalMonthDayNano = unsafe {
+                        std::ptr::read_unaligned(chunk.as_ptr() as *const IntervalMonthDayNano)
+                    };
+                    builder.append_value(interval);
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            // List: child data format depends on whether it's from nested decode or direct
+            // From decode_value_to_vec for nested List: [count:i32][elem0][elem1]...[count:i32]...
+            DataType::List(child_field) => {
+                Self::build_list_from_vec(child_field.clone(), data)
+            }
+            // Struct: data = [field0][field1]...[field0][field1]... (row-major)
+            DataType::Struct(fields) => {
+                Self::build_struct_from_vec(&fields, data)
+            }
             other => Err(ArrowError::NotYetImplemented(format!(
                 "build_array_from_vec not implemented for {:?}",
                 other
             ))),
+        }
+    }
+
+    /// Build a ListArray from serialized Vec data
+    /// Format: [count0:i32][elem0_0]...[count1:i32][elem1_0]...
+    fn build_list_from_vec(child_field: FieldRef, data: &[u8]) -> Result<ArrayRef, ArrowError> {
+        let child_type = child_field.data_type();
+
+        if data.is_empty() {
+            // Empty list array
+            let empty_child = Self::build_empty_array(child_type)?;
+            return Ok(Arc::new(ListArray::new(
+                child_field,
+                OffsetBuffer::new(ScalarBuffer::from(vec![0i32])),
+                empty_child,
+                None,
+            )));
+        }
+
+        let mut offsets: Vec<i32> = vec![0];
+        let mut all_child_data: Vec<u8> = Vec::new();
+        let mut pos = 0;
+
+        // Parse each list: [count:i32][elem0][elem1]...
+        while pos + 4 <= data.len() {
+            let count = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+
+            // Parse 'count' elements
+            for _ in 0..count {
+                let elem_start = pos;
+                pos = Self::skip_serialized_value(child_type, data, pos)?;
+                all_child_data.extend_from_slice(&data[elem_start..pos]);
+            }
+
+            offsets.push(offsets.last().unwrap() + count);
+        }
+
+        // Build child array from collected data
+        let child_array = Self::build_array_from_vec(child_type.clone(), &all_child_data)?;
+
+        Ok(Arc::new(ListArray::new(
+            child_field,
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            child_array,
+            None,
+        )))
+    }
+
+    /// Build a StructArray from serialized Vec data
+    /// Format: [field0_row0][field1_row0]...[field0_row1][field1_row1]...
+    fn build_struct_from_vec(fields: &Fields, data: &[u8]) -> Result<ArrayRef, ArrowError> {
+        if data.is_empty() || fields.is_empty() {
+            let empty_children: Vec<ArrayRef> = fields
+                .iter()
+                .map(|f| Self::build_empty_array(f.data_type()))
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(Arc::new(StructArray::new(fields.clone(), empty_children, None)));
+        }
+
+        // Collect data for each field separately
+        let mut field_data: Vec<Vec<u8>> = vec![Vec::new(); fields.len()];
+        let mut pos = 0;
+        let mut row_count = 0;
+
+        // Parse row-by-row
+        while pos < data.len() {
+            for (i, field) in fields.iter().enumerate() {
+                let field_start = pos;
+                pos = Self::skip_serialized_value(field.data_type(), data, pos)?;
+                field_data[i].extend_from_slice(&data[field_start..pos]);
+            }
+            row_count += 1;
+
+            // Safety: don't loop forever on malformed data
+            if row_count > 1_000_000 {
+                return Err(ArrowError::ParseError(
+                    "Struct deserialization exceeded maximum row count".to_string(),
+                ));
+            }
+        }
+
+        // Build each field's array
+        let child_arrays: Vec<ArrayRef> = fields
+            .iter()
+            .enumerate()
+            .map(|(i, field)| Self::build_array_from_vec(field.data_type().clone(), &field_data[i]))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Arc::new(StructArray::new(fields.clone(), child_arrays, None)))
+    }
+
+    /// Skip over a serialized value, returning the new position
+    fn skip_serialized_value(data_type: &DataType, data: &[u8], pos: usize) -> Result<usize, ArrowError> {
+        match data_type {
+            DataType::Null => Ok(pos),
+            DataType::Boolean => Ok(pos + 1),
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) => Ok(pos + 4),
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => Ok(pos + 8),
+            DataType::Float32 => Ok(pos + 4),
+            DataType::Float64 => Ok(pos + 8),
+            DataType::Decimal128(_, _) => Ok(pos + 16),
+            DataType::Interval(IntervalUnit::MonthDayNano) => Ok(pos + 16),
+            DataType::FixedSizeBinary(size) => Ok(pos + *size as usize),
+            DataType::Utf8 | DataType::Binary => {
+                if pos + 4 > data.len() {
+                    return Err(ArrowError::ParseError("Truncated string/binary length".to_string()));
+                }
+                let len = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                Ok(pos + 4 + len)
+            }
+            DataType::List(child_field) => {
+                if pos + 4 > data.len() {
+                    return Err(ArrowError::ParseError("Truncated list count".to_string()));
+                }
+                let count = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                let mut new_pos = pos + 4;
+                for _ in 0..count {
+                    new_pos = Self::skip_serialized_value(child_field.data_type(), data, new_pos)?;
+                }
+                Ok(new_pos)
+            }
+            DataType::Struct(fields) => {
+                let mut new_pos = pos;
+                for field in fields.iter() {
+                    new_pos = Self::skip_serialized_value(field.data_type(), data, new_pos)?;
+                }
+                Ok(new_pos)
+            }
+            DataType::Map(entries_field, _) => {
+                // Map: [count:i32][key_len:i32][key][value]...
+                if pos + 4 > data.len() {
+                    return Err(ArrowError::ParseError("Truncated map count".to_string()));
+                }
+                let count = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                let mut new_pos = pos + 4;
+                let value_type = if let DataType::Struct(fields) = entries_field.data_type() {
+                    fields.iter().nth(1).map(|f| f.data_type()).unwrap_or(&DataType::Utf8)
+                } else {
+                    &DataType::Utf8
+                };
+                for _ in 0..count {
+                    // Skip key (string)
+                    if new_pos + 4 > data.len() {
+                        return Err(ArrowError::ParseError("Truncated map key length".to_string()));
+                    }
+                    let key_len = i32::from_le_bytes(data[new_pos..new_pos + 4].try_into().unwrap()) as usize;
+                    new_pos += 4 + key_len;
+                    // Skip value
+                    new_pos = Self::skip_serialized_value(value_type, data, new_pos)?;
+                }
+                Ok(new_pos)
+            }
+            DataType::Union(union_fields, _) => {
+                // Union: [tag:i32][value]
+                if pos + 4 > data.len() {
+                    return Err(ArrowError::ParseError("Truncated union tag".to_string()));
+                }
+                let tag = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                let new_pos = pos + 4;
+                if let Some((_, field)) = union_fields.iter().find(|(id, _)| *id == tag as i8) {
+                    if !matches!(field.data_type(), DataType::Null) {
+                        return Self::skip_serialized_value(field.data_type(), data, new_pos);
+                    }
+                }
+                Ok(new_pos)
+            }
+            DataType::Dictionary(_, _) => Ok(pos + 4), // index is i32
+            _ => Err(ArrowError::NotYetImplemented(format!(
+                "skip_serialized_value not implemented for {:?}",
+                data_type
+            ))),
+        }
+    }
+
+    /// Build an empty array for the given data type
+    fn build_empty_array(data_type: &DataType) -> Result<ArrayRef, ArrowError> {
+        match data_type {
+            DataType::Null => Ok(Arc::new(NullArray::new(0))),
+            DataType::Int32 => Ok(Arc::new(Int32Array::from(Vec::<i32>::new()))),
+            DataType::Int64 => Ok(Arc::new(Int64Array::from(Vec::<i64>::new()))),
+            DataType::Float32 => Ok(Arc::new(Float32Array::from(Vec::<f32>::new()))),
+            DataType::Float64 => Ok(Arc::new(Float64Array::from(Vec::<f64>::new()))),
+            DataType::Boolean => Ok(Arc::new(BooleanArray::from(Vec::<bool>::new()))),
+            DataType::Utf8 => Ok(Arc::new(StringArray::from(Vec::<&str>::new()))),
+            DataType::Binary => Ok(Arc::new(BinaryArray::from(Vec::<&[u8]>::new()))),
+            DataType::List(child_field) => {
+                let empty_child = Self::build_empty_array(child_field.data_type())?;
+                Ok(Arc::new(ListArray::new(
+                    child_field.clone(),
+                    OffsetBuffer::new(ScalarBuffer::from(vec![0i32])),
+                    empty_child,
+                    None,
+                )))
+            }
+            DataType::Struct(fields) => {
+                let empty_children: Vec<ArrayRef> = fields
+                    .iter()
+                    .map(|f| Self::build_empty_array(f.data_type()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Arc::new(StructArray::new(fields.clone(), empty_children, None)))
+            }
+            _ => Ok(Arc::new(NullArray::new(0))),
         }
     }
 }
@@ -1199,18 +3722,11 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buffer_provider::{BufferLayout, ColumnRegion, PooledBufferProvider};
+    use crate::buffer_provider::{BufferLayout, ColumnRegion, DefaultBufferProvider, PooledBufferProvider};
 
     fn create_int64_layout(row_capacity: usize) -> BufferLayout {
         BufferLayout {
-            columns: vec![ColumnRegion {
-                data_offset: 0,
-                data_capacity: row_capacity * 8,
-                offsets_offset: None,
-                offsets_capacity: None,
-                null_bitmap_offset: None,
-                null_bitmap_capacity: None,
-            }],
+            columns: vec![ColumnRegion::fixed(0, row_capacity * 8)],
             total_size: row_capacity * 8,
             row_count: row_capacity,
         }
@@ -1225,22 +3741,8 @@ mod tests {
 
         let layout = BufferLayout {
             columns: vec![
-                ColumnRegion {
-                    data_offset: 0,
-                    data_capacity: 1024,
-                    offsets_offset: None,
-                    offsets_capacity: None,
-                    null_bitmap_offset: None,
-                    null_bitmap_capacity: None,
-                },
-                ColumnRegion {
-                    data_offset: 1024,
-                    data_capacity: 1024,
-                    offsets_offset: None,
-                    offsets_capacity: None,
-                    null_bitmap_offset: None,
-                    null_bitmap_capacity: None,
-                },
+                ColumnRegion::fixed(0, 1024),
+                ColumnRegion::fixed(1024, 1024),
             ],
             total_size: 2048,
             row_count: 128,
@@ -1269,5 +3771,2016 @@ mod tests {
         let consumed = decoder.decode(&avro_bytes, 1).unwrap();
         assert_eq!(consumed, 1);
         assert_eq!(decoder.row_count(), 1);
+    }
+
+    #[test]
+    fn test_checkpoint_creation() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, 800),
+                ColumnRegion::variable(800, 1000, 1800, 404), // 101 * 4 for offsets
+            ],
+            total_size: 2204,
+            row_count: 100,
+        };
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let decoder = PooledRecordDecoder::try_new(schema.clone(), provider).unwrap();
+
+        let checkpoint = decoder.create_checkpoint(0);
+
+        assert_eq!(checkpoint.cursor_position, 0);
+        assert_eq!(checkpoint.data_positions.len(), 2);
+        assert_eq!(checkpoint.row_counts.len(), 2);
+        assert_eq!(checkpoint.nested_snapshots.len(), 2);
+    }
+
+    #[test]
+    fn test_decode_with_capacity() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+
+        // Only room for 2 rows
+        let layout = create_int64_layout(2);
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema.clone(), provider).unwrap();
+
+        // Encode 3 values as zigzag varint
+        let avro_bytes = vec![84u8, 84u8, 84u8]; // 42, 42, 42
+
+        let (consumed, rows, exceeded) = decoder.decode_with_capacity(&avro_bytes, 3).unwrap();
+
+        // Should decode 2 rows successfully
+        assert_eq!(rows, 2);
+        assert_eq!(consumed, 2);
+        assert!(exceeded);
+        assert_eq!(decoder.row_count(), 2);
+    }
+
+    #[test]
+    fn test_nested_snapshot_map() {
+        let col = ColumnState {
+            column_index: 0,
+            data_type: DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int32, false),
+                    ])),
+                    false,
+                )),
+                false,
+            ),
+            data_position: 0,
+            row_count: 0,
+            is_nullable: false,
+            nested: NestedState::Map {
+                map_offsets: vec![0, 2],
+                key_offsets: vec![0, 3, 7],
+                key_data: b"foobar!".to_vec(),
+                value_offsets: vec![0],  // Not used for Int32 values
+                value_data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                value_type: DataType::Int32,
+                total_entries: 2,
+            },
+        };
+
+        let snapshot = col.create_snapshot();
+
+        if let NestedSnapshot::Map {
+            map_offsets_len,
+            key_offsets_len,
+            key_data_len,
+            value_offsets_len,
+            value_data_len,
+            total_entries,
+        } = snapshot {
+            assert_eq!(map_offsets_len, 2);
+            assert_eq!(key_offsets_len, 3);
+            assert_eq!(key_data_len, 7);
+            assert_eq!(value_offsets_len, 1);
+            assert_eq!(value_data_len, 8);
+            assert_eq!(total_entries, 2);
+        } else {
+            panic!("Expected Map snapshot");
+        }
+    }
+
+    #[test]
+    fn test_nested_snapshot_restore() {
+        let mut col = ColumnState {
+            column_index: 0,
+            data_type: DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+            data_position: 10,
+            row_count: 2,
+            is_nullable: false,
+            nested: NestedState::List {
+                offsets: vec![0, 3, 5],
+                child_data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                child_data_position: 10,
+                child_type: DataType::Int32,
+                total_elements: 5,
+                use_preallocated: false,
+            },
+        };
+
+        // Create snapshot
+        let snapshot = col.create_snapshot();
+
+        // Modify state (simulating partial decode)
+        if let NestedState::List { offsets, child_data, total_elements, .. } = &mut col.nested {
+            offsets.push(8);
+            child_data.extend_from_slice(&[11, 12, 13]);
+            *total_elements = 8;
+        }
+        col.data_position = 20;
+        col.row_count = 3;
+
+        // Restore
+        col.restore_snapshot(&snapshot);
+        col.data_position = 10;
+        col.row_count = 2;
+
+        // Verify restored state
+        if let NestedState::List { offsets, child_data, total_elements, .. } = &col.nested {
+            assert_eq!(offsets.len(), 3);
+            assert_eq!(child_data.len(), 10);
+            assert_eq!(*total_elements, 5);
+        } else {
+            panic!("Expected List nested state");
+        }
+    }
+
+    #[test]
+    fn test_enable_preallocated_list() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("list_col", DataType::List(Arc::new(Field::new("item", DataType::Int64, false))), false),
+        ]));
+
+        let layout = BufferLayout {
+            columns: vec![ColumnRegion::fixed(0, 1024)],
+            total_size: 1024,
+            row_count: 100,
+        };
+        let buffer = vec![0u8; 1024];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Enable pre-allocated mode
+        assert!(decoder.enable_preallocated_list(0).is_ok());
+
+        // Verify the flag is set
+        if let NestedState::List { use_preallocated, .. } = &decoder.columns[0].nested {
+            assert!(*use_preallocated);
+        } else {
+            panic!("Expected List nested state");
+        }
+    }
+
+    #[test]
+    fn test_enable_preallocated_list_wrong_type() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("int_col", DataType::Int64, false),
+        ]));
+
+        let layout = BufferLayout {
+            columns: vec![ColumnRegion::fixed(0, 1024)],
+            total_size: 1024,
+            row_count: 100,
+        };
+        let buffer = vec![0u8; 1024];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Should fail for non-List column
+        let result = decoder.enable_preallocated_list(0);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not a List type"));
+    }
+
+    #[test]
+    fn test_enable_preallocated_list_out_of_bounds() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("list_col", DataType::List(Arc::new(Field::new("item", DataType::Int64, false))), false),
+        ]));
+
+        let layout = BufferLayout {
+            columns: vec![ColumnRegion::fixed(0, 1024)],
+            total_size: 1024,
+            row_count: 100,
+        };
+        let buffer = vec![0u8; 1024];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Should fail for out of bounds
+        let result = decoder.enable_preallocated_list(5);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("out of bounds"));
+    }
+
+    #[test]
+    fn test_list_child_data_position_tracking() {
+        // Test that child_data_position is properly tracked in Vec mode
+        let mut col = ColumnState {
+            column_index: 0,
+            data_type: DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+            data_position: 0,
+            row_count: 0,
+            is_nullable: false,
+            nested: NestedState::List {
+                offsets: vec![0],
+                child_data: Vec::new(),
+                child_data_position: 0,
+                child_type: DataType::Int32,
+                total_elements: 0,
+                use_preallocated: false,
+            },
+        };
+
+        // Simulate adding data
+        if let NestedState::List { child_data, child_data_position, total_elements, offsets, .. } = &mut col.nested {
+            // Add 3 i32 values (12 bytes)
+            child_data.extend_from_slice(&1i32.to_le_bytes());
+            child_data.extend_from_slice(&2i32.to_le_bytes());
+            child_data.extend_from_slice(&3i32.to_le_bytes());
+            *child_data_position = child_data.len();
+            *total_elements = 3;
+            offsets.push(3);
+        }
+
+        // Create snapshot
+        let snapshot = col.create_snapshot();
+
+        if let NestedSnapshot::List { child_data_len, child_data_position, total_elements, .. } = snapshot {
+            assert_eq!(child_data_len, 12);
+            assert_eq!(child_data_position, 12);
+            assert_eq!(total_elements, 3);
+        } else {
+            panic!("Expected List snapshot");
+        }
+    }
+
+    #[test]
+    fn test_list_snapshot_with_position_restore() {
+        let mut col = ColumnState {
+            column_index: 0,
+            data_type: DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+            data_position: 0,
+            row_count: 2,
+            is_nullable: false,
+            nested: NestedState::List {
+                offsets: vec![0, 2, 5],
+                child_data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], // 5 i32s
+                child_data_position: 20,
+                child_type: DataType::Int32,
+                total_elements: 5,
+                use_preallocated: false,
+            },
+        };
+
+        // Create snapshot at current state
+        let snapshot = col.create_snapshot();
+
+        // Simulate partial row decode (add more data)
+        if let NestedState::List { child_data, child_data_position, total_elements, offsets, .. } = &mut col.nested {
+            child_data.extend_from_slice(&21i32.to_le_bytes());
+            child_data.extend_from_slice(&22i32.to_le_bytes());
+            *child_data_position = child_data.len(); // 28 bytes now
+            *total_elements = 7;
+            offsets.push(7);
+        }
+        col.row_count = 3;
+
+        // Verify modified state
+        if let NestedState::List { child_data_position, total_elements, offsets, .. } = &col.nested {
+            assert_eq!(*child_data_position, 28);
+            assert_eq!(*total_elements, 7);
+            assert_eq!(offsets.len(), 4);
+        }
+
+        // Restore snapshot
+        col.restore_snapshot(&snapshot);
+
+        // Verify restored state
+        if let NestedState::List { child_data, child_data_position, total_elements, offsets, .. } = &col.nested {
+            assert_eq!(child_data.len(), 20); // Truncated back
+            assert_eq!(*child_data_position, 20); // Position restored
+            assert_eq!(*total_elements, 5);
+            assert_eq!(offsets.len(), 3);
+        } else {
+            panic!("Expected List nested state");
+        }
+    }
+
+    #[test]
+    fn test_peek_long_cursor() {
+        use crate::reader::cursor::AvroCursor;
+
+        // Test peek_long doesn't consume data
+        // 42 in zigzag encoding is 84 (0x54)
+        let data = vec![0x54u8];
+        let cursor = AvroCursor::new(&data);
+
+        // Peek should return 42
+        let peeked = cursor.peek_long().unwrap();
+        assert_eq!(peeked, 42);
+
+        // Position should still be 0
+        assert_eq!(cursor.position(), 0);
+
+        // Create mutable cursor to actually read
+        let mut cursor2 = AvroCursor::new(&data);
+        let read = cursor2.get_long().unwrap();
+        assert_eq!(read, 42);
+        assert_eq!(cursor2.position(), 1);
+    }
+
+    #[test]
+    fn test_decode_value_to_slice_int32() {
+        use crate::reader::cursor::AvroCursor;
+
+        // 42 in zigzag encoding
+        let data = vec![0x54u8];
+        let mut cursor = AvroCursor::new(&data);
+        let mut output = [0u8; 4];
+
+        let bytes_written = PooledRecordDecoder::<DefaultBufferProvider>::decode_value_to_slice(
+            &DataType::Int32,
+            &mut cursor,
+            &mut output,
+        ).unwrap();
+
+        assert_eq!(bytes_written, 4);
+        assert_eq!(i32::from_le_bytes(output), 42);
+    }
+
+    #[test]
+    fn test_decode_value_to_slice_int64() {
+        use crate::reader::cursor::AvroCursor;
+
+        // 100 in zigzag encoding is 200 (0xC8 0x01)
+        let data = vec![0xC8u8, 0x01];
+        let mut cursor = AvroCursor::new(&data);
+        let mut output = [0u8; 8];
+
+        let bytes_written = PooledRecordDecoder::<DefaultBufferProvider>::decode_value_to_slice(
+            &DataType::Int64,
+            &mut cursor,
+            &mut output,
+        ).unwrap();
+
+        assert_eq!(bytes_written, 8);
+        assert_eq!(i64::from_le_bytes(output), 100);
+    }
+
+    #[test]
+    fn test_decode_value_to_slice_float32() {
+        use crate::reader::cursor::AvroCursor;
+
+        let value: f32 = 3.14;
+        let data = value.to_le_bytes().to_vec();
+        let mut cursor = AvroCursor::new(&data);
+        let mut output = [0u8; 4];
+
+        let bytes_written = PooledRecordDecoder::<DefaultBufferProvider>::decode_value_to_slice(
+            &DataType::Float32,
+            &mut cursor,
+            &mut output,
+        ).unwrap();
+
+        assert_eq!(bytes_written, 4);
+        assert!((f32::from_le_bytes(output) - 3.14).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_decode_value_to_slice_float64() {
+        use crate::reader::cursor::AvroCursor;
+
+        let value: f64 = 2.71828;
+        let data = value.to_le_bytes().to_vec();
+        let mut cursor = AvroCursor::new(&data);
+        let mut output = [0u8; 8];
+
+        let bytes_written = PooledRecordDecoder::<DefaultBufferProvider>::decode_value_to_slice(
+            &DataType::Float64,
+            &mut cursor,
+            &mut output,
+        ).unwrap();
+
+        assert_eq!(bytes_written, 8);
+        assert!((f64::from_le_bytes(output) - 2.71828).abs() < 0.00001);
+    }
+
+    #[test]
+    fn test_decode_value_to_slice_boolean() {
+        use crate::reader::cursor::AvroCursor;
+
+        // True
+        let data_true = vec![1u8];
+        let mut cursor = AvroCursor::new(&data_true);
+        let mut output = [0u8; 1];
+
+        let bytes_written = PooledRecordDecoder::<DefaultBufferProvider>::decode_value_to_slice(
+            &DataType::Boolean,
+            &mut cursor,
+            &mut output,
+        ).unwrap();
+
+        assert_eq!(bytes_written, 1);
+        assert_eq!(output[0], 1);
+
+        // False
+        let data_false = vec![0u8];
+        let mut cursor = AvroCursor::new(&data_false);
+
+        let bytes_written = PooledRecordDecoder::<DefaultBufferProvider>::decode_value_to_slice(
+            &DataType::Boolean,
+            &mut cursor,
+            &mut output,
+        ).unwrap();
+
+        assert_eq!(bytes_written, 1);
+        assert_eq!(output[0], 0);
+    }
+
+    #[test]
+    fn test_get_value_size_fixed_types() {
+        use crate::reader::cursor::AvroCursor;
+
+        let dummy_data = vec![0u8; 100];
+
+        // Null - 0 bytes
+        let mut cursor = AvroCursor::new(&dummy_data);
+        assert_eq!(PooledRecordDecoder::<DefaultBufferProvider>::get_value_size(&DataType::Null, &mut cursor).unwrap(), 0);
+
+        // Boolean - 1 byte
+        let mut cursor = AvroCursor::new(&dummy_data);
+        assert_eq!(PooledRecordDecoder::<DefaultBufferProvider>::get_value_size(&DataType::Boolean, &mut cursor).unwrap(), 1);
+
+        // Int32 - 4 bytes
+        let mut cursor = AvroCursor::new(&dummy_data);
+        assert_eq!(PooledRecordDecoder::<DefaultBufferProvider>::get_value_size(&DataType::Int32, &mut cursor).unwrap(), 4);
+
+        // Int64 - 8 bytes
+        let mut cursor = AvroCursor::new(&dummy_data);
+        assert_eq!(PooledRecordDecoder::<DefaultBufferProvider>::get_value_size(&DataType::Int64, &mut cursor).unwrap(), 8);
+
+        // Float32 - 4 bytes
+        let mut cursor = AvroCursor::new(&dummy_data);
+        assert_eq!(PooledRecordDecoder::<DefaultBufferProvider>::get_value_size(&DataType::Float32, &mut cursor).unwrap(), 4);
+
+        // Float64 - 8 bytes
+        let mut cursor = AvroCursor::new(&dummy_data);
+        assert_eq!(PooledRecordDecoder::<DefaultBufferProvider>::get_value_size(&DataType::Float64, &mut cursor).unwrap(), 8);
+
+        // FixedSizeBinary(16) - 16 bytes
+        let mut cursor = AvroCursor::new(&dummy_data);
+        assert_eq!(PooledRecordDecoder::<DefaultBufferProvider>::get_value_size(&DataType::FixedSizeBinary(16), &mut cursor).unwrap(), 16);
+    }
+
+    #[test]
+    fn test_get_value_size_variable_types() {
+        use crate::reader::cursor::AvroCursor;
+
+        // String "hello" - length 5 encoded as varint (0x0A = 5 in zigzag)
+        // Total size = 4 (length prefix in output) + 5 (data) = 9
+        let data = vec![0x0Au8, b'h', b'e', b'l', b'l', b'o'];
+        let mut cursor = AvroCursor::new(&data);
+
+        let size = PooledRecordDecoder::<DefaultBufferProvider>::get_value_size(&DataType::Utf8, &mut cursor).unwrap();
+        assert_eq!(size, 4 + 5); // 4 byte length prefix + 5 bytes data
+
+        // Binary with length 10 - 0x14 = 10 in zigzag
+        let data = vec![0x14u8; 11]; // Length byte + 10 data bytes
+        let mut cursor = AvroCursor::new(&data);
+
+        let size = PooledRecordDecoder::<DefaultBufferProvider>::get_value_size(&DataType::Binary, &mut cursor).unwrap();
+        assert_eq!(size, 4 + 10); // 4 byte length prefix + 10 bytes data
+    }
+
+    #[test]
+    fn test_build_array_from_buffer_int32() {
+        // Create buffer with 3 i32 values: 1, 2, 3
+        let mut data = Vec::new();
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(&2i32.to_le_bytes());
+        data.extend_from_slice(&3i32.to_le_bytes());
+        let buffer = Buffer::from(data);
+
+        let array = PooledRecordDecoder::<DefaultBufferProvider>::build_array_from_buffer(
+            DataType::Int32,
+            buffer,
+        ).unwrap();
+
+        let int_array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(int_array.len(), 3);
+        assert_eq!(int_array.value(0), 1);
+        assert_eq!(int_array.value(1), 2);
+        assert_eq!(int_array.value(2), 3);
+    }
+
+    #[test]
+    fn test_build_array_from_buffer_int64() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&100i64.to_le_bytes());
+        data.extend_from_slice(&200i64.to_le_bytes());
+        let buffer = Buffer::from(data);
+
+        let array = PooledRecordDecoder::<DefaultBufferProvider>::build_array_from_buffer(
+            DataType::Int64,
+            buffer,
+        ).unwrap();
+
+        let int_array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(int_array.len(), 2);
+        assert_eq!(int_array.value(0), 100);
+        assert_eq!(int_array.value(1), 200);
+    }
+
+    #[test]
+    fn test_build_array_from_buffer_float32() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&1.5f32.to_le_bytes());
+        data.extend_from_slice(&2.5f32.to_le_bytes());
+        let buffer = Buffer::from(data);
+
+        let array = PooledRecordDecoder::<DefaultBufferProvider>::build_array_from_buffer(
+            DataType::Float32,
+            buffer,
+        ).unwrap();
+
+        let float_array = array.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(float_array.len(), 2);
+        assert!((float_array.value(0) - 1.5).abs() < 0.001);
+        assert!((float_array.value(1) - 2.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_build_array_from_buffer_float64() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&3.14159f64.to_le_bytes());
+        let buffer = Buffer::from(data);
+
+        let array = PooledRecordDecoder::<DefaultBufferProvider>::build_array_from_buffer(
+            DataType::Float64,
+            buffer,
+        ).unwrap();
+
+        let float_array = array.as_any().downcast_ref::<Float64Array>().unwrap();
+        assert_eq!(float_array.len(), 1);
+        assert!((float_array.value(0) - 3.14159).abs() < 0.00001);
+    }
+
+    #[test]
+    fn test_build_array_from_buffer_boolean() {
+        // Booleans stored as bytes (0 or 1)
+        let data = vec![1u8, 0u8, 1u8, 1u8, 0u8];
+        let buffer = Buffer::from(data);
+
+        let array = PooledRecordDecoder::<DefaultBufferProvider>::build_array_from_buffer(
+            DataType::Boolean,
+            buffer,
+        ).unwrap();
+
+        let bool_array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert_eq!(bool_array.len(), 5);
+        assert!(bool_array.value(0));
+        assert!(!bool_array.value(1));
+        assert!(bool_array.value(2));
+        assert!(bool_array.value(3));
+        assert!(!bool_array.value(4));
+    }
+
+    #[test]
+    fn test_build_array_from_buffer_empty() {
+        let buffer = Buffer::from(Vec::<u8>::new());
+
+        let array = PooledRecordDecoder::<DefaultBufferProvider>::build_array_from_buffer(
+            DataType::Int32,
+            buffer,
+        ).unwrap();
+
+        let int_array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(int_array.len(), 0);
+    }
+
+    #[test]
+    fn test_build_array_from_buffer_unsupported_type() {
+        let buffer = Buffer::from(vec![0u8; 10]);
+
+        let result = PooledRecordDecoder::<DefaultBufferProvider>::build_array_from_buffer(
+            DataType::Utf8, // String not supported in buffer mode
+            buffer,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not implemented"));
+    }
+
+    #[test]
+    fn test_preallocated_list_with_child_region() {
+        // Create a schema with a List<Int32> column
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("list_col", DataType::List(Arc::new(Field::new("item", DataType::Int32, false))), false),
+        ]));
+
+        // Create layout with child region for list elements
+        let child_region = ColumnRegion::fixed(1024, 512); // 512 bytes for child data
+        let parent_region = ColumnRegion::fixed(0, 1024).with_child(child_region);
+
+        let layout = BufferLayout {
+            columns: vec![parent_region],
+            total_size: 1536,
+            row_count: 100,
+        };
+
+        let buffer = vec![0u8; 1536];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Enable pre-allocated mode
+        decoder.enable_preallocated_list(0).unwrap();
+
+        // Verify child region is accessible
+        assert!(decoder.provider.has_capacity_for_child_data(0, 0, 100));
+        assert!(decoder.provider.has_capacity_for_child_data(0, 0, 512));
+        // Should still have capacity at exactly 512
+        assert!(!decoder.provider.has_capacity_for_child_data(0, 0, 513));
+    }
+
+    #[test]
+    fn test_child_region_capacity_check() {
+        let child_region = ColumnRegion::fixed(100, 50); // 50 bytes capacity
+        let parent_region = ColumnRegion::fixed(0, 100).with_child(child_region);
+
+        let layout = BufferLayout {
+            columns: vec![parent_region],
+            total_size: 150,
+            row_count: 10,
+        };
+
+        let buffer = vec![0u8; 150];
+        let provider = PooledBufferProvider::new(buffer, layout);
+
+        // Should have capacity for up to 50 bytes
+        assert!(provider.has_capacity_for_child_data(0, 0, 50));
+        assert!(!provider.has_capacity_for_child_data(0, 0, 51));
+
+        // Invalid column index
+        assert!(!provider.has_capacity_for_child_data(5, 0, 10));
+
+        // Invalid child index
+        assert!(!provider.has_capacity_for_child_data(0, 1, 10));
+    }
+
+    // =============================================================================
+    // Comprehensive roundtrip tests for ALL supported Avro types
+    // =============================================================================
+
+    /// Helper to create Avro varint encoding for i32
+    fn encode_varint_i32(val: i32) -> Vec<u8> {
+        let zigzag = ((val << 1) ^ (val >> 31)) as u32;
+        let mut result = Vec::new();
+        let mut n = zigzag;
+        loop {
+            if n & !0x7F == 0 {
+                result.push(n as u8);
+                break;
+            }
+            result.push((n as u8 & 0x7F) | 0x80);
+            n >>= 7;
+        }
+        result
+    }
+
+    /// Helper to create Avro varint encoding for i64
+    fn encode_varint_i64(val: i64) -> Vec<u8> {
+        let zigzag = ((val << 1) ^ (val >> 63)) as u64;
+        let mut result = Vec::new();
+        let mut n = zigzag;
+        loop {
+            if n & !0x7F == 0 {
+                result.push(n as u8);
+                break;
+            }
+            result.push((n as u8 & 0x7F) | 0x80);
+            n >>= 7;
+        }
+        result
+    }
+
+    /// Helper to encode Avro string/bytes (length-prefixed)
+    fn encode_bytes(data: &[u8]) -> Vec<u8> {
+        let mut result = encode_varint_i64(data.len() as i64);
+        result.extend_from_slice(data);
+        result
+    }
+
+    #[test]
+    fn test_roundtrip_flat_schema() {
+        // Test flat schema: Int64, Float64, Int32, Float32
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("count", DataType::Int32, false),
+            Field::new("ratio", DataType::Float32, false),
+        ]));
+
+        let rows = 100;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows * 8),        // id: Int64
+                ColumnRegion::fixed(rows * 8, rows * 8), // value: Float64
+                ColumnRegion::fixed(rows * 16, rows * 4),// count: Int32
+                ColumnRegion::fixed(rows * 20, rows * 4),// ratio: Float32
+            ],
+            total_size: rows * 24,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            avro_data.extend(encode_varint_i64(i as i64));      // id
+            avro_data.extend((i as f64 * 0.1).to_le_bytes());    // value (fixed 8 bytes)
+            avro_data.extend(encode_varint_i32((i % 1000) as i32)); // count
+            avro_data.extend((i as f32 / 100.0).to_le_bytes());  // ratio (fixed 4 bytes)
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+        assert_eq!(batch.num_columns(), 4);
+
+        // Verify values
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(99), 99);
+
+        let count_col = batch.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(count_col.value(0), 0);
+        assert_eq!(count_col.value(99), 99);
+    }
+
+    #[test]
+    fn test_roundtrip_strings_schema() {
+        // Test strings-only schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("email", DataType::Utf8, false),
+        ]));
+
+        let rows = 50;
+        let avg_len = 20;
+        let string_capacity = rows * (avg_len + 10);
+        let offsets_capacity = (rows + 1) * 4;
+
+        let mut offset = 0;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion {
+                    data_offset: offset,
+                    data_capacity: string_capacity,
+                    offsets_offset: Some(offset + string_capacity),
+                    offsets_capacity: Some(offsets_capacity),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![],
+                },
+                {
+                    offset += string_capacity + offsets_capacity;
+                    ColumnRegion {
+                        data_offset: offset,
+                        data_capacity: string_capacity,
+                        offsets_offset: Some(offset + string_capacity),
+                        offsets_capacity: Some(offsets_capacity),
+                        null_bitmap_offset: None,
+                        null_bitmap_capacity: None,
+                        child_regions: vec![],
+                    }
+                },
+            ],
+            total_size: (string_capacity + offsets_capacity) * 2,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            let name = format!("name_{:05}", i);
+            let email = format!("user{}@test.com", i);
+            avro_data.extend(encode_bytes(name.as_bytes()));
+            avro_data.extend(encode_bytes(email.as_bytes()));
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+        assert_eq!(batch.num_columns(), 2);
+
+        let name_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(name_col.value(0), "name_00000");
+        assert_eq!(name_col.value(49), "name_00049");
+    }
+
+    #[test]
+    fn test_roundtrip_mixed_schema() {
+        // Test mixed schema: fixed + variable types
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+
+        let rows = 30;
+        let string_capacity = rows * 30;
+        let offsets_capacity = (rows + 1) * 4;
+
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows * 8), // id
+                ColumnRegion {
+                    data_offset: rows * 8,
+                    data_capacity: string_capacity,
+                    offsets_offset: Some(rows * 8 + string_capacity),
+                    offsets_capacity: Some(offsets_capacity),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![],
+                },
+                ColumnRegion::fixed(rows * 8 + string_capacity + offsets_capacity, rows * 8), // value
+            ],
+            total_size: rows * 16 + string_capacity + offsets_capacity,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            avro_data.extend(encode_varint_i64(i as i64 * 100));
+            let name = format!("item_{}", i);
+            avro_data.extend(encode_bytes(name.as_bytes()));
+            avro_data.extend((i as f64 * 1.5).to_le_bytes());
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(10), 1000);
+    }
+
+    #[test]
+    fn test_roundtrip_dictionary_schema() {
+        use arrow_array::DictionaryArray;
+        use arrow_array::types::Int32Type;
+
+        // Test dictionary (enum) schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("status", DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Utf8)
+            ), false),
+        ]));
+
+        let rows = 100;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, 0), // Dictionary uses Vec internally
+            ],
+            total_size: 0,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; 1]; // Minimal buffer
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Set dictionary values (enum symbols)
+        decoder.set_dictionary_values(0, vec![
+            "ACTIVE".to_string(),
+            "INACTIVE".to_string(),
+            "PENDING".to_string(),
+        ]).unwrap();
+
+        // Encode test data - just varint indices
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            avro_data.extend(encode_varint_i32((i % 3) as i32)); // cycle through 0, 1, 2
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        let dict_col = batch.column(0).as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>().unwrap();
+
+        // Check that keys cycle through 0, 1, 2
+        let keys = dict_col.keys();
+        assert_eq!(keys.value(0), 0);
+        assert_eq!(keys.value(1), 1);
+        assert_eq!(keys.value(2), 2);
+        assert_eq!(keys.value(3), 0);
+    }
+
+    #[test]
+    fn test_roundtrip_all_types_combined() {
+
+        // Test comprehensive schema with all types
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+            Field::new("status", DataType::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(DataType::Utf8)
+            ), false),
+            Field::new("count", DataType::Int32, false),
+        ]));
+
+        let rows = 50;
+        let string_capacity = rows * 30;
+        let offsets_capacity = (rows + 1) * 4;
+
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows * 8),  // id
+                ColumnRegion {                      // name
+                    data_offset: rows * 8,
+                    data_capacity: string_capacity,
+                    offsets_offset: Some(rows * 8 + string_capacity),
+                    offsets_capacity: Some(offsets_capacity),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![],
+                },
+                ColumnRegion::fixed(rows * 8 + string_capacity + offsets_capacity, rows * 8), // value
+                ColumnRegion::fixed(0, 0),  // status (Dictionary uses Vec)
+                ColumnRegion::fixed(rows * 16 + string_capacity + offsets_capacity, rows * 4), // count
+            ],
+            total_size: rows * 20 + string_capacity + offsets_capacity,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Set dictionary values
+        decoder.set_dictionary_values(3, vec![
+            "ACTIVE".to_string(),
+            "INACTIVE".to_string(),
+            "PENDING".to_string(),
+        ]).unwrap();
+
+        // Encode test data
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            avro_data.extend(encode_varint_i64(i as i64));                // id
+            let name = format!("item_{}", i);
+            avro_data.extend(encode_bytes(name.as_bytes()));              // name
+            avro_data.extend((i as f64 * 0.5).to_le_bytes());             // value (fixed 8 bytes)
+            avro_data.extend(encode_varint_i32((i % 3) as i32));          // status (enum index)
+            avro_data.extend(encode_varint_i32((i * 10) as i32));         // count
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+        assert_eq!(batch.num_columns(), 5);
+
+        // Verify id column
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(25), 25);
+
+        // Verify name column
+        let name_col = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(name_col.value(0), "item_0");
+
+        // Verify count column
+        let count_col = batch.column(4).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(count_col.value(0), 0);
+        assert_eq!(count_col.value(5), 50);
+    }
+
+    #[test]
+    fn test_batch_decode_path_selection() {
+        // Verify that different schemas use the correct batch decode path
+
+        // Flat schema should use decode_batch_flat
+        let flat_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, 80),
+                ColumnRegion::fixed(80, 40),
+            ],
+            total_size: 120,
+            row_count: 10,
+        };
+        let buffer = vec![0u8; 120];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let decoder = PooledRecordDecoder::try_new(flat_schema, provider).unwrap();
+        assert!(decoder.is_flat_schema());
+
+        // Strings schema should use decode_batch_strings_only
+        let strings_schema = Arc::new(Schema::new(vec![
+            Field::new("s1", DataType::Utf8, false),
+            Field::new("s2", DataType::Utf8, false),
+        ]));
+        let layout2 = BufferLayout {
+            columns: vec![
+                ColumnRegion {
+                    data_offset: 0,
+                    data_capacity: 100,
+                    offsets_offset: Some(100),
+                    offsets_capacity: Some(44),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![],
+                },
+                ColumnRegion {
+                    data_offset: 144,
+                    data_capacity: 100,
+                    offsets_offset: Some(244),
+                    offsets_capacity: Some(44),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![],
+                },
+            ],
+            total_size: 288,
+            row_count: 10,
+        };
+        let buffer2 = vec![0u8; 288];
+        let provider2 = PooledBufferProvider::new(buffer2, layout2);
+        let decoder2 = PooledRecordDecoder::try_new(strings_schema, provider2).unwrap();
+        assert!(decoder2.is_strings_only_schema());
+    }
+
+    #[test]
+    fn test_roundtrip_list_schema() {
+        use arrow_array::ListArray;
+
+        // Test List<Int32> schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("scores", DataType::List(Arc::new(Field::new("item", DataType::Int32, false))), false),
+        ]));
+
+        let rows = 10;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows * 8), // id
+                ColumnRegion::fixed(0, 0),        // scores (List uses Vec internally)
+            ],
+            total_size: rows * 8,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data - Avro array format: block_count, elements..., 0 (end)
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            // id
+            avro_data.extend(encode_varint_i64(i as i64));
+            // scores array: [i*10, i*10+1, i*10+2] (3 elements)
+            avro_data.extend(encode_varint_i64(3)); // block count
+            avro_data.extend(encode_varint_i32((i * 10) as i32));
+            avro_data.extend(encode_varint_i32((i * 10 + 1) as i32));
+            avro_data.extend(encode_varint_i32((i * 10 + 2) as i32));
+            avro_data.extend(encode_varint_i64(0)); // end of array
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+        assert_eq!(batch.num_columns(), 2);
+
+        // Verify id column
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(5), 5);
+
+        // Verify list column
+        let list_col = batch.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list_col.len(), rows);
+
+        // Check first row's list: [0, 1, 2]
+        let first_list = list_col.value(0);
+        let first_values = first_list.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(first_values.len(), 3);
+        assert_eq!(first_values.value(0), 0);
+        assert_eq!(first_values.value(1), 1);
+        assert_eq!(first_values.value(2), 2);
+
+        // Check row 5's list: [50, 51, 52]
+        let fifth_list = list_col.value(5);
+        let fifth_values = fifth_list.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(fifth_values.value(0), 50);
+    }
+
+    #[test]
+    fn test_roundtrip_map_schema() {
+        use arrow_array::MapArray;
+
+        // Test Map<String, Int32> schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("metadata", DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int32, true),
+                    ].into()
+                ), false)),
+                false
+            ), false),
+        ]));
+
+        let rows = 5;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows * 8), // id
+                ColumnRegion::fixed(0, 0),        // metadata (Map uses Vec internally)
+            ],
+            total_size: rows * 8,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data - Avro map format: block_count, (key, value)..., 0 (end)
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            // id
+            avro_data.extend(encode_varint_i64(i as i64));
+            // map with 2 entries: {"a": i*10, "b": i*10+1}
+            avro_data.extend(encode_varint_i64(2)); // block count
+            avro_data.extend(encode_bytes(b"a"));
+            avro_data.extend(encode_varint_i32((i * 10) as i32));
+            avro_data.extend(encode_bytes(b"b"));
+            avro_data.extend(encode_varint_i32((i * 10 + 1) as i32));
+            avro_data.extend(encode_varint_i64(0)); // end of map
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+        assert_eq!(batch.num_columns(), 2);
+
+        // Verify id column
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+
+        // Verify map column structure
+        let map_col = batch.column(1).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map_col.len(), rows);
+
+        // Each row should have 2 entries
+        assert_eq!(map_col.value_length(0), 2);
+        assert_eq!(map_col.value_length(1), 2);
+    }
+
+    #[test]
+    fn test_roundtrip_map_preallocated() {
+        use arrow_array::MapArray;
+
+        // Test Map<String, Int32> schema with pre-allocated child regions
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("metadata", DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int32, true),
+                    ].into()
+                ), false)),
+                false
+            ), false),
+        ]));
+
+        let rows = 5;
+        let avg_entries = 2;
+        let total_entries = rows * avg_entries;
+        let avg_key_len = 5;
+
+        // Calculate buffer sizes
+        let id_cap = rows * 8;
+        let map_off_cap = (rows + 1) * 4;
+        let key_data_cap = total_entries * avg_key_len;
+        let key_off_cap = (total_entries + 1) * 4; // key string offsets
+        let value_data_cap = total_entries * 4; // Int32 values (fixed size, no offsets needed)
+
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, id_cap), // id
+                ColumnRegion {
+                    data_offset: id_cap,
+                    data_capacity: 0,
+                    offsets_offset: Some(id_cap),
+                    offsets_capacity: Some(map_off_cap),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![
+                        // child_index 0: key data (strings) + offsets
+                        ColumnRegion {
+                            data_offset: id_cap + map_off_cap,
+                            data_capacity: key_data_cap,
+                            offsets_offset: Some(id_cap + map_off_cap + key_data_cap),
+                            offsets_capacity: Some(key_off_cap),
+                            null_bitmap_offset: None,
+                            null_bitmap_capacity: None,
+                            child_regions: vec![],
+                        },
+                        // child_index 1: value data (Int32 - no offsets needed)
+                        ColumnRegion {
+                            data_offset: id_cap + map_off_cap + key_data_cap + key_off_cap,
+                            data_capacity: value_data_cap,
+                            offsets_offset: None,
+                            offsets_capacity: None,
+                            null_bitmap_offset: None,
+                            null_bitmap_capacity: None,
+                            child_regions: vec![],
+                        },
+                    ],
+                },
+            ],
+            total_size: id_cap + map_off_cap + key_data_cap + key_off_cap + value_data_cap,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data - Avro map format: block_count, (key, value)..., 0 (end)
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            // id
+            avro_data.extend(encode_varint_i64(i as i64));
+            // map with 2 entries: {"a": i*10, "b": i*10+1}
+            avro_data.extend(encode_varint_i64(2)); // block count
+            avro_data.extend(encode_bytes(b"a"));
+            avro_data.extend(encode_varint_i32((i * 10) as i32));
+            avro_data.extend(encode_bytes(b"b"));
+            avro_data.extend(encode_varint_i32((i * 10 + 1) as i32));
+            avro_data.extend(encode_varint_i64(0)); // end of map
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+        assert_eq!(batch.num_columns(), 2);
+
+        // Verify id column
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+
+        // Verify map column structure
+        let map_col = batch.column(1).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map_col.len(), rows);
+
+        // Each row should have 2 entries
+        assert_eq!(map_col.value_length(0), 2);
+        assert_eq!(map_col.value_length(1), 2);
+    }
+
+    // NOTE: test_roundtrip_map_string_string_preallocated was removed because
+    // preallocated Map mode was removed in favor of Vec-only mode.
+    // Map functionality is covered by test_roundtrip_map_string_int.
+
+    #[test]
+    fn test_roundtrip_union_schema() {
+        use arrow_array::UnionArray;
+
+        // Test Union schema: ["null", "string"]
+        let union_fields = UnionFields::new(
+            vec![0, 1],
+            vec![
+                Field::new("null", DataType::Null, true),
+                Field::new("string", DataType::Utf8, false),
+            ],
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("optional_name", DataType::Union(union_fields, UnionMode::Dense), false),
+        ]));
+
+        let rows = 10;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows * 8), // id
+                ColumnRegion::fixed(0, 0),        // optional_name (Union uses Vec internally)
+            ],
+            total_size: rows * 8,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data - Avro union format: type_index (varint), then value
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            // id
+            avro_data.extend(encode_varint_i64(i as i64));
+            // optional_name: alternate between null (index 0) and string (index 1)
+            if i % 2 == 0 {
+                avro_data.extend(encode_varint_i64(0)); // null type
+                // no value for null
+            } else {
+                avro_data.extend(encode_varint_i64(1)); // string type
+                let name = format!("name_{}", i);
+                avro_data.extend(encode_bytes(name.as_bytes()));
+            }
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+        assert_eq!(batch.num_columns(), 2);
+
+        // Verify id column
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(5), 5);
+
+        // Verify union column
+        let union_col = batch.column(1).as_any().downcast_ref::<UnionArray>().unwrap();
+        assert_eq!(union_col.len(), rows);
+
+        // Check type IDs alternate: 0 (null), 1 (string), 0, 1, ...
+        assert_eq!(union_col.type_id(0), 0); // null
+        assert_eq!(union_col.type_id(1), 1); // string
+        assert_eq!(union_col.type_id(2), 0); // null
+        assert_eq!(union_col.type_id(3), 1); // string
+    }
+
+    #[test]
+    fn test_roundtrip_struct_schema() {
+        use arrow_array::StructArray;
+
+        // Test nested struct schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("address", DataType::Struct(
+                vec![
+                    Field::new("street", DataType::Utf8, false),
+                    Field::new("city", DataType::Utf8, false),
+                    Field::new("zip", DataType::Int32, false),
+                ].into()
+            ), false),
+        ]));
+
+        let rows = 5;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows * 8), // id
+                ColumnRegion::fixed(0, 0),        // address (Struct uses Vec internally)
+            ],
+            total_size: rows * 8,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data - Avro record format: fields in order, no type tags
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            // id
+            avro_data.extend(encode_varint_i64(i as i64));
+            // address struct: street, city, zip
+            let street = format!("{} Main St", i * 100);
+            let city = format!("City{}", i);
+            avro_data.extend(encode_bytes(street.as_bytes()));
+            avro_data.extend(encode_bytes(city.as_bytes()));
+            avro_data.extend(encode_varint_i32((10000 + i) as i32));
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+        assert_eq!(batch.num_columns(), 2);
+
+        // Verify id column
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(4), 4);
+
+        // Verify struct column
+        let struct_col = batch.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_col.len(), rows);
+        assert_eq!(struct_col.num_columns(), 3);
+
+        // Check street field
+        let street_col = struct_col.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(street_col.value(0), "0 Main St");
+        assert_eq!(street_col.value(3), "300 Main St");
+
+        // Check city field
+        let city_col = struct_col.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(city_col.value(0), "City0");
+
+        // Check zip field
+        let zip_col = struct_col.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(zip_col.value(0), 10000);
+        assert_eq!(zip_col.value(4), 10004);
+    }
+
+    #[test]
+    fn test_roundtrip_list_of_strings() {
+        use arrow_array::ListArray;
+
+        // Test List<String> schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))), false),
+        ]));
+
+        let rows = 5;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, 0), // tags (List uses Vec internally)
+            ],
+            total_size: 1,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            // tags array: ["tag_i_0", "tag_i_1"]
+            avro_data.extend(encode_varint_i64(2)); // block count
+            avro_data.extend(encode_bytes(format!("tag_{}_0", i).as_bytes()));
+            avro_data.extend(encode_bytes(format!("tag_{}_1", i).as_bytes()));
+            avro_data.extend(encode_varint_i64(0)); // end of array
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        // Verify list column
+        let list_col = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list_col.len(), rows);
+
+        // Check first row
+        let first_list = list_col.value(0);
+        let first_values = first_list.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(first_values.len(), 2);
+        assert_eq!(first_values.value(0), "tag_0_0");
+        assert_eq!(first_values.value(1), "tag_0_1");
+    }
+
+    #[test]
+    fn test_roundtrip_boolean() {
+        use arrow_array::BooleanArray;
+
+        // Test Boolean schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("active", DataType::Boolean, false),
+            Field::new("verified", DataType::Boolean, false),
+        ]));
+
+        let rows = 10;
+        // Boolean in universal decode path uses 1 byte per value
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows),      // active
+                ColumnRegion::fixed(rows, rows),   // verified
+            ],
+            total_size: rows * 2,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data - Avro boolean is 1 byte: 0 = false, 1 = true
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            avro_data.push(if i % 2 == 0 { 1 } else { 0 }); // active: alternate
+            avro_data.push(if i % 3 == 0 { 1 } else { 0 }); // verified: every 3rd
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert_eq!(bytes_consumed, rows * 2);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        let active_col = batch.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(active_col.value(0));  // true
+        assert!(!active_col.value(1)); // false
+        assert!(active_col.value(2));  // true
+
+        let verified_col = batch.column(1).as_any().downcast_ref::<BooleanArray>().unwrap();
+        assert!(verified_col.value(0));  // true (0 % 3 == 0)
+        assert!(!verified_col.value(1)); // false
+        assert!(!verified_col.value(2)); // false
+        assert!(verified_col.value(3));  // true (3 % 3 == 0)
+    }
+
+    #[test]
+    fn test_roundtrip_binary_and_fixed() {
+        use arrow_array::{BinaryArray, FixedSizeBinaryArray};
+
+        // Test Binary and FixedSizeBinary schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data", DataType::Binary, false),
+            Field::new("checksum", DataType::FixedSizeBinary(4), false),
+        ]));
+
+        let rows = 5;
+        let binary_capacity = rows * 20;
+        let offsets_capacity = (rows + 1) * 4;
+        let fixed_capacity = rows * 4;
+
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion {
+                    data_offset: 0,
+                    data_capacity: binary_capacity,
+                    offsets_offset: Some(binary_capacity),
+                    offsets_capacity: Some(offsets_capacity),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![],
+                },
+                ColumnRegion::fixed(binary_capacity + offsets_capacity, fixed_capacity),
+            ],
+            total_size: binary_capacity + offsets_capacity + fixed_capacity,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            // data: variable length bytes
+            let data: Vec<u8> = (0..10).map(|j| ((i + j) % 256) as u8).collect();
+            avro_data.extend(encode_bytes(&data));
+            // checksum: fixed 4 bytes
+            avro_data.extend(&[(i as u8), (i as u8) + 1, (i as u8) + 2, (i as u8) + 3]);
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        // Verify binary column
+        let binary_col = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(binary_col.value(0).len(), 10);
+        assert_eq!(binary_col.value(0)[0], 0);
+
+        // Verify fixed binary column
+        let fixed_col = batch.column(1).as_any().downcast_ref::<FixedSizeBinaryArray>().unwrap();
+        assert_eq!(fixed_col.value(0), &[0, 1, 2, 3]);
+        assert_eq!(fixed_col.value(1), &[1, 2, 3, 4]);
+    }
+
+    // ==========================================================================
+    // DEEPLY NESTED TYPE TESTS (verifying recursive decode_value_to_vec)
+    // ==========================================================================
+
+    #[test]
+    fn test_roundtrip_list_of_structs() {
+        use arrow_array::{ListArray, StructArray};
+
+        // Schema: List<Struct{name: String, value: Int32}>
+        let struct_fields: Fields = vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Int32, false),
+        ].into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("items", DataType::List(Arc::new(
+                Field::new("item", DataType::Struct(struct_fields), false)
+            )), false),
+        ]));
+
+        let rows = 3;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, 0), // List uses Vec internally
+            ],
+            total_size: 1,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode: row0=[{name:"a",value:1},{name:"b",value:2}], row1=[], row2=[{name:"c",value:3}]
+        let mut avro_data = Vec::new();
+        // Row 0: 2 items
+        avro_data.extend(encode_varint_i64(2)); // block count
+        avro_data.extend(encode_bytes(b"a"));
+        avro_data.extend(encode_varint_i32(1));
+        avro_data.extend(encode_bytes(b"b"));
+        avro_data.extend(encode_varint_i32(2));
+        avro_data.extend(encode_varint_i64(0)); // end of array
+        // Row 1: 0 items (empty)
+        avro_data.extend(encode_varint_i64(0)); // end of array
+        // Row 2: 1 item
+        avro_data.extend(encode_varint_i64(1)); // block count
+        avro_data.extend(encode_bytes(b"c"));
+        avro_data.extend(encode_varint_i32(3));
+        avro_data.extend(encode_varint_i64(0)); // end of array
+
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        let list_col = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list_col.len(), 3);
+        assert_eq!(list_col.value_length(0), 2); // row0 has 2 items
+        assert_eq!(list_col.value_length(1), 0); // row1 is empty
+        assert_eq!(list_col.value_length(2), 1); // row2 has 1 item
+
+        // Get first row's struct array
+        let row0_items = list_col.value(0);
+        let struct_arr = row0_items.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(struct_arr.len(), 2);
+
+        let names = struct_arr.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(names.value(0), "a");
+        assert_eq!(names.value(1), "b");
+
+        let values = struct_arr.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(values.value(0), 1);
+        assert_eq!(values.value(1), 2);
+    }
+
+    #[test]
+    fn test_roundtrip_nested_struct() {
+        use arrow_array::StructArray;
+
+        // Schema: Struct{id: Int64, inner: Struct{x: Int32, y: Int32}}
+        let inner_fields: Fields = vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ].into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("inner", DataType::Struct(inner_fields), false),
+        ]));
+
+        let rows = 3;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows * 8), // id
+                ColumnRegion::fixed(0, 0), // inner struct uses Vec
+            ],
+            total_size: rows * 8,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            avro_data.extend(encode_varint_i64(i as i64));      // id
+            avro_data.extend(encode_varint_i32((i * 10) as i32)); // x
+            avro_data.extend(encode_varint_i32((i * 20) as i32)); // y
+        }
+
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(2), 2);
+
+        let inner_col = batch.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(inner_col.len(), rows);
+
+        let x_col = inner_col.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let y_col = inner_col.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(x_col.value(0), 0);
+        assert_eq!(y_col.value(0), 0);
+        assert_eq!(x_col.value(2), 20);
+        assert_eq!(y_col.value(2), 40);
+    }
+
+    #[test]
+    fn test_roundtrip_list_of_lists() {
+        use arrow_array::ListArray;
+
+        // Schema: List<List<Int32>> (2D array)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("matrix", DataType::List(Arc::new(
+                Field::new("row", DataType::List(Arc::new(
+                    Field::new("item", DataType::Int32, false)
+                )), false)
+            )), false),
+        ]));
+
+        let rows = 2;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, 0), // List uses Vec
+            ],
+            total_size: 1,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Row 0: [[1,2],[3]]
+        // Row 1: [[4,5,6]]
+        let mut avro_data = Vec::new();
+        // Row 0: 2 inner lists
+        avro_data.extend(encode_varint_i64(2)); // outer block count
+        // Inner list 0: [1,2]
+        avro_data.extend(encode_varint_i64(2));
+        avro_data.extend(encode_varint_i32(1));
+        avro_data.extend(encode_varint_i32(2));
+        avro_data.extend(encode_varint_i64(0)); // end inner
+        // Inner list 1: [3]
+        avro_data.extend(encode_varint_i64(1));
+        avro_data.extend(encode_varint_i32(3));
+        avro_data.extend(encode_varint_i64(0)); // end inner
+        avro_data.extend(encode_varint_i64(0)); // end outer
+        // Row 1: 1 inner list
+        avro_data.extend(encode_varint_i64(1)); // outer block count
+        // Inner list 0: [4,5,6]
+        avro_data.extend(encode_varint_i64(3));
+        avro_data.extend(encode_varint_i32(4));
+        avro_data.extend(encode_varint_i32(5));
+        avro_data.extend(encode_varint_i32(6));
+        avro_data.extend(encode_varint_i64(0)); // end inner
+        avro_data.extend(encode_varint_i64(0)); // end outer
+
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        let outer_list = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(outer_list.len(), 2);
+        assert_eq!(outer_list.value_length(0), 2); // row0 has 2 inner lists
+        assert_eq!(outer_list.value_length(1), 1); // row1 has 1 inner list
+
+        // Check first row's inner lists
+        let row0 = outer_list.value(0);
+        let inner_lists = row0.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(inner_lists.len(), 2);
+        assert_eq!(inner_lists.value_length(0), 2); // [1,2]
+        assert_eq!(inner_lists.value_length(1), 1); // [3]
+
+        let first_inner = inner_lists.value(0);
+        let int_arr = first_inner.as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(int_arr.value(0), 1);
+        assert_eq!(int_arr.value(1), 2);
+    }
+
+    #[test]
+    fn test_roundtrip_map_of_structs() {
+        use arrow_array::{MapArray, StructArray};
+
+        // Schema: Map<String, Struct{x: Int32, y: Int32}>
+        let value_fields: Fields = vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ].into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("coords", DataType::Map(
+                Arc::new(Field::new("entries", DataType::Struct(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Struct(value_fields), true),
+                ].into()), false)),
+                false
+            ), false),
+        ]));
+
+        let rows = 2;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, 0), // Map uses Vec
+            ],
+            total_size: 1,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Row 0: {"a": {x:1, y:2}, "b": {x:3, y:4}}
+        // Row 1: {"c": {x:5, y:6}}
+        let mut avro_data = Vec::new();
+        // Row 0: 2 entries
+        avro_data.extend(encode_varint_i64(2));
+        avro_data.extend(encode_bytes(b"a"));
+        avro_data.extend(encode_varint_i32(1)); // x
+        avro_data.extend(encode_varint_i32(2)); // y
+        avro_data.extend(encode_bytes(b"b"));
+        avro_data.extend(encode_varint_i32(3)); // x
+        avro_data.extend(encode_varint_i32(4)); // y
+        avro_data.extend(encode_varint_i64(0)); // end map
+        // Row 1: 1 entry
+        avro_data.extend(encode_varint_i64(1));
+        avro_data.extend(encode_bytes(b"c"));
+        avro_data.extend(encode_varint_i32(5)); // x
+        avro_data.extend(encode_varint_i32(6)); // y
+        avro_data.extend(encode_varint_i64(0)); // end map
+
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        let map_col = batch.column(0).as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(map_col.len(), 2);
+        assert_eq!(map_col.value_length(0), 2); // row0 has 2 entries
+        assert_eq!(map_col.value_length(1), 1); // row1 has 1 entry
+
+        // Get keys from first row
+        let row0 = map_col.value(0);
+        let keys = row0.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(keys.value(0), "a");
+        assert_eq!(keys.value(1), "b");
+
+        // Get struct values from first row
+        let values = row0.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+        let x_col = values.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let y_col = values.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(x_col.value(0), 1);
+        assert_eq!(y_col.value(0), 2);
+        assert_eq!(x_col.value(1), 3);
+        assert_eq!(y_col.value(1), 4);
+    }
+
+    #[test]
+    fn test_roundtrip_struct_with_list_field() {
+        use arrow_array::{StructArray, ListArray};
+
+        // Schema: Struct{id: Int64, tags: List<String>}
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("data", DataType::Struct(vec![
+                Field::new("name", DataType::Utf8, false),
+                Field::new("tags", DataType::List(Arc::new(
+                    Field::new("item", DataType::Utf8, false)
+                )), false),
+            ].into()), false),
+        ]));
+
+        let rows = 2;
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(0, rows * 8), // id
+                ColumnRegion::fixed(0, 0), // struct uses Vec
+            ],
+            total_size: rows * 8,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size.max(1)];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Row 0: {id: 1, data: {name: "alice", tags: ["a", "b"]}}
+        // Row 1: {id: 2, data: {name: "bob", tags: []}}
+        let mut avro_data = Vec::new();
+        // Row 0
+        avro_data.extend(encode_varint_i64(1)); // id
+        avro_data.extend(encode_bytes(b"alice")); // name
+        avro_data.extend(encode_varint_i64(2)); // tags block
+        avro_data.extend(encode_bytes(b"a"));
+        avro_data.extend(encode_bytes(b"b"));
+        avro_data.extend(encode_varint_i64(0)); // end tags
+        // Row 1
+        avro_data.extend(encode_varint_i64(2)); // id
+        avro_data.extend(encode_bytes(b"bob")); // name
+        avro_data.extend(encode_varint_i64(0)); // empty tags
+
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 1);
+        assert_eq!(id_col.value(1), 2);
+
+        let struct_col = batch.column(1).as_any().downcast_ref::<StructArray>().unwrap();
+        let name_col = struct_col.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(name_col.value(0), "alice");
+        assert_eq!(name_col.value(1), "bob");
+
+        let tags_col = struct_col.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(tags_col.value_length(0), 2); // alice has 2 tags
+        assert_eq!(tags_col.value_length(1), 0); // bob has 0 tags
+
+        let alice_tags = tags_col.value(0);
+        let tags_arr = alice_tags.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(tags_arr.value(0), "a");
+        assert_eq!(tags_arr.value(1), "b");
     }
 }

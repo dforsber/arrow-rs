@@ -95,3 +95,23 @@ harness = false
 [[bench]]
 name = "avro_writer"
 harness = false
+
+[[bench]]
+name = "pooled_list_benchmark"
+harness = false
+
+[[bench]]
+name = "pooled_flat_benchmark"
+harness = false
+
+[[bench]]
+name = "pooled_string_benchmark"
+harness = false
+
+[[bench]]
+name = "pooled_all_types_benchmark"
+harness = false
+
+[[bench]]
+name = "pooled_decoder_bench"
+harness = false

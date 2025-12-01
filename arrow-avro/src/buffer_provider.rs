@@ -46,8 +46,10 @@
 //!     .build_decoder()?;
 //! ```
 
+use arrow_buffer::alloc::Allocation;
 use arrow_buffer::Buffer;
 use arrow_schema::ArrowError;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 /// Trait for providing pre-allocated buffers for Avro decoding
@@ -164,6 +166,114 @@ pub trait BufferProvider: Send + Sync {
         column_index: usize,
         additional_bytes: usize,
     ) -> bool;
+
+    /// Get raw pointer and capacity for a column's data region
+    ///
+    /// This enables batch writes with multiple columns by avoiding Rust's
+    /// borrow checker limitations. The caller is responsible for ensuring
+    /// writes don't exceed capacity.
+    ///
+    /// # Safety
+    /// The returned pointer is only valid until the buffer is modified or reset.
+    /// Caller must ensure:
+    /// - No writes exceed the returned capacity
+    /// - Column regions don't overlap (they shouldn't by design)
+    ///
+    /// # Arguments
+    /// * `column_index` - Index of the column
+    /// * `offset` - Byte offset within the column's data region
+    ///
+    /// # Returns
+    /// (raw pointer to data region at offset, remaining capacity from offset)
+    fn get_data_ptr(
+        &mut self,
+        column_index: usize,
+        offset: usize,
+    ) -> Result<(*mut u8, usize), ArrowError>;
+
+    // =========================================================================
+    // Child Region Methods (for nested types like List, Map, Struct)
+    // =========================================================================
+
+    /// Get a mutable slice for writing nested child data
+    ///
+    /// # Arguments
+    /// * `column_index` - Index of the parent column in the schema
+    /// * `child_index` - Index of the child region (0 for List elements, 0/1 for Map key/value)
+    /// * `offset` - Byte offset within the child's data region
+    /// * `len` - Number of bytes to write
+    ///
+    /// # Returns
+    /// Mutable slice for writing data, or error if out of bounds
+    fn get_child_data_slice(
+        &mut self,
+        column_index: usize,
+        child_index: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<&mut [u8], ArrowError>;
+
+    /// Get a mutable slice for writing nested child offsets
+    ///
+    /// # Arguments
+    /// * `column_index` - Index of the parent column
+    /// * `child_index` - Index of the child region
+    /// * `offset` - Byte offset within the child's offset region
+    /// * `len` - Number of bytes to write
+    fn get_child_offsets_slice(
+        &mut self,
+        column_index: usize,
+        child_index: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<&mut [u8], ArrowError>;
+
+    /// Finalize child data and return an Arrow Buffer
+    ///
+    /// # Arguments
+    /// * `column_index` - Index of the parent column
+    /// * `child_index` - Index of the child region
+    /// * `data_len` - Actual bytes written to child data region
+    fn finalize_child_data_buffer(
+        &mut self,
+        column_index: usize,
+        child_index: usize,
+        data_len: usize,
+    ) -> Result<Buffer, ArrowError>;
+
+    /// Finalize child offsets and return an Arrow Buffer
+    ///
+    /// # Arguments
+    /// * `column_index` - Index of the parent column
+    /// * `child_index` - Index of the child region
+    /// * `offsets_len` - Actual bytes written to child offsets region
+    fn finalize_child_offsets_buffer(
+        &mut self,
+        column_index: usize,
+        child_index: usize,
+        offsets_len: usize,
+    ) -> Result<Buffer, ArrowError>;
+
+    /// Check if there's capacity for additional child data
+    ///
+    /// # Arguments
+    /// * `column_index` - Index of the parent column
+    /// * `child_index` - Index of the child region
+    /// * `additional_bytes` - Bytes to be added
+    fn has_capacity_for_child_data(
+        &self,
+        column_index: usize,
+        child_index: usize,
+        additional_bytes: usize,
+    ) -> bool;
+
+    /// Check if a column has a pre-configured child region for nested types
+    /// Returns true if the column has child regions configured (for List, Map, etc.)
+    fn has_child_region(&self, column_index: usize, child_index: usize) -> bool {
+        // Default implementation: check if capacity exists for 0 bytes
+        // This works because implementations that have no child regions will return false
+        self.has_capacity_for_child_data(column_index, child_index, 0)
+    }
 }
 
 /// Memory region within a pooled buffer
@@ -181,6 +291,52 @@ pub struct ColumnRegion {
     pub null_bitmap_offset: Option<usize>,
     /// Null bitmap capacity in bytes
     pub null_bitmap_capacity: Option<usize>,
+    /// Child regions for nested types (List elements, Map key/value, Struct fields)
+    pub child_regions: Vec<ColumnRegion>,
+}
+
+impl ColumnRegion {
+    /// Create a simple fixed-width column region
+    pub fn fixed(data_offset: usize, data_capacity: usize) -> Self {
+        Self {
+            data_offset,
+            data_capacity,
+            offsets_offset: None,
+            offsets_capacity: None,
+            null_bitmap_offset: None,
+            null_bitmap_capacity: None,
+            child_regions: Vec::new(),
+        }
+    }
+
+    /// Create a variable-length column region (String, Binary)
+    pub fn variable(
+        data_offset: usize,
+        data_capacity: usize,
+        offsets_offset: usize,
+        offsets_capacity: usize,
+    ) -> Self {
+        Self {
+            data_offset,
+            data_capacity,
+            offsets_offset: Some(offsets_offset),
+            offsets_capacity: Some(offsets_capacity),
+            null_bitmap_offset: None,
+            null_bitmap_capacity: None,
+            child_regions: Vec::new(),
+        }
+    }
+
+    /// Add a child region for nested types
+    pub fn with_child(mut self, child: ColumnRegion) -> Self {
+        self.child_regions.push(child);
+        self
+    }
+
+    /// Get remaining capacity for data
+    pub fn remaining_data_capacity(&self, current_position: usize) -> usize {
+        self.data_capacity.saturating_sub(current_position)
+    }
 }
 
 /// Buffer layout specification for a schema
@@ -304,6 +460,71 @@ impl BufferProvider for DefaultBufferProvider {
     }
 
     fn has_capacity_for_variable_data(&self, _column_index: usize, _additional_bytes: usize) -> bool {
+        true // Always has capacity (will allocate as needed)
+    }
+
+    fn get_data_ptr(
+        &mut self,
+        _column_index: usize,
+        _offset: usize,
+    ) -> Result<(*mut u8, usize), ArrowError> {
+        Err(ArrowError::NotYetImplemented(
+            "DefaultBufferProvider does not provide raw pointers".to_string(),
+        ))
+    }
+
+    fn get_child_data_slice(
+        &mut self,
+        _column_index: usize,
+        _child_index: usize,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<&mut [u8], ArrowError> {
+        Err(ArrowError::NotYetImplemented(
+            "DefaultBufferProvider does not provide child slices".to_string(),
+        ))
+    }
+
+    fn get_child_offsets_slice(
+        &mut self,
+        _column_index: usize,
+        _child_index: usize,
+        _offset: usize,
+        _len: usize,
+    ) -> Result<&mut [u8], ArrowError> {
+        Err(ArrowError::NotYetImplemented(
+            "DefaultBufferProvider does not provide child slices".to_string(),
+        ))
+    }
+
+    fn finalize_child_data_buffer(
+        &mut self,
+        _column_index: usize,
+        _child_index: usize,
+        _data_len: usize,
+    ) -> Result<Buffer, ArrowError> {
+        Err(ArrowError::NotYetImplemented(
+            "DefaultBufferProvider does not provide child buffers".to_string(),
+        ))
+    }
+
+    fn finalize_child_offsets_buffer(
+        &mut self,
+        _column_index: usize,
+        _child_index: usize,
+        _offsets_len: usize,
+    ) -> Result<Buffer, ArrowError> {
+        Err(ArrowError::NotYetImplemented(
+            "DefaultBufferProvider does not provide child buffers".to_string(),
+        ))
+    }
+
+    fn has_capacity_for_child_data(
+        &self,
+        _column_index: usize,
+        _child_index: usize,
+        _additional_bytes: usize,
+    ) -> bool {
         true // Always has capacity (will allocate as needed)
     }
 }
@@ -485,13 +706,11 @@ impl BufferProvider for PooledBufferProvider {
             ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
         })?;
 
-        // Create a Buffer from the slice using from_custom_allocation
-        // Note: This requires implementing the Allocation trait
+        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
         let start = region.data_offset;
-        let slice = &self.buffer[start..start + data_len];
-
-        // For now, copy the data (we'll optimize this later with custom Allocation)
-        Ok(Buffer::from(slice))
+        let ptr = unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(start) as *mut u8) };
+        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        Ok(unsafe { Buffer::from_custom_allocation(ptr, data_len, owner) })
     }
 
     fn finalize_offsets_buffer(
@@ -515,8 +734,11 @@ impl BufferProvider for PooledBufferProvider {
             ))
         })?;
 
-        let slice = &self.buffer[offsets_offset..offsets_offset + offsets_len];
-        Ok(Buffer::from(slice))
+        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
+        let ptr =
+            unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(offsets_offset) as *mut u8) };
+        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        Ok(unsafe { Buffer::from_custom_allocation(ptr, offsets_len, owner) })
     }
 
     fn finalize_null_bitmap_buffer(
@@ -540,8 +762,11 @@ impl BufferProvider for PooledBufferProvider {
             ))
         })?;
 
-        let slice = &self.buffer[bitmap_offset..bitmap_offset + bitmap_len];
-        Ok(Buffer::from(slice))
+        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
+        let ptr =
+            unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(bitmap_offset) as *mut u8) };
+        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        Ok(unsafe { Buffer::from_custom_allocation(ptr, bitmap_len, owner) })
     }
 
     fn reset(&mut self) {
@@ -557,8 +782,8 @@ impl BufferProvider for PooledBufferProvider {
             }
         }
 
-        // Zero the buffer and reset positions
-        self.buffer_mut.iter_mut().for_each(|b| *b = 0);
+        // Just reset positions - don't zero the buffer (decode will overwrite old data)
+        // This is O(num_columns) instead of O(buffer_size)
         self.data_positions.iter_mut().for_each(|p| *p = 0);
         self.offsets_positions.iter_mut().for_each(|p| *p = 0);
         self.null_bitmap_positions.iter_mut().for_each(|p| *p = 0);
@@ -572,6 +797,206 @@ impl BufferProvider for PooledBufferProvider {
         if let Some(region) = self.layout.columns.get(column_index) {
             let current_pos = self.data_positions.get(column_index).copied().unwrap_or(0);
             current_pos + additional_bytes <= region.data_capacity
+        } else {
+            false
+        }
+    }
+
+    fn get_data_ptr(
+        &mut self,
+        column_index: usize,
+        offset: usize,
+    ) -> Result<(*mut u8, usize), ArrowError> {
+        if self.finalized {
+            return Err(ArrowError::InvalidArgumentError(
+                "Buffer already finalized".to_string(),
+            ));
+        }
+
+        let region = self.layout.columns.get(column_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
+        })?;
+
+        let start = region.data_offset + offset;
+        let remaining_capacity = region.data_capacity.saturating_sub(offset);
+
+        if start >= self.buffer_mut.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Offset {} exceeds buffer size {}",
+                start, self.buffer_mut.len()
+            )));
+        }
+
+        // SAFETY: We've verified start is within bounds. The caller is responsible
+        // for ensuring writes don't exceed remaining_capacity.
+        let ptr = unsafe { self.buffer_mut.as_mut_ptr().add(start) };
+        Ok((ptr, remaining_capacity))
+    }
+
+    fn get_child_data_slice(
+        &mut self,
+        column_index: usize,
+        child_index: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<&mut [u8], ArrowError> {
+        if self.finalized {
+            return Err(ArrowError::InvalidArgumentError(
+                "Buffer already finalized".to_string(),
+            ));
+        }
+
+        let region = self.layout.columns.get(column_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
+        })?;
+
+        let child_region = region.child_regions.get(child_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "Invalid child index {} for column {}",
+                child_index, column_index
+            ))
+        })?;
+
+        let start = child_region.data_offset + offset;
+        let end = start + len;
+
+        if end > child_region.data_offset + child_region.data_capacity {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Child data write exceeds capacity: {} > {}",
+                end - child_region.data_offset,
+                child_region.data_capacity
+            )));
+        }
+
+        Ok(&mut self.buffer_mut[start..end])
+    }
+
+    fn get_child_offsets_slice(
+        &mut self,
+        column_index: usize,
+        child_index: usize,
+        offset: usize,
+        len: usize,
+    ) -> Result<&mut [u8], ArrowError> {
+        if self.finalized {
+            return Err(ArrowError::InvalidArgumentError(
+                "Buffer already finalized".to_string(),
+            ));
+        }
+
+        let region = self.layout.columns.get(column_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
+        })?;
+
+        let child_region = region.child_regions.get(child_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "Invalid child index {} for column {}",
+                child_index, column_index
+            ))
+        })?;
+
+        let offsets_offset = child_region.offsets_offset.ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "Child {} of column {} has no offsets region",
+                child_index, column_index
+            ))
+        })?;
+
+        let offsets_capacity = child_region.offsets_capacity.unwrap_or(0);
+        let start = offsets_offset + offset;
+        let end = start + len;
+
+        if end > offsets_offset + offsets_capacity {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "Child offsets write exceeds capacity: {} > {}",
+                end - offsets_offset,
+                offsets_capacity
+            )));
+        }
+
+        Ok(&mut self.buffer_mut[start..end])
+    }
+
+    fn finalize_child_data_buffer(
+        &mut self,
+        column_index: usize,
+        child_index: usize,
+        data_len: usize,
+    ) -> Result<Buffer, ArrowError> {
+        if !self.finalized {
+            // Move buffer to Arc for shared ownership
+            self.buffer = Arc::new(std::mem::take(&mut self.buffer_mut));
+            self.finalized = true;
+        }
+
+        let region = self.layout.columns.get(column_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
+        })?;
+
+        let child_region = region.child_regions.get(child_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "Invalid child index {} for column {}",
+                child_index, column_index
+            ))
+        })?;
+
+        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
+        let start = child_region.data_offset;
+        let ptr = unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(start) as *mut u8) };
+        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        Ok(unsafe { Buffer::from_custom_allocation(ptr, data_len, owner) })
+    }
+
+    fn finalize_child_offsets_buffer(
+        &mut self,
+        column_index: usize,
+        child_index: usize,
+        offsets_len: usize,
+    ) -> Result<Buffer, ArrowError> {
+        if !self.finalized {
+            // Move buffer to Arc for shared ownership
+            self.buffer = Arc::new(std::mem::take(&mut self.buffer_mut));
+            self.finalized = true;
+        }
+
+        let region = self.layout.columns.get(column_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
+        })?;
+
+        let child_region = region.child_regions.get(child_index).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "Invalid child index {} for column {}",
+                child_index, column_index
+            ))
+        })?;
+
+        let offsets_offset = child_region.offsets_offset.ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!(
+                "Child {} of column {} has no offsets region",
+                child_index, column_index
+            ))
+        })?;
+
+        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
+        let ptr =
+            unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(offsets_offset) as *mut u8) };
+        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        Ok(unsafe { Buffer::from_custom_allocation(ptr, offsets_len, owner) })
+    }
+
+    fn has_capacity_for_child_data(
+        &self,
+        column_index: usize,
+        child_index: usize,
+        additional_bytes: usize,
+    ) -> bool {
+        if let Some(region) = self.layout.columns.get(column_index) {
+            if let Some(child_region) = region.child_regions.get(child_index) {
+                // Note: We don't track per-child positions yet, so check against full capacity
+                additional_bytes <= child_region.data_capacity
+            } else {
+                false
+            }
         } else {
             false
         }
@@ -591,17 +1016,12 @@ mod tests {
 
     #[test]
     fn test_pooled_provider_creation() {
+        let mut region = ColumnRegion::fixed(0, 1024);
+        region.null_bitmap_offset = Some(1024);
+        region.null_bitmap_capacity = Some(64);
+
         let layout = BufferLayout {
-            columns: vec![
-                ColumnRegion {
-                    data_offset: 0,
-                    data_capacity: 1024,
-                    offsets_offset: None,
-                    offsets_capacity: None,
-                    null_bitmap_offset: Some(1024),
-                    null_bitmap_capacity: Some(64),
-                },
-            ],
+            columns: vec![region],
             total_size: 1088,
             row_count: 100,
         };
@@ -615,16 +1035,7 @@ mod tests {
     #[test]
     fn test_pooled_provider_write_data() {
         let layout = BufferLayout {
-            columns: vec![
-                ColumnRegion {
-                    data_offset: 0,
-                    data_capacity: 1024,
-                    offsets_offset: None,
-                    offsets_capacity: None,
-                    null_bitmap_offset: None,
-                    null_bitmap_capacity: None,
-                },
-            ],
+            columns: vec![ColumnRegion::fixed(0, 1024)],
             total_size: 1024,
             row_count: 128,
         };
@@ -643,16 +1054,7 @@ mod tests {
     #[test]
     fn test_pooled_provider_bounds_check() {
         let layout = BufferLayout {
-            columns: vec![
-                ColumnRegion {
-                    data_offset: 0,
-                    data_capacity: 64,
-                    offsets_offset: None,
-                    offsets_capacity: None,
-                    null_bitmap_offset: None,
-                    null_bitmap_capacity: None,
-                },
-            ],
+            columns: vec![ColumnRegion::fixed(0, 64)],
             total_size: 64,
             row_count: 8,
         };

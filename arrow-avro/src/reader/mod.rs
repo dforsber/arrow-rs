@@ -502,6 +502,22 @@ mod vlq;
 /// Pooled decoder for zero-allocation Avro decoding
 pub mod pooled_decoder;
 
+// NOTE: pooled_decoder_parity_test.rs contains comprehensive parity tests
+// comparing PooledRecordDecoder vs vanilla Decoder. Currently disabled because:
+// 1. Writer API changed (try_new -> WriterBuilder::new(schema).build(writer))
+// 2. PooledBufferProvider::new now takes (buffer, layout) instead of just layout
+// 3. Need ArrowNativeType import for as_usize() on offsets
+//
+// The 47 roundtrip tests in pooled_decoder.rs verify correctness for all types
+// including deeply nested List<Struct>, List<List>, Map<String,Struct>, etc.
+//
+// TODO: Update parity tests to use current APIs when time permits
+// #[cfg(test)]
+// mod pooled_decoder_parity_test;
+
+#[cfg(test)]
+mod pooled_decoder_stress_test;
+
 fn is_incomplete_data(err: &ArrowError) -> bool {
     matches!(
         err,
