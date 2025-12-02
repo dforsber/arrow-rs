@@ -502,6 +502,10 @@ mod vlq;
 /// Pooled decoder for zero-allocation Avro decoding
 pub mod pooled_decoder;
 
+/// JIT-compiled decoder using Cranelift for maximum performance
+#[cfg(feature = "jit")]
+pub mod jit_decoder;
+
 // NOTE: pooled_decoder_parity_test.rs contains comprehensive parity tests
 // comparing PooledRecordDecoder vs vanilla Decoder. Currently disabled because:
 // 1. Writer API changed (try_new -> WriterBuilder::new(schema).build(writer))

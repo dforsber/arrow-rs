@@ -44,6 +44,8 @@ md5 = ["dep:md5"]
 sha256 = ["dep:sha2"]
 small_decimals = []
 avro_custom_types = ["dep:arrow-select"]
+# JIT compilation for schema-specific decoders using Cranelift
+jit = ["dep:cranelift", "dep:cranelift-jit", "dep:cranelift-module", "dep:cranelift-native", "dep:target-lexicon"]
 
 [dependencies]
 arrow-schema = { workspace = true }
@@ -66,6 +68,12 @@ indexmap = "2.10"
 rand = "0.9"
 md5 = { version = "0.8", optional = true }
 sha2 = { version = "0.10", optional = true }
+# Cranelift JIT dependencies (optional)
+cranelift = { version = "0.126", optional = true }
+cranelift-jit = { version = "0.126", optional = true }
+cranelift-module = { version = "0.126", optional = true }
+cranelift-native = { version = "0.126", optional = true }
+target-lexicon = { version = "0.13", optional = true }
 
 [dev-dependencies]
 arrow-data = { workspace = true }
@@ -115,3 +123,8 @@ harness = false
 [[bench]]
 name = "pooled_decoder_bench"
 harness = false
+
+[[bench]]
+name = "jit_benchmark"
+harness = false
+required-features = ["jit"]

@@ -185,8 +185,9 @@ struct EnumResolution {
     default_index: i32,
 }
 
+/// Internal decoder enum for Avro types - made pub(crate) for use in pooled_decoder
 #[derive(Debug, AsRefStr)]
-enum Decoder {
+pub(crate) enum Decoder {
     Null(usize),
     Boolean(BooleanBufferBuilder),
     Int32(Vec<i32>),
@@ -246,6 +247,44 @@ enum Decoder {
 }
 
 impl Decoder {
+    /// Create a simple decoder from Arrow DataType (for use in pooled_decoder struct handling)
+    /// This creates basic decoders without schema resolution - just for primitive and string types
+    pub(crate) fn from_arrow_type(data_type: &DataType) -> Self {
+        match data_type {
+            DataType::Null => Self::Null(0),
+            DataType::Boolean => Self::Boolean(BooleanBufferBuilder::new(1024)),
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) => Self::Int32(Vec::with_capacity(1024)),
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => Self::Int64(Vec::with_capacity(1024)),
+            DataType::Float32 => Self::Float32(Vec::with_capacity(1024)),
+            DataType::Float64 => Self::Float64(Vec::with_capacity(1024)),
+            DataType::Utf8 => Self::String(OffsetBufferBuilder::new(1024), Vec::with_capacity(1024 * 32)),
+            DataType::Binary => Self::Binary(OffsetBufferBuilder::new(1024), Vec::with_capacity(1024 * 32)),
+            DataType::FixedSizeBinary(size) => Self::Fixed(*size, Vec::with_capacity(1024 * (*size as usize))),
+            DataType::Decimal128(precision, scale) => Self::Decimal128(*precision as usize, Some(*scale as usize), None, Decimal128Builder::with_capacity(1024)),
+            DataType::Struct(fields) => {
+                let arrow_fields: Vec<FieldRef> = fields.iter().cloned().collect();
+                // Wrap nullable fields in Decoder::Nullable to handle Avro union tags internally
+                let child_decoders: Vec<Decoder> = fields.iter().map(|f| {
+                    let base_decoder = Self::from_arrow_type(f.data_type());
+                    if f.is_nullable() {
+                        // Avro nullable unions are typically ['null', 'type'] (NullFirst)
+                        Self::Nullable(
+                            Nullability::NullFirst,
+                            NullBufferBuilder::new(1024),
+                            Box::new(base_decoder),
+                            NullablePlan::ReadTag,
+                        )
+                    } else {
+                        base_decoder
+                    }
+                }).collect();
+                Self::Record(Fields::from(arrow_fields), child_decoders, None)
+            }
+            // Fallback to Int64 for unsupported types
+            _ => Self::Int64(Vec::with_capacity(1024)),
+        }
+    }
+
     fn try_new(data_type: &AvroDataType) -> Result<Self, ArrowError> {
         if let Some(ResolutionInfo::Union(info)) = data_type.resolution.as_ref() {
             if info.writer_is_union && !info.reader_is_union {
@@ -525,7 +564,7 @@ impl Decoder {
     }
 
     /// Append a null record
-    fn append_null(&mut self) -> Result<(), ArrowError> {
+    pub(crate) fn append_null(&mut self) -> Result<(), ArrowError> {
         match self {
             Self::Null(count) => *count += 1,
             Self::Boolean(b) => b.append(false),
@@ -849,8 +888,8 @@ impl Decoder {
         }
     }
 
-    /// Decode a single record from `buf`
-    fn decode(&mut self, buf: &mut AvroCursor<'_>) -> Result<(), ArrowError> {
+    /// Decode a single value from `buf`
+    pub(crate) fn decode(&mut self, buf: &mut AvroCursor<'_>) -> Result<(), ArrowError> {
         match self {
             Self::Null(x) => *x += 1,
             Self::Boolean(values) => values.append(buf.get_bool()?),
@@ -1055,7 +1094,7 @@ impl Decoder {
     }
 
     /// Flush decoded records to an [`ArrayRef`]
-    fn flush(&mut self, nulls: Option<NullBuffer>) -> Result<ArrayRef, ArrowError> {
+    pub(crate) fn flush(&mut self, nulls: Option<NullBuffer>) -> Result<ArrayRef, ArrowError> {
         Ok(match self {
             Self::Nullable(_, n, e, _) => e.flush(n.finish())?,
             Self::Null(size) => Arc::new(NullArray::new(std::mem::replace(size, 0))),
