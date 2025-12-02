@@ -68,6 +68,12 @@ enum FieldOp {
     Fixed { size: usize, nullable: bool },
     /// Nested struct with child fields
     Struct { fields: Vec<FieldOp>, nullable: bool },
+    /// Enum - read varint index (not zigzag decoded for enum)
+    Enum { nullable: bool },
+    /// List/Array - read block count + elements
+    List { element: Box<FieldOp>, nullable: bool },
+    /// Map - read block count + key-value pairs
+    Map { value: Box<FieldOp>, nullable: bool },
 }
 
 /// Column type metadata for buffer layout
@@ -234,7 +240,9 @@ impl JitDecoder {
     /// Get column type for a field operation
     fn op_to_column_type(op: &FieldOp) -> ColumnType {
         match op {
-            FieldOp::Bytes { .. } => ColumnType::Variable,
+            FieldOp::Bytes { .. } | FieldOp::List { .. } | FieldOp::Map { .. } => {
+                ColumnType::Variable
+            }
             _ => ColumnType::Fixed,
         }
     }
@@ -253,6 +261,25 @@ impl JitDecoder {
             DataType::Struct(fields) => {
                 let child_ops = fields.iter().map(|f| Self::field_to_op(f.as_ref())).collect();
                 FieldOp::Struct { fields: child_ops, nullable }
+            }
+            // Dictionary/Enum - store indices as i32
+            DataType::Dictionary(_, _) => FieldOp::Enum { nullable },
+            // List types - decode element type recursively
+            DataType::List(element_field) | DataType::LargeList(element_field) => {
+                let element_op = Box::new(Self::field_to_op(element_field.as_ref()));
+                FieldOp::List { element: element_op, nullable }
+            }
+            // Map type - keys are always strings in Avro, values are recursive
+            DataType::Map(entries_field, _) => {
+                // Map entries are a struct with key and value fields
+                if let DataType::Struct(fields) = entries_field.data_type() {
+                    if fields.len() >= 2 {
+                        let value_op = Box::new(Self::field_to_op(fields[1].as_ref()));
+                        return FieldOp::Map { value: value_op, nullable };
+                    }
+                }
+                // Fallback - treat as bytes
+                FieldOp::Bytes { nullable }
             }
             // Default to Int64 for other types
             _ => FieldOp::Int64 { nullable },
@@ -624,11 +651,434 @@ impl JitDecoder {
                     builder.def_var(output_vars[col_idx], new_output_pos);
                 }
             }
-            FieldOp::Struct { fields: _child_ops, nullable: _ } => {
-                // TODO: Recursively emit child field decodes
-                // For now, this is a placeholder - structs not yet supported
+            FieldOp::Struct { fields: child_ops, nullable } => {
+                // Struct: decode each child field sequentially
+                // Output is flattened: all field data concatenated together
+
+                if *nullable {
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    builder.switch_to_block(null_block);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.switch_to_block(value_block);
+                    Self::emit_struct_decode(builder, child_ops, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    Self::emit_struct_decode(builder, child_ops, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                }
+            }
+            FieldOp::Enum { nullable } => {
+                // Enum is stored as a varint index (NOT zigzag encoded)
+                // We read it as zigzag and decode, same as other ints
+                if *nullable {
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    builder.switch_to_block(null_block);
+                    let zero_val = builder.ins().iconst(types::I32, 0);
+                    builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.switch_to_block(value_block);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    // Enum indices are stored directly (no zigzag)
+                    let value_i32 = builder.ins().ireduce(types::I32, value);
+                    builder.ins().store(MemFlags::trusted(), value_i32, output_write_ptr, 0);
+                    builder.def_var(cursor_var, new_cursor);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+
+                    let four = builder.ins().iconst(types::I64, 4);
+                    let new_output_pos = builder.ins().iadd(output_pos, four);
+                    builder.def_var(output_vars[col_idx], new_output_pos);
+                } else {
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    // Enum indices are stored directly (no zigzag)
+                    let value_i32 = builder.ins().ireduce(types::I32, value);
+                    builder.ins().store(MemFlags::trusted(), value_i32, output_write_ptr, 0);
+                    builder.def_var(cursor_var, new_cursor);
+                    let four = builder.ins().iconst(types::I64, 4);
+                    let new_output_pos = builder.ins().iadd(output_pos, four);
+                    builder.def_var(output_vars[col_idx], new_output_pos);
+                }
+            }
+            FieldOp::List { element, nullable } => {
+                // Avro arrays: read block count (zigzag), decode elements, repeat until count=0
+                // For Arrow ListArray, we need:
+                // - output_ptrs[col_idx] -> element data buffer
+                // - output_ptrs[col_idx + 1] -> offsets buffer (i32)
+                //
+                // For simplicity, we handle a flattened approach where:
+                // - Elements are written to data buffer
+                // - Offsets are tracked separately
+                //
+                // Note: This implementation handles non-nullable lists with primitive elements
+
+                if *nullable {
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    // Null block: skip
+                    builder.switch_to_block(null_block);
+                    builder.ins().jump(continue_block, &[]);
+
+                    // Value block: decode list
+                    builder.switch_to_block(value_block);
+                    Self::emit_list_decode(builder, element, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    Self::emit_list_decode(builder, element, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                }
+            }
+            FieldOp::Map { value, nullable } => {
+                // Avro maps: read block count (zigzag), decode key-value pairs, repeat until count=0
+                // Keys are always strings in Avro
+                // For simplicity, this implementation stores just the values
+                // (keys are read and skipped for now - full map support would need separate buffers)
+
+                if *nullable {
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    builder.switch_to_block(null_block);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.switch_to_block(value_block);
+                    Self::emit_map_decode(builder, value, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    Self::emit_map_decode(builder, value, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                }
             }
         }
+    }
+
+    /// Emit Cranelift IR for Avro struct/record decoding
+    ///
+    /// Structs decode each field sequentially in schema order.
+    /// Output is flattened: all field data written sequentially to a single buffer.
+    fn emit_struct_decode(
+        builder: &mut FunctionBuilder,
+        child_ops: &[FieldOp],
+        input_ptr: Value,
+        cursor_var: Variable,
+        output_write_ptr: Value,
+        output_pos: Value,
+        output_vars: &[Variable],
+        col_idx: usize,
+    ) {
+        // Track bytes written across all child fields
+        let struct_bytes_var = builder.declare_var(types::I64);
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.def_var(struct_bytes_var, zero);
+
+        // Decode each child field
+        for child_op in child_ops {
+            let struct_bytes = builder.use_var(struct_bytes_var);
+            let field_write_ptr = builder.ins().iadd(output_write_ptr, struct_bytes);
+
+            // Get field size
+            let field_size: i64 = match child_op {
+                FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
+                FieldOp::Int32 { .. } | FieldOp::Float32 { .. } | FieldOp::Enum { .. } => 4,
+                FieldOp::Boolean { .. } => 1,
+                _ => 8, // Default
+            };
+
+            // Decode based on child type
+            match child_op {
+                FieldOp::Int64 { nullable: false } => {
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let zigzag = Self::emit_zigzag_decode_i64(builder, value);
+                    builder.ins().store(MemFlags::trusted(), zigzag, field_write_ptr, 0);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                FieldOp::Int32 { nullable: false } => {
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let zigzag = Self::emit_zigzag_decode_i32(builder, value);
+                    builder.ins().store(MemFlags::trusted(), zigzag, field_write_ptr, 0);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                FieldOp::Float64 { nullable: false } => {
+                    let cursor = builder.use_var(cursor_var);
+                    let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                    let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), value, field_write_ptr, 0);
+                    let eight = builder.ins().iconst(types::I64, 8);
+                    let new_cursor = builder.ins().iadd(cursor, eight);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                FieldOp::Float32 { nullable: false } => {
+                    let cursor = builder.use_var(cursor_var);
+                    let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                    let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), value, field_write_ptr, 0);
+                    let four = builder.ins().iconst(types::I64, 4);
+                    let new_cursor = builder.ins().iadd(cursor, four);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                FieldOp::Boolean { nullable: false } => {
+                    let cursor = builder.use_var(cursor_var);
+                    let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                    let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), value, field_write_ptr, 0);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let new_cursor = builder.ins().iadd(cursor, one);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                _ => {
+                    // Skip complex/nullable child types for now
+                }
+            }
+
+            // Update bytes written
+            let field_size_val = builder.ins().iconst(types::I64, field_size);
+            let new_struct_bytes = builder.ins().iadd(struct_bytes, field_size_val);
+            builder.def_var(struct_bytes_var, new_struct_bytes);
+        }
+
+        // Update final output position
+        let final_bytes = builder.use_var(struct_bytes_var);
+        let new_output_pos = builder.ins().iadd(output_pos, final_bytes);
+        builder.def_var(output_vars[col_idx], new_output_pos);
+    }
+
+    /// Emit Cranelift IR for Avro map decoding
+    ///
+    /// Avro maps use the same block encoding as arrays:
+    /// 1. Read block count (zigzag encoded)
+    /// 2. If count < 0, abs(count) is entry count, skip byte size
+    /// 3. For each entry: read string key, then read value
+    /// 4. Repeat until count = 0
+    ///
+    /// This implementation stores only the values (keys are skipped)
+    fn emit_map_decode(
+        builder: &mut FunctionBuilder,
+        value_op: &FieldOp,
+        input_ptr: Value,
+        cursor_var: Variable,
+        output_write_ptr: Value,
+        output_pos: Value,
+        output_vars: &[Variable],
+        col_idx: usize,
+    ) {
+        // Get value size based on type
+        let value_size: i64 = match value_op {
+            FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
+            FieldOp::Int32 { .. } | FieldOp::Float32 { .. } | FieldOp::Enum { .. } => 4,
+            FieldOp::Boolean { .. } => 1,
+            _ => 8,
+        };
+
+        // Create variable to track bytes written
+        let map_bytes_var = builder.declare_var(types::I64);
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.def_var(map_bytes_var, zero);
+
+        // Block loop
+        let block_header = builder.create_block();
+        let block_body = builder.create_block();
+        let block_exit = builder.create_block();
+
+        builder.ins().jump(block_header, &[]);
+
+        // Block header: read block count
+        builder.switch_to_block(block_header);
+        let (count_raw, count_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        builder.def_var(cursor_var, count_cursor);
+
+        let count = Self::emit_zigzag_decode_i64(builder, count_raw);
+
+        let zero_check = builder.ins().iconst(types::I64, 0);
+        let is_done = builder.ins().icmp(IntCC::Equal, count, zero_check);
+        builder.ins().brif(is_done, block_exit, &[], block_body, &[]);
+
+        // Block body: decode entries
+        builder.switch_to_block(block_body);
+
+        let zero_cmp = builder.ins().iconst(types::I64, 0);
+        let is_negative = builder.ins().icmp(IntCC::SignedLessThan, count, zero_cmp);
+        let neg_count = builder.ins().ineg(count);
+        let abs_count = builder.ins().select(is_negative, neg_count, count);
+
+        let skip_block = builder.create_block();
+        let decode_block = builder.create_block();
+
+        builder.ins().brif(is_negative, skip_block, &[], decode_block, &[]);
+
+        // Skip block: read byte size and discard
+        builder.switch_to_block(skip_block);
+        let (_byte_size, skip_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        builder.def_var(cursor_var, skip_cursor);
+        builder.ins().jump(decode_block, &[]);
+
+        // Decode block: loop over entries
+        builder.switch_to_block(decode_block);
+
+        let entry_idx_var = builder.declare_var(types::I64);
+        let zero_idx = builder.ins().iconst(types::I64, 0);
+        builder.def_var(entry_idx_var, zero_idx);
+
+        let entry_loop_header = builder.create_block();
+        let entry_loop_body = builder.create_block();
+        let entry_loop_exit = builder.create_block();
+
+        builder.ins().jump(entry_loop_header, &[]);
+
+        // Entry loop header
+        builder.switch_to_block(entry_loop_header);
+        let entry_idx = builder.use_var(entry_idx_var);
+        let more_entries = builder.ins().icmp(IntCC::UnsignedLessThan, entry_idx, abs_count);
+        builder.ins().brif(more_entries, entry_loop_body, &[], entry_loop_exit, &[]);
+
+        // Entry loop body: skip key string, decode value
+        builder.switch_to_block(entry_loop_body);
+
+        // Skip string key: read length, skip bytes
+        let (key_len_raw, key_len_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        builder.def_var(cursor_var, key_len_cursor);
+        let key_len = Self::emit_zigzag_decode_i64(builder, key_len_raw);
+        let cursor_after_key = builder.use_var(cursor_var);
+        let new_cursor_after_key = builder.ins().iadd(cursor_after_key, key_len);
+        builder.def_var(cursor_var, new_cursor_after_key);
+
+        // Decode value
+        let map_bytes_written = builder.use_var(map_bytes_var);
+        let value_write_ptr = builder.ins().iadd(output_write_ptr, map_bytes_written);
+
+        match value_op {
+            FieldOp::Int64 { nullable: false } => {
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let zigzag = Self::emit_zigzag_decode_i64(builder, value);
+                builder.ins().store(MemFlags::trusted(), zigzag, value_write_ptr, 0);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Int32 { nullable: false } => {
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let zigzag = Self::emit_zigzag_decode_i32(builder, value);
+                builder.ins().store(MemFlags::trusted(), zigzag, value_write_ptr, 0);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Float64 { nullable: false } => {
+                let cursor = builder.use_var(cursor_var);
+                let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, value_write_ptr, 0);
+                let eight = builder.ins().iconst(types::I64, 8);
+                let new_cursor = builder.ins().iadd(cursor, eight);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Float32 { nullable: false } => {
+                let cursor = builder.use_var(cursor_var);
+                let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, value_write_ptr, 0);
+                let four = builder.ins().iconst(types::I64, 4);
+                let new_cursor = builder.ins().iadd(cursor, four);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Boolean { nullable: false } => {
+                let cursor = builder.use_var(cursor_var);
+                let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, value_write_ptr, 0);
+                let one = builder.ins().iconst(types::I64, 1);
+                let new_cursor = builder.ins().iadd(cursor, one);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            _ => {
+                // For other types, skip
+            }
+        }
+
+        // Update bytes written
+        let value_size_val = builder.ins().iconst(types::I64, value_size);
+        let new_bytes_written = builder.ins().iadd(map_bytes_written, value_size_val);
+        builder.def_var(map_bytes_var, new_bytes_written);
+
+        // Increment entry index
+        let one = builder.ins().iconst(types::I64, 1);
+        let new_entry_idx = builder.ins().iadd(entry_idx, one);
+        builder.def_var(entry_idx_var, new_entry_idx);
+
+        builder.ins().jump(entry_loop_header, &[]);
+
+        // Entry loop exit
+        builder.switch_to_block(entry_loop_exit);
+        builder.ins().jump(block_header, &[]);
+
+        // Block exit
+        builder.switch_to_block(block_exit);
+        let final_bytes_written = builder.use_var(map_bytes_var);
+        let new_output_pos = builder.ins().iadd(output_pos, final_bytes_written);
+        builder.def_var(output_vars[col_idx], new_output_pos);
+
+        // Seal all blocks
+        builder.seal_block(skip_block);
+        builder.seal_block(decode_block);
+        builder.seal_block(entry_loop_header);
+        builder.seal_block(entry_loop_body);
+        builder.seal_block(entry_loop_exit);
+        builder.seal_block(block_header);
+        builder.seal_block(block_body);
+        builder.seal_block(block_exit);
     }
 
     /// Emit Cranelift IR for memcpy with proper loop structure
@@ -698,6 +1148,189 @@ impl JitDecoder {
 
         // Continue from exit block
         builder.switch_to_block(exit_block);
+    }
+
+    /// Emit Cranelift IR for Avro array/list decoding
+    ///
+    /// Avro arrays use block encoding:
+    /// 1. Read block count (zigzag encoded)
+    /// 2. If count < 0, abs(count) is element count, skip byte size
+    /// 3. Decode elements
+    /// 4. Repeat until count = 0
+    ///
+    /// For simplicity, this implementation handles primitive element types
+    /// and stores just the flattened element data (not full Arrow ListArray format)
+    fn emit_list_decode(
+        builder: &mut FunctionBuilder,
+        element_op: &FieldOp,
+        input_ptr: Value,
+        cursor_var: Variable,
+        output_write_ptr: Value,  // Base + output_pos
+        output_pos: Value,
+        output_vars: &[Variable],
+        col_idx: usize,
+    ) {
+        // Get element size based on type
+        let element_size: i64 = match element_op {
+            FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
+            FieldOp::Int32 { .. } | FieldOp::Float32 { .. } | FieldOp::Enum { .. } => 4,
+            FieldOp::Boolean { .. } => 1,
+            _ => 8, // Default for complex types
+        };
+
+        // Create variable to track bytes written (relative offset from output_write_ptr)
+        let list_bytes_var = builder.declare_var(types::I64);
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.def_var(list_bytes_var, zero);
+
+        // Block loop: read count, decode elements, repeat until count=0
+        let block_header = builder.create_block();
+        let block_body = builder.create_block();
+        let block_exit = builder.create_block();
+
+        builder.ins().jump(block_header, &[]);
+
+        // Block header: read block count
+        builder.switch_to_block(block_header);
+        let (count_raw, count_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        builder.def_var(cursor_var, count_cursor);
+
+        // Zigzag decode the count
+        let count = Self::emit_zigzag_decode_i64(builder, count_raw);
+
+        // Check if count == 0 (end of array)
+        let zero_check = builder.ins().iconst(types::I64, 0);
+        let is_done = builder.ins().icmp(IntCC::Equal, count, zero_check);
+        builder.ins().brif(is_done, block_exit, &[], block_body, &[]);
+
+        // Block body: decode elements
+        builder.switch_to_block(block_body);
+
+        // Handle negative count: abs(count)
+        // If count < 0, also skip byte size varint
+        let zero_cmp = builder.ins().iconst(types::I64, 0);
+        let is_negative = builder.ins().icmp(IntCC::SignedLessThan, count, zero_cmp);
+        let neg_count = builder.ins().ineg(count);
+        let abs_count = builder.ins().select(is_negative, neg_count, count);
+
+        // If negative, skip byte size (just read and discard)
+        let skip_block = builder.create_block();
+        let decode_block = builder.create_block();
+
+        builder.ins().brif(is_negative, skip_block, &[], decode_block, &[]);
+
+        // Skip block: read byte size and discard
+        builder.switch_to_block(skip_block);
+        let (_byte_size, skip_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        builder.def_var(cursor_var, skip_cursor);
+        builder.ins().jump(decode_block, &[]);
+
+        // Decode block: loop over elements
+        builder.switch_to_block(decode_block);
+
+        // Element loop
+        let elem_idx_var = builder.declare_var(types::I64);
+        let zero_idx = builder.ins().iconst(types::I64, 0);
+        builder.def_var(elem_idx_var, zero_idx);
+
+        let elem_loop_header = builder.create_block();
+        let elem_loop_body = builder.create_block();
+        let elem_loop_exit = builder.create_block();
+
+        builder.ins().jump(elem_loop_header, &[]);
+
+        // Element loop header: check idx < abs_count
+        builder.switch_to_block(elem_loop_header);
+        let elem_idx = builder.use_var(elem_idx_var);
+        let more_elems = builder.ins().icmp(IntCC::UnsignedLessThan, elem_idx, abs_count);
+        builder.ins().brif(more_elems, elem_loop_body, &[], elem_loop_exit, &[]);
+
+        // Element loop body: decode one element
+        builder.switch_to_block(elem_loop_body);
+
+        // Calculate output pointer for this element
+        // output_write_ptr is base + output_pos, list_bytes_written is offset from there
+        let list_bytes_written = builder.use_var(list_bytes_var);
+        let elem_write_ptr = builder.ins().iadd(output_write_ptr, list_bytes_written);
+
+        // Decode based on element type
+        match element_op {
+            FieldOp::Int64 { nullable: false } => {
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let zigzag = Self::emit_zigzag_decode_i64(builder, value);
+                builder.ins().store(MemFlags::trusted(), zigzag, elem_write_ptr, 0);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Int32 { nullable: false } => {
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let zigzag = Self::emit_zigzag_decode_i32(builder, value);
+                builder.ins().store(MemFlags::trusted(), zigzag, elem_write_ptr, 0);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Float64 { nullable: false } => {
+                let cursor = builder.use_var(cursor_var);
+                let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
+                let eight = builder.ins().iconst(types::I64, 8);
+                let new_cursor = builder.ins().iadd(cursor, eight);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Float32 { nullable: false } => {
+                let cursor = builder.use_var(cursor_var);
+                let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
+                let four = builder.ins().iconst(types::I64, 4);
+                let new_cursor = builder.ins().iadd(cursor, four);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Boolean { nullable: false } => {
+                let cursor = builder.use_var(cursor_var);
+                let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
+                let one = builder.ins().iconst(types::I64, 1);
+                let new_cursor = builder.ins().iadd(cursor, one);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            _ => {
+                // For other types, skip for now (no decode)
+            }
+        }
+
+        // Update list bytes written
+        let elem_size_val = builder.ins().iconst(types::I64, element_size);
+        let new_bytes_written = builder.ins().iadd(list_bytes_written, elem_size_val);
+        builder.def_var(list_bytes_var, new_bytes_written);
+
+        // Increment element index
+        let one = builder.ins().iconst(types::I64, 1);
+        let new_elem_idx = builder.ins().iadd(elem_idx, one);
+        builder.def_var(elem_idx_var, new_elem_idx);
+
+        builder.ins().jump(elem_loop_header, &[]);
+
+        // Element loop exit: continue to next block
+        builder.switch_to_block(elem_loop_exit);
+        builder.ins().jump(block_header, &[]);
+
+        // Block exit: update final output position
+        // output_pos + list_bytes_written = new output position
+        builder.switch_to_block(block_exit);
+        let final_bytes_written = builder.use_var(list_bytes_var);
+        let new_output_pos = builder.ins().iadd(output_pos, final_bytes_written);
+        builder.def_var(output_vars[col_idx], new_output_pos);
+
+        // Seal all blocks
+        builder.seal_block(skip_block);
+        builder.seal_block(decode_block);
+        builder.seal_block(elem_loop_header);
+        builder.seal_block(elem_loop_body);
+        builder.seal_block(elem_loop_exit);
+        builder.seal_block(block_header);
+        builder.seal_block(block_body);
+        builder.seal_block(block_exit);
     }
 
     /// Emit Cranelift IR for varint decoding with proper loop
@@ -904,6 +1537,14 @@ impl JitDecoder {
             DataType::Int64 | DataType::Float64 => row_count * 8,
             DataType::Utf8 | DataType::Binary => row_count * 128, // Estimate average string length
             DataType::FixedSizeBinary(n) => row_count * (*n as usize),
+            DataType::List(elem_field) => {
+                // Estimate avg 10 elements per list
+                10 * row_count * Self::estimate_buffer_size(elem_field.data_type(), 1)
+            }
+            DataType::Map(entries_field, _) => {
+                // Estimate avg 5 entries per map
+                5 * row_count * Self::estimate_buffer_size(entries_field.data_type(), 1)
+            }
             _ => row_count * 8, // Default
         }
     }
@@ -1797,6 +2438,676 @@ mod tests {
             assert_eq!(id_array.value(i), i as i64 * 100, "Id mismatch at row {}", i);
             assert!((value_array.value(i) - i as f64 * 1.5).abs() < 1e-10, "Value mismatch at row {}", i);
             assert_eq!(count_array.value(i), i as i32 * 10, "Count mismatch at row {}", i);
+        }
+    }
+
+    /// Encode enum index as varint (not zigzag - just raw varint)
+    fn encode_enum_index(index: u32) -> Vec<u8> {
+        let mut result = Vec::new();
+        let mut v = index as u64;
+        loop {
+            if v < 0x80 {
+                result.push(v as u8);
+                break;
+            }
+            result.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        result
+    }
+
+    #[test]
+    fn test_roundtrip_enum() {
+        use arrow_schema::DataType;
+
+        // Create a Dictionary type (represents Avro Enum)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "status",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Test enum indices: 0, 1, 2, 0, 1
+        let test_indices: Vec<u32> = vec![0, 1, 2, 0, 1];
+
+        let mut input = Vec::new();
+        for &idx in &test_indices {
+            input.extend(encode_enum_index(idx));
+        }
+
+        let row_count = test_indices.len();
+        let mut output = vec![0u8; row_count * 4];  // i32 indices
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, &expected) in test_indices.iter().enumerate() {
+            let actual = i32::from_le_bytes(output[i * 4..(i + 1) * 4].try_into().unwrap());
+            assert_eq!(actual, expected as i32, "Enum index mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_nullable_enum() {
+        use arrow_schema::DataType;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "status",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,  // nullable
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Test pattern: value, null, value, null, value
+        let values: Vec<Option<u32>> = vec![Some(0), None, Some(2), None, Some(1)];
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(idx) => {
+                    input.extend(encode_union_tag(false));  // non-null
+                    input.extend(encode_enum_index(*idx));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));   // null
+                }
+            }
+        }
+
+        let row_count = values.len();
+        let mut output = vec![0xFFu8; row_count * 4];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, v) in values.iter().enumerate() {
+            let actual = i32::from_le_bytes(output[i * 4..(i + 1) * 4].try_into().unwrap());
+            match v {
+                Some(expected) => {
+                    assert_eq!(actual, *expected as i32, "Value mismatch at index {}", i);
+                }
+                None => {
+                    assert_eq!(actual, 0, "Null should have 0 placeholder at index {}", i);
+                }
+            }
+        }
+    }
+
+    /// Encode Avro array: block count (zigzag) + elements + 0 terminator
+    fn encode_avro_array_i64(elements: &[i64]) -> Vec<u8> {
+        let mut result = Vec::new();
+        if elements.is_empty() {
+            // Empty array: just 0 block count
+            result.push(0x00);
+        } else {
+            // Single block with all elements
+            result.extend(encode_varint_i64(elements.len() as i64)); // block count
+            for &e in elements {
+                result.extend(encode_varint_i64(e));
+            }
+            result.push(0x00); // terminator
+        }
+        result
+    }
+
+    fn encode_avro_array_i32(elements: &[i32]) -> Vec<u8> {
+        let mut result = Vec::new();
+        if elements.is_empty() {
+            result.push(0x00);
+        } else {
+            result.extend(encode_varint_i64(elements.len() as i64)); // block count
+            for &e in elements {
+                result.extend(encode_varint_i32(e));
+            }
+            result.push(0x00);
+        }
+        result
+    }
+
+    #[test]
+    fn test_roundtrip_list_int64_empty() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "values",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Empty array: single 0 byte
+        let input = encode_avro_array_i64(&[]);
+
+        let mut output = vec![0xFFu8; 100];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        assert_eq!(consumed, 1); // Just the 0 terminator
+    }
+
+    #[test]
+    fn test_roundtrip_list_int64_single() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "values",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Array with elements: [10, 20, 30]
+        let elements: Vec<i64> = vec![10, 20, 30];
+        let input = encode_avro_array_i64(&elements);
+
+        let mut output = vec![0u8; elements.len() * 8 + 100];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify elements
+        for (i, &expected) in elements.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Element mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_list_int32() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "counts",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        let elements: Vec<i32> = vec![1, 2, 3, 4, 5];
+        let input = encode_avro_array_i32(&elements);
+
+        let mut output = vec![0u8; elements.len() * 4 + 100];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, &expected) in elements.iter().enumerate() {
+            let actual = i32::from_le_bytes(output[i * 4..(i + 1) * 4].try_into().unwrap());
+            assert_eq!(actual, expected, "Element mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_list_multiple_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "values",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Three rows with different list sizes
+        let row1: Vec<i64> = vec![1, 2];
+        let row2: Vec<i64> = vec![10, 20, 30];
+        let row3: Vec<i64> = vec![100];
+
+        let mut input = Vec::new();
+        input.extend(encode_avro_array_i64(&row1));
+        input.extend(encode_avro_array_i64(&row2));
+        input.extend(encode_avro_array_i64(&row3));
+
+        let total_elements = row1.len() + row2.len() + row3.len();
+        let mut output = vec![0u8; total_elements * 8 + 100];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, 3).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify all elements in order
+        let all_elements: Vec<i64> = [row1, row2, row3].concat();
+        for (i, &expected) in all_elements.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Element mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_list_with_int_column() {
+        // Mixed schema: Int64 + List<Int64>
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "values",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        let row_count = 3;
+        let ids: Vec<i64> = vec![100, 200, 300];
+        let lists: Vec<Vec<i64>> = vec![
+            vec![1, 2],
+            vec![10, 20, 30],
+            vec![100],
+        ];
+
+        let mut input = Vec::new();
+        for i in 0..row_count {
+            input.extend(encode_varint_i64(ids[i]));
+            input.extend(encode_avro_array_i64(&lists[i]));
+        }
+
+        let total_elements: usize = lists.iter().map(|l| l.len()).sum();
+        let mut output_id = vec![0u8; row_count * 8];
+        let mut output_list = vec![0u8; total_elements * 8 + 100];
+
+        let mut output_ptrs = vec![
+            output_id.as_mut_ptr(),
+            output_list.as_mut_ptr(),
+        ];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify ids
+        for (i, &expected) in ids.iter().enumerate() {
+            let actual = i64::from_le_bytes(output_id[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Id mismatch at row {}", i);
+        }
+
+        // Verify list elements
+        let all_elements: Vec<i64> = lists.into_iter().flatten().collect();
+        for (i, &expected) in all_elements.iter().enumerate() {
+            let actual = i64::from_le_bytes(output_list[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "List element mismatch at index {}", i);
+        }
+    }
+
+    /// Encode Avro map: block count + (key, value) pairs + 0 terminator
+    /// This encodes values only (keys are strings)
+    fn encode_avro_map_i64(entries: &[(&str, i64)]) -> Vec<u8> {
+        let mut result = Vec::new();
+        if entries.is_empty() {
+            result.push(0x00);
+        } else {
+            // Block count
+            result.extend(encode_varint_i64(entries.len() as i64));
+            for (key, value) in entries {
+                // String key: length + bytes
+                result.extend(encode_avro_bytes(key.as_bytes()));
+                // Int64 value
+                result.extend(encode_varint_i64(*value));
+            }
+            result.push(0x00); // terminator
+        }
+        result
+    }
+
+    #[test]
+    fn test_roundtrip_map_empty() {
+        use arrow_schema::Fields;
+
+        let map_field = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("props", DataType::Map(Arc::new(map_field), false), false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Empty map
+        let input = encode_avro_map_i64(&[]);
+
+        let mut output = vec![0xFFu8; 100];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        assert_eq!(consumed, 1); // Just the 0 terminator
+    }
+
+    #[test]
+    fn test_roundtrip_map_single() {
+        use arrow_schema::Fields;
+
+        let map_field = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("props", DataType::Map(Arc::new(map_field), false), false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Map with entries
+        let entries: Vec<(&str, i64)> = vec![("a", 100), ("bb", 200), ("ccc", 300)];
+        let input = encode_avro_map_i64(&entries);
+
+        // Output buffer for values only
+        let mut output = vec![0u8; entries.len() * 8 + 100];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify values (keys are skipped)
+        for (i, &(_, expected_value)) in entries.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected_value, "Value mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_map_multiple_rows() {
+        use arrow_schema::Fields;
+
+        let map_field = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("props", DataType::Map(Arc::new(map_field), false), false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Three rows with different map sizes
+        let row1: Vec<(&str, i64)> = vec![("x", 10)];
+        let row2: Vec<(&str, i64)> = vec![("y", 20), ("z", 30)];
+        let row3: Vec<(&str, i64)> = vec![];
+
+        let mut input = Vec::new();
+        input.extend(encode_avro_map_i64(&row1));
+        input.extend(encode_avro_map_i64(&row2));
+        input.extend(encode_avro_map_i64(&row3));
+
+        let total_entries = row1.len() + row2.len() + row3.len();
+        let mut output = vec![0u8; total_entries * 8 + 100];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, 3).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify all values in order
+        let all_values: Vec<i64> = [row1, row2, row3].iter()
+            .flat_map(|entries| entries.iter().map(|(_, v)| *v))
+            .collect();
+        for (i, &expected) in all_values.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Value mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_map_with_int_column() {
+        use arrow_schema::Fields;
+
+        let map_field = Field::new(
+            "entries",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("props", DataType::Map(Arc::new(map_field), false), false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        let row_count = 2;
+        let ids: Vec<i64> = vec![1000, 2000];
+        let maps: Vec<Vec<(&str, i64)>> = vec![
+            vec![("a", 1), ("b", 2)],
+            vec![("c", 3)],
+        ];
+
+        let mut input = Vec::new();
+        for i in 0..row_count {
+            input.extend(encode_varint_i64(ids[i]));
+            input.extend(encode_avro_map_i64(&maps[i]));
+        }
+
+        let total_entries: usize = maps.iter().map(|m| m.len()).sum();
+        let mut output_id = vec![0u8; row_count * 8];
+        let mut output_map = vec![0u8; total_entries * 8 + 100];
+
+        let mut output_ptrs = vec![
+            output_id.as_mut_ptr(),
+            output_map.as_mut_ptr(),
+        ];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify ids
+        for (i, &expected) in ids.iter().enumerate() {
+            let actual = i64::from_le_bytes(output_id[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Id mismatch at row {}", i);
+        }
+
+        // Verify map values
+        let all_values: Vec<i64> = maps.iter()
+            .flat_map(|entries| entries.iter().map(|(_, v)| *v))
+            .collect();
+        for (i, &expected) in all_values.iter().enumerate() {
+            let actual = i64::from_le_bytes(output_map[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Map value mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_struct_simple() {
+        use arrow_schema::Fields;
+
+        // Struct with two Int64 fields
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "point",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("x", DataType::Int64, false),
+                    Field::new("y", DataType::Int64, false),
+                ])),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Encode struct: x=10, y=20
+        let mut input = Vec::new();
+        input.extend(encode_varint_i64(10)); // x
+        input.extend(encode_varint_i64(20)); // y
+
+        // Output buffer for flattened struct (2 x i64 = 16 bytes)
+        let mut output = vec![0u8; 16];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify fields
+        let x = i64::from_le_bytes(output[0..8].try_into().unwrap());
+        let y = i64::from_le_bytes(output[8..16].try_into().unwrap());
+        assert_eq!(x, 10, "x mismatch");
+        assert_eq!(y, 20, "y mismatch");
+    }
+
+    #[test]
+    fn test_roundtrip_struct_multiple_rows() {
+        use arrow_schema::Fields;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "point",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("x", DataType::Int64, false),
+                    Field::new("y", DataType::Int64, false),
+                ])),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        let points: Vec<(i64, i64)> = vec![(1, 2), (10, 20), (100, 200)];
+
+        let mut input = Vec::new();
+        for (x, y) in &points {
+            input.extend(encode_varint_i64(*x));
+            input.extend(encode_varint_i64(*y));
+        }
+
+        let mut output = vec![0u8; points.len() * 16];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, points.len()).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify each point
+        for (i, (expected_x, expected_y)) in points.iter().enumerate() {
+            let offset = i * 16;
+            let x = i64::from_le_bytes(output[offset..offset+8].try_into().unwrap());
+            let y = i64::from_le_bytes(output[offset+8..offset+16].try_into().unwrap());
+            assert_eq!(x, *expected_x, "x mismatch at row {}", i);
+            assert_eq!(y, *expected_y, "y mismatch at row {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_struct_mixed_types() {
+        use arrow_schema::Fields;
+
+        // Struct with mixed types
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "record",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("id", DataType::Int64, false),
+                    Field::new("count", DataType::Int32, false),
+                    Field::new("score", DataType::Float64, false),
+                ])),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Encode: id=1000, count=5, score=3.14
+        let mut input = Vec::new();
+        input.extend(encode_varint_i64(1000)); // id
+        input.extend(encode_varint_i32(5));    // count
+        input.extend_from_slice(&3.14f64.to_le_bytes()); // score
+
+        // Output: 8 (i64) + 4 (i32) + 8 (f64) = 20 bytes
+        let mut output = vec![0u8; 20];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        let id = i64::from_le_bytes(output[0..8].try_into().unwrap());
+        let count = i32::from_le_bytes(output[8..12].try_into().unwrap());
+        let score = f64::from_le_bytes(output[12..20].try_into().unwrap());
+
+        assert_eq!(id, 1000);
+        assert_eq!(count, 5);
+        assert!((score - 3.14).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_roundtrip_struct_with_int_column() {
+        use arrow_schema::Fields;
+
+        // Schema: Int64, Struct { Int64, Int64 }
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "point",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("x", DataType::Int64, false),
+                    Field::new("y", DataType::Int64, false),
+                ])),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        let row_count = 2;
+        let ids: Vec<i64> = vec![100, 200];
+        let points: Vec<(i64, i64)> = vec![(1, 2), (10, 20)];
+
+        let mut input = Vec::new();
+        for i in 0..row_count {
+            input.extend(encode_varint_i64(ids[i]));
+            input.extend(encode_varint_i64(points[i].0));
+            input.extend(encode_varint_i64(points[i].1));
+        }
+
+        let mut output_id = vec![0u8; row_count * 8];
+        let mut output_struct = vec![0u8; row_count * 16];
+
+        let mut output_ptrs = vec![
+            output_id.as_mut_ptr(),
+            output_struct.as_mut_ptr(),
+        ];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify ids
+        for (i, &expected) in ids.iter().enumerate() {
+            let actual = i64::from_le_bytes(output_id[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Id mismatch at row {}", i);
+        }
+
+        // Verify struct fields
+        for (i, (expected_x, expected_y)) in points.iter().enumerate() {
+            let offset = i * 16;
+            let x = i64::from_le_bytes(output_struct[offset..offset+8].try_into().unwrap());
+            let y = i64::from_le_bytes(output_struct[offset+8..offset+16].try_into().unwrap());
+            assert_eq!(x, *expected_x, "x mismatch at row {}", i);
+            assert_eq!(y, *expected_y, "y mismatch at row {}", i);
         }
     }
 }
