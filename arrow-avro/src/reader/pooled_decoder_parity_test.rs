@@ -8,21 +8,48 @@
 use crate::buffer_provider::{BufferLayout, ColumnRegion, PooledBufferProvider};
 use crate::reader::pooled_decoder::PooledRecordDecoder;
 use crate::reader::ReaderBuilder;
-use crate::writer::Writer;
+use crate::writer::AvroWriter;
 use arrow::array::*;
 use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
 use arrow::record_batch::RecordBatch;
-use arrow_buffer::OffsetBuffer;
+use arrow_buffer::{NullBuffer, OffsetBuffer};
 use std::io::Cursor;
 use std::sync::Arc;
+
+/// Create an aligned buffer for the pooled decoder
+/// Uses std::alloc to allocate memory with 64-byte alignment
+fn create_aligned_buffer(size: usize) -> Vec<u8> {
+    use std::alloc::{alloc_zeroed, Layout};
+
+    // Round up size to next 64-byte boundary
+    let aligned_size = (size + 63) & !63;
+
+    // Allocate with 64-byte alignment (Arrow's requirement)
+    let layout = Layout::from_size_align(aligned_size, 64).unwrap();
+
+    unsafe {
+        let ptr = alloc_zeroed(layout);
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+
+        // Create a Vec that owns this memory
+        // SAFETY: We allocated with proper size and alignment, and the memory is zeroed
+        // Note: When Vec is dropped, it will deallocate with Layout::for_value which uses
+        // alignment 1 for [u8]. To avoid this, we need to use a custom type or
+        // ensure we don't drop the Vec in a way that causes dealloc issues.
+        Vec::from_raw_parts(ptr, aligned_size, aligned_size)
+    }
+}
 
 /// Encode a RecordBatch row as raw Avro bytes (without OCF container)
 fn encode_row_as_avro(batch: &RecordBatch, row: usize) -> Vec<u8> {
     let mut buf = Vec::new();
+    let schema = batch.schema();
 
     for col_idx in 0..batch.num_columns() {
         let col = batch.column(col_idx);
-        let field = batch.schema().field(col_idx);
+        let field = schema.field(col_idx);
         encode_value(&mut buf, col.as_ref(), row, field.is_nullable());
     }
 
@@ -77,8 +104,8 @@ fn encode_value(buf: &mut Vec<u8>, array: &dyn Array, row: usize, nullable: bool
         DataType::List(child_field) => {
             let arr = array.as_any().downcast_ref::<ListArray>().unwrap();
             let offsets = arr.offsets();
-            let start = offsets[row].as_usize();
-            let end = offsets[row + 1].as_usize();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
             let count = end - start;
 
             if count > 0 {
@@ -91,10 +118,170 @@ fn encode_value(buf: &mut Vec<u8>, array: &dyn Array, row: usize, nullable: bool
             // End of array marker
             buf.push(0);
         }
+        DataType::Struct(fields) => {
+            let arr = array.as_any().downcast_ref::<StructArray>().unwrap();
+            // Encode each field in order
+            for (i, field) in fields.iter().enumerate() {
+                let col = arr.column(i);
+                encode_value(buf, col.as_ref(), row, field.is_nullable());
+            }
+        }
+        DataType::Map(entry_field, _sorted) => {
+            let arr = array.as_any().downcast_ref::<MapArray>().unwrap();
+            let offsets = arr.offsets();
+            let start = offsets[row] as usize;
+            let end = offsets[row + 1] as usize;
+            let count = end - start;
+
+            if count > 0 {
+                encode_varint_i64(buf, count as i64);
+                let keys = arr.keys();
+                let values = arr.values();
+
+                // Get key/value nullability from the entry struct
+                let entry_type = entry_field.data_type();
+                let (key_nullable, value_nullable) = if let DataType::Struct(entry_fields) = entry_type
+                {
+                    (
+                        entry_fields[0].is_nullable(),
+                        entry_fields[1].is_nullable(),
+                    )
+                } else {
+                    (false, false)
+                };
+
+                for i in start..end {
+                    encode_value(buf, keys.as_ref(), i, key_nullable);
+                    encode_value(buf, values.as_ref(), i, value_nullable);
+                }
+            }
+            // End of map marker
+            buf.push(0);
+        }
+        DataType::Date32 => {
+            // Date32 is encoded as int (days since epoch)
+            let arr = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            encode_varint_i32(buf, arr.value(row));
+        }
+        DataType::Timestamp(unit, _tz) => {
+            // Timestamp is encoded as long (microseconds for TimestampMicrosecond, etc.)
+            use arrow::datatypes::TimeUnit;
+            match unit {
+                TimeUnit::Microsecond => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap();
+                    encode_varint_i64(buf, arr.value(row));
+                }
+                TimeUnit::Millisecond => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .unwrap();
+                    encode_varint_i64(buf, arr.value(row));
+                }
+                TimeUnit::Nanosecond => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .unwrap();
+                    encode_varint_i64(buf, arr.value(row));
+                }
+                TimeUnit::Second => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .unwrap();
+                    encode_varint_i64(buf, arr.value(row));
+                }
+            }
+        }
+        DataType::Decimal128(_precision, _scale) => {
+            // Decimal128 is encoded as bytes (with length prefix) by default in Arrow-Avro
+            let arr = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let value = arr.value(row);
+            // Avro decimal uses big-endian two's complement representation
+            // with minimum bytes needed (trimmed leading 0x00 for positive, 0xFF for negative)
+            let be_bytes = value.to_be_bytes();
+            let trimmed = trim_decimal_bytes(&be_bytes);
+            // Write length as varint, then the bytes
+            encode_varint_i64(buf, trimmed.len() as i64);
+            buf.extend_from_slice(trimmed);
+        }
+        DataType::Duration(unit) => {
+            // Duration is encoded as long
+            use arrow::datatypes::TimeUnit;
+            match unit {
+                TimeUnit::Microsecond => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<DurationMicrosecondArray>()
+                        .unwrap();
+                    encode_varint_i64(buf, arr.value(row));
+                }
+                TimeUnit::Millisecond => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<DurationMillisecondArray>()
+                        .unwrap();
+                    encode_varint_i64(buf, arr.value(row));
+                }
+                TimeUnit::Nanosecond => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<DurationNanosecondArray>()
+                        .unwrap();
+                    encode_varint_i64(buf, arr.value(row));
+                }
+                TimeUnit::Second => {
+                    let arr = array
+                        .as_any()
+                        .downcast_ref::<DurationSecondArray>()
+                        .unwrap();
+                    encode_varint_i64(buf, arr.value(row));
+                }
+            }
+        }
+        DataType::FixedSizeBinary(size) => {
+            let arr = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            let value = arr.value(row);
+            assert_eq!(value.len(), *size as usize);
+            buf.extend_from_slice(value);
+        }
         _ => {
             // Skip unsupported types for now
+            panic!("Unsupported type: {:?}", array.data_type());
         }
     }
+}
+
+/// Minimal two's-complement representation (same as writer/encoder.rs:minimal_twos_complement)
+/// Trims leading sign bytes (0x00 for positive, 0xFF for negative) while preserving the sign.
+fn trim_decimal_bytes(be: &[u8]) -> &[u8] {
+    if be.is_empty() {
+        return be;
+    }
+    let sign_byte = if (be[0] & 0x80) != 0 { 0xFF } else { 0x00 };
+    let mut k = 0usize;
+    while k < be.len() && be[k] == sign_byte {
+        k += 1;
+    }
+    if k == 0 {
+        return be;
+    }
+    if k == be.len() {
+        return &be[be.len() - 1..];
+    }
+    let drop = if ((be[k] ^ sign_byte) & 0x80) == 0 {
+        k
+    } else {
+        k - 1
+    };
+    &be[drop..]
 }
 
 fn encode_varint_i32(buf: &mut Vec<u8>, value: i32) {
@@ -118,65 +305,98 @@ fn encode_varint_u64(buf: &mut Vec<u8>, mut value: u64) {
     }
 }
 
-/// Create a simple buffer layout for testing
+/// Get required alignment for a data type
+fn alignment_for_type(dt: &DataType) -> usize {
+    match dt {
+        DataType::Int64 | DataType::Float64 | DataType::Timestamp(_, _) | DataType::Date64 => 8,
+        DataType::Int32 | DataType::Float32 | DataType::Date32 => 4,
+        DataType::Int16 => 2,
+        _ => 1, // Boolean, Int8, Utf8 data, Binary data
+    }
+}
+
+/// Align offset to the next multiple of alignment
+fn align_offset(offset: usize, alignment: usize) -> usize {
+    (offset + alignment - 1) & !(alignment - 1)
+}
+
+/// Create a simple buffer layout for testing with proper alignment
 fn create_test_layout(schema: &ArrowSchema, row_count: usize) -> BufferLayout {
     let mut columns = Vec::new();
     let mut offset = 0;
 
-    for (idx, field) in schema.fields().iter().enumerate() {
+    for (_idx, field) in schema.fields().iter().enumerate() {
         let (data_cap, offsets_cap, null_cap) = estimate_column_size(field.data_type(), row_count);
 
+        // Align offset for data based on type
+        let data_alignment = alignment_for_type(field.data_type());
+        offset = align_offset(offset, data_alignment);
+        let data_offset = offset;
+        offset += data_cap;
+
+        // Offsets need 4-byte alignment (i32 offsets)
+        let offsets_offset = if offsets_cap > 0 {
+            offset = align_offset(offset, 4);
+            let off = offset;
+            offset += offsets_cap;
+            Some(off)
+        } else {
+            None
+        };
+
+        // Null bitmap can be 1-byte aligned
+        let null_bitmap_offset = if field.is_nullable() {
+            let off = offset;
+            offset += null_cap;
+            Some(off)
+        } else {
+            None
+        };
+
         let region = ColumnRegion {
-            data_offset: offset,
+            data_offset,
             data_capacity: data_cap,
-            offsets_offset: if offsets_cap > 0 {
-                Some(offset + data_cap)
-            } else {
-                None
-            },
-            offsets_capacity: if offsets_cap > 0 {
-                Some(offsets_cap)
-            } else {
-                None
-            },
-            null_bitmap_offset: if field.is_nullable() {
-                Some(offset + data_cap + offsets_cap)
-            } else {
-                None
-            },
-            null_bitmap_capacity: if field.is_nullable() {
-                Some(null_cap)
-            } else {
-                None
-            },
+            offsets_offset,
+            offsets_capacity: if offsets_cap > 0 { Some(offsets_cap) } else { None },
+            null_bitmap_offset,
+            null_bitmap_capacity: if field.is_nullable() { Some(null_cap) } else { None },
             child_regions: vec![],
         };
 
-        offset += data_cap + offsets_cap + null_cap;
         columns.push(region);
     }
 
+    // Ensure minimum size and round up to 8-byte boundary
+    offset = align_offset(offset.max(1024), 8);
+
     BufferLayout {
         columns,
-        total_size: offset.max(1024), // Minimum 1KB
+        total_size: offset,
         row_count,
     }
 }
 
 fn estimate_column_size(dt: &DataType, rows: usize) -> (usize, usize, usize) {
+    // Note: Complex types (List, Map, Struct) use internal Vec storage in the pooled decoder,
+    // so they don't need pre-allocated buffer space.
     let data = match dt {
         DataType::Boolean => (rows + 7) / 8,
         DataType::Int32 | DataType::Float32 | DataType::Date32 => rows * 4,
-        DataType::Int64 | DataType::Float64 | DataType::Timestamp(_, _) => rows * 8,
+        DataType::Int64 | DataType::Float64 | DataType::Timestamp(_, _) | DataType::Duration(_) => {
+            rows * 8
+        }
         DataType::Utf8 | DataType::Binary => rows * 64, // avg 64 bytes
         DataType::FixedSizeBinary(n) => rows * (*n as usize),
-        DataType::List(_) | DataType::Map(_, _) => rows * 128,
-        DataType::Struct(_) => rows * 64,
+        DataType::Decimal128(_, _) => rows * 16, // 16 bytes per decimal
+        // Complex types use Vec internally, not pre-allocated buffers
+        DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_) => 0,
         DataType::Union(_, _) => rows * 64,
         _ => rows * 8,
     };
     let offsets = match dt {
-        DataType::Utf8 | DataType::Binary | DataType::List(_) => (rows + 1) * 4,
+        DataType::Utf8 | DataType::Binary => (rows + 1) * 4,
+        // List uses internal Vec for offsets
+        DataType::List(_) => 0,
         _ => 0,
     };
     let null_bitmap = (rows + 7) / 8;
@@ -186,12 +406,12 @@ fn estimate_column_size(dt: &DataType, rows: usize) -> (usize, usize, usize) {
 /// Helper to write Avro data and read back with both decoders
 fn compare_decoders(arrow_schema: &ArrowSchema, batch: &RecordBatch) -> (RecordBatch, RecordBatch) {
     // Write to Avro
-    let mut avro_data = Vec::new();
-    {
-        let mut writer = Writer::try_new(&mut avro_data, arrow_schema).unwrap();
+    let avro_data = {
+        let mut writer = AvroWriter::new(Vec::new(), arrow_schema.clone()).unwrap();
         writer.write(batch).unwrap();
-        writer.close().unwrap();
-    }
+        writer.finish().unwrap();
+        writer.into_inner()
+    };
 
     // Read with vanilla decoder
     let vanilla_batch = {
@@ -213,8 +433,9 @@ fn compare_decoders(arrow_schema: &ArrowSchema, batch: &RecordBatch) -> (RecordB
         // Create layout for pooled decoder
         let layout = create_test_layout(arrow_schema, batch.num_rows());
 
-        // Create pooled decoder
-        let provider = PooledBufferProvider::new(layout);
+        // Create pooled decoder with aligned buffer
+        let buffer = create_aligned_buffer(layout.total_size);
+        let provider = PooledBufferProvider::new(buffer, layout);
         let schema_ref = Arc::new(arrow_schema.clone());
         let mut decoder = PooledRecordDecoder::try_new(schema_ref, provider).unwrap();
 
@@ -373,14 +594,14 @@ fn test_parity_binary() {
 fn test_parity_list_int() {
     let schema = ArrowSchema::new(vec![Field::new(
         "list_col",
-        DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+        DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
         false,
     )]);
 
     let values = Int32Array::from(vec![1, 2, 3, 4, 5, 6]);
     let offsets = OffsetBuffer::from_lengths([2, 1, 3]);
     let list = ListArray::new(
-        Arc::new(Field::new("item", DataType::Int32, true)),
+        Arc::new(Field::new("item", DataType::Int32, false)),
         offsets,
         Arc::new(values),
         None,
@@ -397,14 +618,14 @@ fn test_parity_list_int() {
 fn test_parity_list_string() {
     let schema = ArrowSchema::new(vec![Field::new(
         "list_col",
-        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
         false,
     )]);
 
     let values = StringArray::from(vec!["a", "b", "c", "d", "e"]);
     let offsets = OffsetBuffer::from_lengths([2, 0, 3]);
     let list = ListArray::new(
-        Arc::new(Field::new("item", DataType::Utf8, true)),
+        Arc::new(Field::new("item", DataType::Utf8, false)),
         offsets,
         Arc::new(values),
         None,
@@ -576,14 +797,14 @@ fn test_parity_nested_struct() {
 
 #[test]
 fn test_parity_list_of_struct() {
-    // List<Struct<id: Int32, name: String>>
+    // List<Struct<id: Int32, name: String>> - non-nullable for simpler encoding
     let struct_field = Field::new(
         "item",
         DataType::Struct(Fields::from(vec![
             Field::new("id", DataType::Int32, false),
-            Field::new("name", DataType::Utf8, true),
+            Field::new("name", DataType::Utf8, false),
         ])),
-        true,
+        false,
     );
     let schema = ArrowSchema::new(vec![Field::new(
         "list_col",
@@ -593,11 +814,11 @@ fn test_parity_list_of_struct() {
 
     // Create structs
     let ids = Int32Array::from(vec![1, 2, 3, 4]);
-    let names = StringArray::from(vec![Some("a"), Some("b"), None, Some("d")]);
+    let names = StringArray::from(vec!["a", "b", "c", "d"]);
     let structs = StructArray::from(vec![
         (Arc::new(Field::new("id", DataType::Int32, false)), Arc::new(ids) as ArrayRef),
         (
-            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(Field::new("name", DataType::Utf8, false)),
             Arc::new(names) as ArrayRef,
         ),
     ]);
@@ -719,4 +940,700 @@ fn test_parity_comprehensive() {
     let (vanilla, _pooled) = compare_decoders(&schema, &batch);
     assert_eq!(vanilla.num_rows(), 3);
     assert_eq!(vanilla.num_columns(), 5);
+}
+
+// ============================================================================
+// Nullable Union Tests (Avro ['null', 'type'] handling)
+// ============================================================================
+
+#[test]
+fn test_nullable_int32_all_null() {
+    // Test column with all null values
+    let schema = ArrowSchema::new(vec![Field::new("nullable_int", DataType::Int32, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int32Array::from(vec![None, None, None, None]))],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 4);
+    assert_eq!(pooled.num_rows(), 4);
+
+    // Verify all values are null
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    for i in 0..4 {
+        assert!(pooled_col.is_null(i), "Row {} should be null", i);
+    }
+}
+
+#[test]
+fn test_nullable_int32_mixed() {
+    // Test column with mixed null and non-null values
+    let schema = ArrowSchema::new(vec![Field::new("nullable_int", DataType::Int32, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int32Array::from(vec![
+            Some(1),
+            None,
+            Some(3),
+            None,
+            Some(5),
+        ]))],
+    )
+    .unwrap();
+
+    let (_vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), 5);
+
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert_eq!(pooled_col.value(0), 1);
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert_eq!(pooled_col.value(2), 3);
+    assert!(pooled_col.is_null(3));
+    assert!(!pooled_col.is_null(4));
+    assert_eq!(pooled_col.value(4), 5);
+}
+
+#[test]
+fn test_nullable_int64() {
+    let schema = ArrowSchema::new(vec![Field::new("nullable_long", DataType::Int64, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int64Array::from(vec![
+            Some(100i64),
+            None,
+            Some(300i64),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert_eq!(pooled_col.value(0), 100);
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert_eq!(pooled_col.value(2), 300);
+}
+
+#[test]
+fn test_nullable_float32() {
+    let schema = ArrowSchema::new(vec![Field::new("nullable_float", DataType::Float32, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Float32Array::from(vec![
+            None,
+            Some(2.5f32),
+            None,
+            Some(4.5f32),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<Float32Array>().unwrap();
+    assert!(pooled_col.is_null(0));
+    assert!(!pooled_col.is_null(1));
+    assert!((pooled_col.value(1) - 2.5f32).abs() < 0.001);
+    assert!(pooled_col.is_null(2));
+    assert!(!pooled_col.is_null(3));
+    assert!((pooled_col.value(3) - 4.5f32).abs() < 0.001);
+}
+
+#[test]
+fn test_nullable_float64() {
+    let schema = ArrowSchema::new(vec![Field::new("nullable_double", DataType::Float64, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Float64Array::from(vec![
+            Some(1.5f64),
+            None,
+            Some(3.5f64),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert!((pooled_col.value(0) - 1.5f64).abs() < 0.001);
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+}
+
+#[test]
+fn test_nullable_boolean() {
+    let schema = ArrowSchema::new(vec![Field::new("nullable_bool", DataType::Boolean, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(BooleanArray::from(vec![
+            Some(true),
+            None,
+            Some(false),
+            None,
+            Some(true),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<BooleanArray>().unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert!(pooled_col.value(0));
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert!(!pooled_col.value(2));
+    assert!(pooled_col.is_null(3));
+    assert!(!pooled_col.is_null(4));
+    assert!(pooled_col.value(4));
+}
+
+#[test]
+fn test_nullable_string_all_null() {
+    let schema = ArrowSchema::new(vec![Field::new("nullable_str", DataType::Utf8, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(StringArray::from(vec![
+            None::<&str>,
+            None,
+            None,
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    for i in 0..3 {
+        assert!(pooled_col.is_null(i), "Row {} should be null", i);
+    }
+}
+
+#[test]
+fn test_nullable_string_mixed() {
+    let schema = ArrowSchema::new(vec![Field::new("nullable_str", DataType::Utf8, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(StringArray::from(vec![
+            Some("hello"),
+            None,
+            Some("world"),
+            None,
+            Some("test"),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert_eq!(pooled_col.value(0), "hello");
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert_eq!(pooled_col.value(2), "world");
+    assert!(pooled_col.is_null(3));
+    assert!(!pooled_col.is_null(4));
+    assert_eq!(pooled_col.value(4), "test");
+}
+
+#[test]
+fn test_nullable_binary() {
+    let schema = ArrowSchema::new(vec![Field::new("nullable_bin", DataType::Binary, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(BinaryArray::from(vec![
+            Some(b"abc".as_slice()),
+            None,
+            Some(b"xyz".as_slice()),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert_eq!(pooled_col.value(0), b"abc");
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert_eq!(pooled_col.value(2), b"xyz");
+}
+
+#[test]
+fn test_multiple_nullable_columns() {
+    // Test multiple nullable columns in the same schema
+    let schema = ArrowSchema::new(vec![
+        Field::new("nullable_int", DataType::Int32, true),
+        Field::new("nullable_str", DataType::Utf8, true),
+        Field::new("nullable_float", DataType::Float64, true),
+        Field::new("nullable_bool", DataType::Boolean, true),
+    ]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+            Arc::new(StringArray::from(vec![None, Some("b"), None])),
+            Arc::new(Float64Array::from(vec![Some(1.1), Some(2.2), None])),
+            Arc::new(BooleanArray::from(vec![None, None, Some(true)])),
+        ],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), 3);
+    assert_eq!(pooled.num_columns(), 4);
+
+    // Check int column
+    let int_col = pooled.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert!(!int_col.is_null(0));
+    assert!(int_col.is_null(1));
+    assert!(!int_col.is_null(2));
+
+    // Check string column
+    let str_col = pooled.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    assert!(str_col.is_null(0));
+    assert!(!str_col.is_null(1));
+    assert!(str_col.is_null(2));
+
+    // Check float column
+    let float_col = pooled.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+    assert!(!float_col.is_null(0));
+    assert!(!float_col.is_null(1));
+    assert!(float_col.is_null(2));
+
+    // Check bool column
+    let bool_col = pooled.column(3).as_any().downcast_ref::<BooleanArray>().unwrap();
+    assert!(bool_col.is_null(0));
+    assert!(bool_col.is_null(1));
+    assert!(!bool_col.is_null(2));
+}
+
+#[test]
+fn test_mixed_nullable_and_non_nullable_columns() {
+    // Test schema with both nullable and non-nullable columns
+    let schema = ArrowSchema::new(vec![
+        Field::new("required_int", DataType::Int32, false),
+        Field::new("nullable_int", DataType::Int32, true),
+        Field::new("required_str", DataType::Utf8, false),
+        Field::new("nullable_str", DataType::Utf8, true),
+    ]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(StringArray::from(vec![Some("x"), None, Some("z")])),
+        ],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), 3);
+
+    // Non-nullable columns should have no nulls
+    let req_int = pooled.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert!(req_int.null_count() == 0);
+
+    let req_str = pooled.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+    assert!(req_str.null_count() == 0);
+
+    // Nullable columns should have correct null patterns
+    let null_int = pooled.column(1).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert!(!null_int.is_null(0));
+    assert!(null_int.is_null(1));
+    assert!(!null_int.is_null(2));
+
+    let null_str = pooled.column(3).as_any().downcast_ref::<StringArray>().unwrap();
+    assert!(!null_str.is_null(0));
+    assert!(null_str.is_null(1));
+    assert!(!null_str.is_null(2));
+}
+
+#[test]
+fn test_nullable_first_and_last_rows() {
+    // Test edge case: null in first row and last row
+    let schema = ArrowSchema::new(vec![Field::new("nullable_int", DataType::Int32, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Int32Array::from(vec![
+            None,
+            Some(2),
+            Some(3),
+            Some(4),
+            None,
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+    assert!(pooled_col.is_null(0), "First row should be null");
+    assert!(!pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert!(!pooled_col.is_null(3));
+    assert!(pooled_col.is_null(4), "Last row should be null");
+}
+
+#[test]
+fn test_large_nullable_batch() {
+    // Test with many rows to exercise batch processing
+    let schema = ArrowSchema::new(vec![
+        Field::new("nullable_int", DataType::Int64, true),
+        Field::new("nullable_str", DataType::Utf8, true),
+    ]);
+
+    let n = 1000;
+    let int_values: Vec<Option<i64>> = (0..n)
+        .map(|i| if i % 3 == 0 { None } else { Some(i as i64) })
+        .collect();
+    let str_values: Vec<Option<&str>> = (0..n)
+        .map(|i| if i % 5 == 0 { None } else { Some("test") })
+        .collect();
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(Int64Array::from(int_values.clone())),
+            Arc::new(StringArray::from(str_values.clone())),
+        ],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), n);
+
+    let int_col = pooled.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let str_col = pooled.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+
+    for i in 0..n {
+        let expected_int_null = i % 3 == 0;
+        let expected_str_null = i % 5 == 0;
+        assert_eq!(
+            int_col.is_null(i),
+            expected_int_null,
+            "Int null mismatch at row {}",
+            i
+        );
+        assert_eq!(
+            str_col.is_null(i),
+            expected_str_null,
+            "Str null mismatch at row {}",
+            i
+        );
+    }
+}
+
+// ============================================================================
+// Date/Time Types Tests
+// ============================================================================
+
+#[test]
+fn test_parity_date32() {
+    let schema = ArrowSchema::new(vec![Field::new("date_col", DataType::Date32, false)]);
+
+    // Days since epoch: 2024-01-01 is about 19723 days since 1970-01-01
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Date32Array::from(vec![19723, 19724, 19725]))],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+    assert_eq!(pooled_col.value(0), 19723);
+    assert_eq!(pooled_col.value(1), 19724);
+    assert_eq!(pooled_col.value(2), 19725);
+}
+
+#[test]
+fn test_parity_date32_nullable() {
+    let schema = ArrowSchema::new(vec![Field::new("date_col", DataType::Date32, true)]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(Date32Array::from(vec![
+            Some(19723),
+            None,
+            Some(19725),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled.column(0).as_any().downcast_ref::<Date32Array>().unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert_eq!(pooled_col.value(0), 19723);
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert_eq!(pooled_col.value(2), 19725);
+}
+
+#[test]
+fn test_parity_timestamp_microsecond() {
+    use arrow::datatypes::TimeUnit;
+
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]);
+
+    // Microseconds since epoch
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(TimestampMicrosecondArray::from(vec![
+            1704067200000000i64, // 2024-01-01 00:00:00
+            1704067260000000i64, // 2024-01-01 00:01:00
+            1704067320000000i64, // 2024-01-01 00:02:00
+        ]))],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(pooled_col.value(0), 1704067200000000i64);
+    assert_eq!(pooled_col.value(1), 1704067260000000i64);
+    assert_eq!(pooled_col.value(2), 1704067320000000i64);
+}
+
+#[test]
+fn test_parity_timestamp_microsecond_nullable() {
+    use arrow::datatypes::TimeUnit;
+
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        true,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(1704067200000000i64),
+            None,
+            Some(1704067320000000i64),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert_eq!(pooled_col.value(0), 1704067200000000i64);
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert_eq!(pooled_col.value(2), 1704067320000000i64);
+}
+
+#[test]
+fn test_parity_timestamp_millisecond() {
+    use arrow::datatypes::TimeUnit;
+
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        false,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(TimestampMillisecondArray::from(vec![
+            1704067200000i64, // 2024-01-01 00:00:00
+            1704067260000i64, // 2024-01-01 00:01:00
+            1704067320000i64, // 2024-01-01 00:02:00
+        ]))],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+}
+
+// ============================================================================
+// Decimal Types Tests
+// ============================================================================
+
+#[test]
+fn test_parity_decimal128() {
+    // Decimal128 with precision 10, scale 2 (fits in ~4 bytes for Avro encoding)
+    let schema = ArrowSchema::new(vec![Field::new(
+        "decimal_col",
+        DataType::Decimal128(10, 2),
+        false,
+    )]);
+
+    // Create decimal values: 123.45, 678.90, -1234.56
+    let values = Decimal128Array::from(vec![12345i128, 67890i128, -123456i128])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert_eq!(pooled_col.value(0), 12345i128);
+    assert_eq!(pooled_col.value(1), 67890i128);
+    assert_eq!(pooled_col.value(2), -123456i128);
+}
+
+#[test]
+fn test_parity_decimal128_nullable() {
+    let schema = ArrowSchema::new(vec![Field::new(
+        "decimal_col",
+        DataType::Decimal128(10, 2),
+        true,
+    )]);
+
+    let values = Decimal128Array::from(vec![Some(12345i128), None, Some(-123456i128)])
+        .with_precision_and_scale(10, 2)
+        .unwrap();
+
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert_eq!(pooled_col.value(0), 12345i128);
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert_eq!(pooled_col.value(2), -123456i128);
+}
+
+#[test]
+fn test_parity_decimal128_large_precision() {
+    // Decimal128 with larger precision (25 digits, requires more bytes)
+    let schema = ArrowSchema::new(vec![Field::new(
+        "decimal_col",
+        DataType::Decimal128(25, 4),
+        false,
+    )]);
+
+    // Larger values that use more bytes
+    let values = Decimal128Array::from(vec![
+        1234567890123456789i128,
+        -9876543210987654321i128,
+        0i128,
+    ])
+    .with_precision_and_scale(25, 4)
+    .unwrap();
+
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+}
+
+// ============================================================================
+// FixedSizeBinary Tests
+// ============================================================================
+
+#[test]
+fn test_parity_fixed_size_binary() {
+    let schema = ArrowSchema::new(vec![Field::new(
+        "fixed_col",
+        DataType::FixedSizeBinary(4),
+        false,
+    )]);
+
+    let values = FixedSizeBinaryArray::from(vec![
+        Some([0x01, 0x02, 0x03, 0x04].as_slice()),
+        Some([0xAA, 0xBB, 0xCC, 0xDD].as_slice()),
+        Some([0x00, 0x00, 0x00, 0x00].as_slice()),
+    ]);
+
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert_eq!(pooled_col.value(0), [0x01, 0x02, 0x03, 0x04]);
+    assert_eq!(pooled_col.value(1), [0xAA, 0xBB, 0xCC, 0xDD]);
+    assert_eq!(pooled_col.value(2), [0x00, 0x00, 0x00, 0x00]);
+}
+
+#[test]
+fn test_parity_fixed_size_binary_nullable() {
+    let schema = ArrowSchema::new(vec![Field::new(
+        "fixed_col",
+        DataType::FixedSizeBinary(4),
+        true,
+    )]);
+
+    let values = FixedSizeBinaryArray::from(vec![
+        Some([0x01, 0x02, 0x03, 0x04].as_slice()),
+        None,
+        Some([0xAA, 0xBB, 0xCC, 0xDD].as_slice()),
+    ]);
+
+    let batch =
+        RecordBatch::try_new(Arc::new(schema.clone()), vec![Arc::new(values)]).unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
 }

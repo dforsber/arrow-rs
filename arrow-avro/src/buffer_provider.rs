@@ -49,8 +49,51 @@
 use arrow_buffer::alloc::Allocation;
 use arrow_buffer::Buffer;
 use arrow_schema::ArrowError;
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ptr::NonNull;
 use std::sync::Arc;
+
+/// Arrow requires 64-byte alignment for SIMD operations
+pub const ARROW_ALIGNMENT: usize = 64;
+
+/// Align an offset to the specified alignment
+///
+/// # Arguments
+/// * `offset` - Current offset
+/// * `alignment` - Required alignment (must be power of 2)
+///
+/// # Returns
+/// The next aligned offset >= input offset
+#[inline]
+pub fn align_to(offset: usize, alignment: usize) -> usize {
+    debug_assert!(alignment.is_power_of_two());
+    (offset + alignment - 1) & !(alignment - 1)
+}
+
+/// Get the required alignment for an Arrow data type
+///
+/// Returns the minimum alignment required for the data type's values
+pub fn alignment_for_type(dt: &arrow_schema::DataType) -> usize {
+    use arrow_schema::DataType;
+    match dt {
+        DataType::Boolean | DataType::Int8 | DataType::UInt8 => 1,
+        DataType::Int16 | DataType::UInt16 | DataType::Float16 => 2,
+        DataType::Int32 | DataType::UInt32 | DataType::Float32 | DataType::Date32 => 4,
+        DataType::Int64 | DataType::UInt64 | DataType::Float64
+        | DataType::Date64 | DataType::Timestamp(_, _) | DataType::Time64(_)
+        | DataType::Duration(_) | DataType::Interval(_) => 8,
+        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => 16,
+        // Variable-length types: data buffer is bytes (1-byte aligned), but offsets are i32 (4-byte aligned)
+        DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => 1,
+        // For complex types, use maximum alignment for safety
+        DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _)
+        | DataType::Struct(_) | DataType::Union(_, _) => 8,
+        // Fixed-size types
+        DataType::FixedSizeBinary(_) | DataType::FixedSizeList(_, _) => 1,
+        // Default to 8-byte alignment for unknown types
+        _ => 8,
+    }
+}
 
 /// Trait for providing pre-allocated buffers for Avro decoding
 ///
@@ -350,32 +393,157 @@ pub struct BufferLayout {
     pub row_count: usize,
 }
 
+/// An aligned buffer for Arrow data
+///
+/// This buffer is allocated with 64-byte alignment to satisfy Arrow's SIMD requirements.
+/// It implements the `Allocation` trait so it can be used as backing memory for Arrow Buffers.
+pub struct AlignedBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+    layout: Layout,
+}
+
+impl AlignedBuffer {
+    /// Create a new aligned buffer with the specified size
+    ///
+    /// The buffer will be zeroed and aligned to ARROW_ALIGNMENT (64 bytes).
+    pub fn new(size: usize) -> Self {
+        let size = size.max(1); // Avoid zero-sized allocation
+        let layout = Layout::from_size_align(size, ARROW_ALIGNMENT)
+            .expect("Invalid layout");
+
+        // SAFETY: Layout is valid and non-zero sized
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr).expect("Allocation failed");
+
+        Self { ptr, len: size, layout }
+    }
+
+    /// Get a mutable slice to the buffer
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: ptr is valid and len is the allocated size
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Get an immutable slice to the buffer
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr is valid and len is the allocated size
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    /// Get the length of the buffer
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Check if the buffer is empty
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Get a raw pointer to a specific offset
+    pub fn as_ptr_at(&self, offset: usize) -> *const u8 {
+        debug_assert!(offset <= self.len);
+        unsafe { self.ptr.as_ptr().add(offset) }
+    }
+
+    /// Get a mutable raw pointer to a specific offset
+    pub fn as_mut_ptr_at(&mut self, offset: usize) -> *mut u8 {
+        debug_assert!(offset <= self.len);
+        unsafe { self.ptr.as_ptr().add(offset) }
+    }
+
+    /// Zero the buffer
+    pub fn zero(&mut self) {
+        // SAFETY: ptr is valid and len is the allocated size
+        unsafe {
+            std::ptr::write_bytes(self.ptr.as_ptr(), 0, self.len);
+        }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        // SAFETY: ptr was allocated with this layout
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}
+
+// SAFETY: AlignedBuffer owns its memory exclusively
+unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
+
+/// Shared aligned buffer wrapped in Arc
+///
+/// This is used after finalization to allow zero-copy sharing of the buffer
+/// as backing memory for Arrow Buffers.
+pub struct SharedAlignedBuffer {
+    ptr: NonNull<u8>,
+    len: usize,
+    layout: Layout,
+}
+
+impl SharedAlignedBuffer {
+    /// Create from an AlignedBuffer (takes ownership)
+    fn from_aligned(buf: AlignedBuffer) -> Self {
+        let result = Self {
+            ptr: buf.ptr,
+            len: buf.len,
+            layout: buf.layout,
+        };
+        // Prevent the original from deallocating
+        std::mem::forget(buf);
+        result
+    }
+
+    /// Get a pointer at the given offset
+    pub fn as_ptr_at(&self, offset: usize) -> *const u8 {
+        debug_assert!(offset <= self.len);
+        unsafe { self.ptr.as_ptr().add(offset) }
+    }
+}
+
+impl Drop for SharedAlignedBuffer {
+    fn drop(&mut self) {
+        // SAFETY: ptr was allocated with this layout
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}
+
+// SAFETY: SharedAlignedBuffer owns its memory exclusively (wrapped in Arc for sharing)
+unsafe impl Send for SharedAlignedBuffer {}
+unsafe impl Sync for SharedAlignedBuffer {}
+
 /// Custom allocation that wraps a pooled buffer slice
 ///
 /// This implements Arrow's `Allocation` trait to enable creating Arrow Buffers
 /// that are backed by our memory pool without copying.
+/// The fields are stored to maintain ownership (keeping the Arc alive) but not read directly.
 pub struct PooledAllocation {
     /// The underlying pooled buffer (Arc for shared ownership)
-    buffer: Arc<Vec<u8>>,
+    _buffer: Arc<SharedAlignedBuffer>,
     /// Offset within the buffer where this allocation starts
-    offset: usize,
+    _offset: usize,
     /// Length of this allocation
-    len: usize,
+    _len: usize,
 }
 
 impl PooledAllocation {
     /// Create a new pooled allocation
-    pub fn new(buffer: Arc<Vec<u8>>, offset: usize, len: usize) -> Self {
-        Self { buffer, offset, len }
-    }
-
-    /// Get the slice this allocation represents
-    pub fn as_slice(&self) -> &[u8] {
-        &self.buffer[self.offset..self.offset + self.len]
+    pub fn new(buffer: Arc<SharedAlignedBuffer>, offset: usize, len: usize) -> Self {
+        Self {
+            _buffer: buffer,
+            _offset: offset,
+            _len: len,
+        }
     }
 }
 
-// Safety: The PooledAllocation is Send + Sync because Arc<Vec<u8>> is
+// Safety: The PooledAllocation is Send + Sync because Arc<SharedAlignedBuffer> is
 unsafe impl Send for PooledAllocation {}
 unsafe impl Sync for PooledAllocation {}
 
@@ -534,11 +702,13 @@ impl BufferProvider for DefaultBufferProvider {
 /// This provider uses a pre-allocated buffer with a known layout to enable
 /// zero-allocation Avro decoding. The buffer is divided into regions for
 /// each column's data, offsets, and null bitmaps.
+///
+/// The buffer is allocated with 64-byte alignment to satisfy Arrow's SIMD requirements.
 pub struct PooledBufferProvider {
-    /// The pre-allocated buffer
-    buffer: Arc<Vec<u8>>,
-    /// Mutable view for writing (before finalization)
-    buffer_mut: Vec<u8>,
+    /// The pre-allocated aligned buffer (Arc-wrapped for finalized state)
+    buffer: Option<Arc<SharedAlignedBuffer>>,
+    /// Mutable buffer for writing (before finalization)
+    buffer_mut: Option<AlignedBuffer>,
     /// Layout specification
     layout: BufferLayout,
     /// Current write positions per column (data)
@@ -555,20 +725,35 @@ impl PooledBufferProvider {
     /// Create a new pooled buffer provider
     ///
     /// # Arguments
-    /// * `buffer` - Pre-allocated buffer (will be zeroed)
+    /// * `buffer` - Pre-allocated buffer (will be ignored, aligned buffer will be allocated)
     /// * `layout` - Buffer layout specification
-    pub fn new(mut buffer: Vec<u8>, layout: BufferLayout) -> Self {
-        // Ensure buffer is large enough
-        if buffer.len() < layout.total_size {
-            buffer.resize(layout.total_size, 0);
-        }
-        // Zero the buffer
-        buffer.iter_mut().for_each(|b| *b = 0);
+    pub fn new(_buffer: Vec<u8>, layout: BufferLayout) -> Self {
+        // Allocate aligned buffer (ignores passed buffer - alignment is more important)
+        let aligned_buffer = AlignedBuffer::new(layout.total_size);
 
         let num_columns = layout.columns.len();
         Self {
-            buffer: Arc::new(Vec::new()), // Will be set on finalization
-            buffer_mut: buffer,
+            buffer: None, // Will be set on finalization
+            buffer_mut: Some(aligned_buffer),
+            layout,
+            data_positions: vec![0; num_columns],
+            offsets_positions: vec![0; num_columns],
+            null_bitmap_positions: vec![0; num_columns],
+            finalized: false,
+        }
+    }
+
+    /// Create a new pooled buffer provider with aligned memory
+    ///
+    /// # Arguments
+    /// * `layout` - Buffer layout specification
+    pub fn new_aligned(layout: BufferLayout) -> Self {
+        let aligned_buffer = AlignedBuffer::new(layout.total_size);
+
+        let num_columns = layout.columns.len();
+        Self {
+            buffer: None,
+            buffer_mut: Some(aligned_buffer),
             layout,
             data_positions: vec![0; num_columns],
             offsets_positions: vec![0; num_columns],
@@ -582,6 +767,13 @@ impl PooledBufferProvider {
         // This would need to be tracked based on actual decoding
         self.layout.row_count
     }
+
+    /// Get a mutable reference to the buffer
+    fn get_buffer_mut(&mut self) -> Result<&mut AlignedBuffer, ArrowError> {
+        self.buffer_mut.as_mut().ok_or_else(|| {
+            ArrowError::InvalidArgumentError("Buffer already finalized".to_string())
+        })
+    }
 }
 
 impl BufferProvider for PooledBufferProvider {
@@ -591,28 +783,27 @@ impl BufferProvider for PooledBufferProvider {
         offset: usize,
         len: usize,
     ) -> Result<&mut [u8], ArrowError> {
-        if self.finalized {
-            return Err(ArrowError::InvalidArgumentError(
-                "Buffer already finalized".to_string(),
-            ));
-        }
-
+        // Get layout info first (immutable borrow)
         let region = self.layout.columns.get(column_index).ok_or_else(|| {
             ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
         })?;
 
         let start = region.data_offset + offset;
         let end = start + len;
+        let data_capacity = region.data_capacity;
+        let data_offset = region.data_offset;
 
-        if end > region.data_offset + region.data_capacity {
+        if end > data_offset + data_capacity {
             return Err(ArrowError::InvalidArgumentError(format!(
                 "Data write exceeds capacity: {} > {}",
-                end - region.data_offset,
-                region.data_capacity
+                end - data_offset,
+                data_capacity
             )));
         }
 
-        Ok(&mut self.buffer_mut[start..end])
+        // Now get mutable buffer access
+        let buffer = self.get_buffer_mut()?;
+        Ok(&mut buffer.as_mut_slice()[start..end])
     }
 
     fn get_offsets_slice(
@@ -621,12 +812,7 @@ impl BufferProvider for PooledBufferProvider {
         offset: usize,
         len: usize,
     ) -> Result<&mut [u8], ArrowError> {
-        if self.finalized {
-            return Err(ArrowError::InvalidArgumentError(
-                "Buffer already finalized".to_string(),
-            ));
-        }
-
+        // Get layout info first (immutable borrow)
         let region = self.layout.columns.get(column_index).ok_or_else(|| {
             ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
         })?;
@@ -650,7 +836,9 @@ impl BufferProvider for PooledBufferProvider {
             )));
         }
 
-        Ok(&mut self.buffer_mut[start..end])
+        // Now get mutable buffer access
+        let buffer = self.get_buffer_mut()?;
+        Ok(&mut buffer.as_mut_slice()[start..end])
     }
 
     fn get_null_bitmap_slice(
@@ -659,12 +847,7 @@ impl BufferProvider for PooledBufferProvider {
         offset: usize,
         len: usize,
     ) -> Result<&mut [u8], ArrowError> {
-        if self.finalized {
-            return Err(ArrowError::InvalidArgumentError(
-                "Buffer already finalized".to_string(),
-            ));
-        }
-
+        // Get layout info first (immutable borrow)
         let region = self.layout.columns.get(column_index).ok_or_else(|| {
             ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
         })?;
@@ -688,7 +871,9 @@ impl BufferProvider for PooledBufferProvider {
             )));
         }
 
-        Ok(&mut self.buffer_mut[start..end])
+        // Now get mutable buffer access
+        let buffer = self.get_buffer_mut()?;
+        Ok(&mut buffer.as_mut_slice()[start..end])
     }
 
     fn finalize_data_buffer(
@@ -698,7 +883,9 @@ impl BufferProvider for PooledBufferProvider {
     ) -> Result<Buffer, ArrowError> {
         if !self.finalized {
             // Move buffer to Arc for shared ownership
-            self.buffer = Arc::new(std::mem::take(&mut self.buffer_mut));
+            if let Some(buf) = self.buffer_mut.take() {
+                self.buffer = Some(Arc::new(SharedAlignedBuffer::from_aligned(buf)));
+            }
             self.finalized = true;
         }
 
@@ -706,10 +893,14 @@ impl BufferProvider for PooledBufferProvider {
             ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
         })?;
 
-        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
+        let buffer = self.buffer.as_ref().ok_or_else(|| {
+            ArrowError::InvalidArgumentError("No buffer available".to_string())
+        })?;
+
+        // Zero-copy: create buffer pointing into our Arc<SharedAlignedBuffer>
         let start = region.data_offset;
-        let ptr = unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(start) as *mut u8) };
-        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        let ptr = unsafe { NonNull::new_unchecked(buffer.as_ptr_at(start) as *mut u8) };
+        let owner: Arc<dyn Allocation> = buffer.clone();
         Ok(unsafe { Buffer::from_custom_allocation(ptr, data_len, owner) })
     }
 
@@ -719,7 +910,9 @@ impl BufferProvider for PooledBufferProvider {
         offsets_len: usize,
     ) -> Result<Buffer, ArrowError> {
         if !self.finalized {
-            self.buffer = Arc::new(std::mem::take(&mut self.buffer_mut));
+            if let Some(buf) = self.buffer_mut.take() {
+                self.buffer = Some(Arc::new(SharedAlignedBuffer::from_aligned(buf)));
+            }
             self.finalized = true;
         }
 
@@ -734,10 +927,13 @@ impl BufferProvider for PooledBufferProvider {
             ))
         })?;
 
-        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
-        let ptr =
-            unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(offsets_offset) as *mut u8) };
-        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        let buffer = self.buffer.as_ref().ok_or_else(|| {
+            ArrowError::InvalidArgumentError("No buffer available".to_string())
+        })?;
+
+        // Zero-copy: create buffer pointing into our Arc<SharedAlignedBuffer>
+        let ptr = unsafe { NonNull::new_unchecked(buffer.as_ptr_at(offsets_offset) as *mut u8) };
+        let owner: Arc<dyn Allocation> = buffer.clone();
         Ok(unsafe { Buffer::from_custom_allocation(ptr, offsets_len, owner) })
     }
 
@@ -747,7 +943,9 @@ impl BufferProvider for PooledBufferProvider {
         bitmap_len: usize,
     ) -> Result<Buffer, ArrowError> {
         if !self.finalized {
-            self.buffer = Arc::new(std::mem::take(&mut self.buffer_mut));
+            if let Some(buf) = self.buffer_mut.take() {
+                self.buffer = Some(Arc::new(SharedAlignedBuffer::from_aligned(buf)));
+            }
             self.finalized = true;
         }
 
@@ -762,24 +960,22 @@ impl BufferProvider for PooledBufferProvider {
             ))
         })?;
 
-        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
-        let ptr =
-            unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(bitmap_offset) as *mut u8) };
-        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        let buffer = self.buffer.as_ref().ok_or_else(|| {
+            ArrowError::InvalidArgumentError("No buffer available".to_string())
+        })?;
+
+        // Zero-copy: create buffer pointing into our Arc<SharedAlignedBuffer>
+        let ptr = unsafe { NonNull::new_unchecked(buffer.as_ptr_at(bitmap_offset) as *mut u8) };
+        let owner: Arc<dyn Allocation> = buffer.clone();
         Ok(unsafe { Buffer::from_custom_allocation(ptr, bitmap_len, owner) })
     }
 
     fn reset(&mut self) {
         if self.finalized {
-            // Take back the buffer from Arc if we're the only owner
-            if let Some(buffer) = Arc::get_mut(&mut self.buffer) {
-                self.buffer_mut = std::mem::take(buffer);
-                self.finalized = false;
-            } else {
-                // Buffer is still shared, need to allocate new
-                self.buffer_mut = vec![0u8; self.layout.total_size];
-                self.finalized = false;
-            }
+            // Buffer is shared or finalized, allocate new aligned buffer
+            self.buffer_mut = Some(AlignedBuffer::new(self.layout.total_size));
+            self.buffer = None;
+            self.finalized = false;
         }
 
         // Just reset positions - don't zero the buffer (decode will overwrite old data)
@@ -807,12 +1003,7 @@ impl BufferProvider for PooledBufferProvider {
         column_index: usize,
         offset: usize,
     ) -> Result<(*mut u8, usize), ArrowError> {
-        if self.finalized {
-            return Err(ArrowError::InvalidArgumentError(
-                "Buffer already finalized".to_string(),
-            ));
-        }
-
+        // Get layout info first (immutable borrow)
         let region = self.layout.columns.get(column_index).ok_or_else(|| {
             ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
         })?;
@@ -820,16 +1011,19 @@ impl BufferProvider for PooledBufferProvider {
         let start = region.data_offset + offset;
         let remaining_capacity = region.data_capacity.saturating_sub(offset);
 
-        if start >= self.buffer_mut.len() {
+        // Now get mutable buffer access
+        let buffer = self.get_buffer_mut()?;
+
+        if start >= buffer.len() {
             return Err(ArrowError::InvalidArgumentError(format!(
                 "Offset {} exceeds buffer size {}",
-                start, self.buffer_mut.len()
+                start, buffer.len()
             )));
         }
 
         // SAFETY: We've verified start is within bounds. The caller is responsible
         // for ensuring writes don't exceed remaining_capacity.
-        let ptr = unsafe { self.buffer_mut.as_mut_ptr().add(start) };
+        let ptr = buffer.as_mut_ptr_at(start);
         Ok((ptr, remaining_capacity))
     }
 
@@ -840,12 +1034,7 @@ impl BufferProvider for PooledBufferProvider {
         offset: usize,
         len: usize,
     ) -> Result<&mut [u8], ArrowError> {
-        if self.finalized {
-            return Err(ArrowError::InvalidArgumentError(
-                "Buffer already finalized".to_string(),
-            ));
-        }
-
+        // Get layout info first (immutable borrow)
         let region = self.layout.columns.get(column_index).ok_or_else(|| {
             ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
         })?;
@@ -859,16 +1048,20 @@ impl BufferProvider for PooledBufferProvider {
 
         let start = child_region.data_offset + offset;
         let end = start + len;
+        let child_data_offset = child_region.data_offset;
+        let child_data_capacity = child_region.data_capacity;
 
-        if end > child_region.data_offset + child_region.data_capacity {
+        if end > child_data_offset + child_data_capacity {
             return Err(ArrowError::InvalidArgumentError(format!(
                 "Child data write exceeds capacity: {} > {}",
-                end - child_region.data_offset,
-                child_region.data_capacity
+                end - child_data_offset,
+                child_data_capacity
             )));
         }
 
-        Ok(&mut self.buffer_mut[start..end])
+        // Now get mutable buffer access
+        let buffer = self.get_buffer_mut()?;
+        Ok(&mut buffer.as_mut_slice()[start..end])
     }
 
     fn get_child_offsets_slice(
@@ -878,12 +1071,7 @@ impl BufferProvider for PooledBufferProvider {
         offset: usize,
         len: usize,
     ) -> Result<&mut [u8], ArrowError> {
-        if self.finalized {
-            return Err(ArrowError::InvalidArgumentError(
-                "Buffer already finalized".to_string(),
-            ));
-        }
-
+        // Get layout info first (immutable borrow)
         let region = self.layout.columns.get(column_index).ok_or_else(|| {
             ArrowError::InvalidArgumentError(format!("Invalid column index: {}", column_index))
         })?;
@@ -914,7 +1102,9 @@ impl BufferProvider for PooledBufferProvider {
             )));
         }
 
-        Ok(&mut self.buffer_mut[start..end])
+        // Now get mutable buffer access
+        let buffer = self.get_buffer_mut()?;
+        Ok(&mut buffer.as_mut_slice()[start..end])
     }
 
     fn finalize_child_data_buffer(
@@ -925,7 +1115,9 @@ impl BufferProvider for PooledBufferProvider {
     ) -> Result<Buffer, ArrowError> {
         if !self.finalized {
             // Move buffer to Arc for shared ownership
-            self.buffer = Arc::new(std::mem::take(&mut self.buffer_mut));
+            if let Some(buf) = self.buffer_mut.take() {
+                self.buffer = Some(Arc::new(SharedAlignedBuffer::from_aligned(buf)));
+            }
             self.finalized = true;
         }
 
@@ -940,10 +1132,14 @@ impl BufferProvider for PooledBufferProvider {
             ))
         })?;
 
-        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
+        let buffer = self.buffer.as_ref().ok_or_else(|| {
+            ArrowError::InvalidArgumentError("No buffer available".to_string())
+        })?;
+
+        // Zero-copy: create buffer pointing into our Arc<SharedAlignedBuffer>
         let start = child_region.data_offset;
-        let ptr = unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(start) as *mut u8) };
-        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        let ptr = unsafe { NonNull::new_unchecked(buffer.as_ptr_at(start) as *mut u8) };
+        let owner: Arc<dyn Allocation> = buffer.clone();
         Ok(unsafe { Buffer::from_custom_allocation(ptr, data_len, owner) })
     }
 
@@ -955,7 +1151,9 @@ impl BufferProvider for PooledBufferProvider {
     ) -> Result<Buffer, ArrowError> {
         if !self.finalized {
             // Move buffer to Arc for shared ownership
-            self.buffer = Arc::new(std::mem::take(&mut self.buffer_mut));
+            if let Some(buf) = self.buffer_mut.take() {
+                self.buffer = Some(Arc::new(SharedAlignedBuffer::from_aligned(buf)));
+            }
             self.finalized = true;
         }
 
@@ -977,10 +1175,13 @@ impl BufferProvider for PooledBufferProvider {
             ))
         })?;
 
-        // Zero-copy: create buffer pointing into our Arc<Vec<u8>>
-        let ptr =
-            unsafe { NonNull::new_unchecked(self.buffer.as_ptr().add(offsets_offset) as *mut u8) };
-        let owner: Arc<dyn Allocation> = self.buffer.clone();
+        let buffer = self.buffer.as_ref().ok_or_else(|| {
+            ArrowError::InvalidArgumentError("No buffer available".to_string())
+        })?;
+
+        // Zero-copy: create buffer pointing into our Arc<SharedAlignedBuffer>
+        let ptr = unsafe { NonNull::new_unchecked(buffer.as_ptr_at(offsets_offset) as *mut u8) };
+        let owner: Arc<dyn Allocation> = buffer.clone();
         Ok(unsafe { Buffer::from_custom_allocation(ptr, offsets_len, owner) })
     }
 
@@ -1047,8 +1248,9 @@ mod tests {
         let slice = provider.get_data_slice(0, 0, 8).unwrap();
         slice.copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
 
-        // Verify data
-        assert_eq!(&provider.buffer_mut[0..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        // Verify data by reading through the slice again
+        let slice = provider.get_data_slice(0, 0, 8).unwrap();
+        assert_eq!(slice, &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]

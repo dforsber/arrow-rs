@@ -295,6 +295,8 @@ fn stress_test_map_of_structs() {
         encode_varint(&mut avro_data, entries_per_row as i64);
         for j in 0..entries_per_row {
             encode_string(&mut avro_data, &format!("key_{}_{}", i, j));
+            // Struct value is nullable, so need union index (1=non-null)
+            encode_varint(&mut avro_data, 1); // union index: non-null
             // Struct value: count (int), label (string)
             encode_varint(&mut avro_data, (i * j) as i64);
             encode_string(&mut avro_data, &format!("label_{}_{}", i, j));
@@ -554,10 +556,11 @@ fn stress_test_mixed_nested_schema() {
             encode_string(&mut avro_data, &format!("tag_{}", j));
         }
         avro_data.push(0);
-        // metadata
+        // metadata (value is nullable, so need union index)
         encode_varint(&mut avro_data, meta_count as i64);
         for j in 0..meta_count {
             encode_string(&mut avro_data, &format!("key_{}", j));
+            encode_varint(&mut avro_data, 1); // union index: non-null
             encode_string(&mut avro_data, &format!("val_{}", j));
         }
         avro_data.push(0);

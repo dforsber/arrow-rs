@@ -19,8 +19,8 @@
 //! for ALL supported Avro types (flat, strings, mixed, dictionary, all-combined)
 
 use apache_avro::types::Value;
-use apache_avro::{to_avro_datum, Schema as ApacheSchema};
-use arrow_avro::buffer_provider::{BufferLayout, ColumnRegion, PooledBufferProvider};
+use apache_avro::{to_avro_datum, Decimal as AvroDecimal, Schema as ApacheSchema};
+use arrow_avro::buffer_provider::{align_to, BufferLayout, ColumnRegion, PooledBufferProvider};
 use arrow_avro::reader::pooled_decoder::PooledRecordDecoder;
 use arrow_avro::reader::ReaderBuilder;
 use arrow_avro::schema::{AvroSchema, Fingerprint, FingerprintAlgorithm, SchemaStore, SINGLE_OBJECT_MAGIC};
@@ -29,6 +29,11 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Align offset to 8 bytes for scalar types
+fn align8(offset: usize) -> usize {
+    align_to(offset, 8)
+}
 
 // === Schema Definitions ===
 
@@ -185,6 +190,55 @@ const COMPREHENSIVE_SCHEMA: &str = r#"{
                 {"name": "zip", "type": "int"}
             ]
         }}
+    ]
+}"#;
+
+// Full coverage schema: ALL types including logical types and nullable variants
+const FULL_COVERAGE_SCHEMA: &str = r#"{
+    "type": "record",
+    "name": "FullCoverageRecord",
+    "fields": [
+        {"name": "id", "type": "long"},
+        {"name": "count", "type": "int"},
+        {"name": "value", "type": "double"},
+        {"name": "ratio", "type": "float"},
+        {"name": "active", "type": "boolean"},
+        {"name": "name", "type": "string"},
+        {"name": "data", "type": "bytes"},
+        {"name": "checksum", "type": {"type": "fixed", "name": "Checksum", "size": 16}},
+        {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 18, "scale": 2}},
+        {"name": "event_date", "type": {"type": "int", "logicalType": "date"}},
+        {"name": "event_time", "type": {"type": "int", "logicalType": "time-millis"}},
+        {"name": "event_time_micros", "type": {"type": "long", "logicalType": "time-micros"}},
+        {"name": "created_at", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+        {"name": "updated_at", "type": {"type": "long", "logicalType": "timestamp-micros"}},
+        {"name": "uuid_field", "type": {"type": "string", "logicalType": "uuid"}},
+        {"name": "duration_field", "type": {"type": "fixed", "name": "Duration", "size": 12, "logicalType": "duration"}},
+        {"name": "status", "type": {"type": "enum", "name": "Status", "symbols": ["ACTIVE", "INACTIVE", "PENDING"]}},
+        {"name": "tags", "type": {"type": "array", "items": "string"}},
+        {"name": "scores", "type": {"type": "array", "items": "int"}},
+        {"name": "metadata", "type": {"type": "map", "values": "string"}},
+        {"name": "address", "type": {
+            "type": "record",
+            "name": "Address",
+            "fields": [
+                {"name": "street", "type": "string"},
+                {"name": "city", "type": "string"},
+                {"name": "zip", "type": "int"}
+            ]
+        }},
+        {"name": "opt_long", "type": ["null", "long"]},
+        {"name": "opt_int", "type": ["null", "int"]},
+        {"name": "opt_double", "type": ["null", "double"]},
+        {"name": "opt_float", "type": ["null", "float"]},
+        {"name": "opt_bool", "type": ["null", "boolean"]},
+        {"name": "opt_string", "type": ["null", "string"]},
+        {"name": "opt_bytes", "type": ["null", "bytes"]},
+        {"name": "opt_decimal", "type": ["null", {"type": "bytes", "logicalType": "decimal", "precision": 18, "scale": 2}]},
+        {"name": "opt_date", "type": ["null", {"type": "int", "logicalType": "date"}]},
+        {"name": "opt_timestamp", "type": ["null", {"type": "long", "logicalType": "timestamp-millis"}]},
+        {"name": "opt_array", "type": ["null", {"type": "array", "items": "string"}]},
+        {"name": "opt_map", "type": ["null", {"type": "map", "values": "string"}]}
     ]
 }"#;
 
@@ -702,6 +756,242 @@ fn gen_comprehensive_data_soe(n: usize, avg_len: usize) -> Vec<u8> {
     out
 }
 
+fn gen_full_coverage_data(n: usize, avg_len: usize) -> Vec<u8> {
+    let schema = ApacheSchema::parse_str(FULL_COVERAGE_SCHEMA).expect("invalid schema");
+    let mut out = Vec::new();
+    for i in 0..n {
+        // Basic types
+        let data_bytes: Vec<u8> = (0..20).map(|j| ((i + j) % 256) as u8).collect();
+        let checksum_bytes: [u8; 16] = std::array::from_fn(|j| ((i * 7 + j) % 256) as u8);
+
+        // Decimal as bytes (big-endian two's complement, scale=2)
+        let decimal_value = ((i as i64 % 100000) * 100) as i128; // e.g. 12345.67 stored as 1234567
+        let decimal_bytes = decimal_value.to_be_bytes().to_vec();
+        // Trim leading zeros/sign-extension but keep at least 1 byte
+        let first_significant = decimal_bytes.iter().position(|&b| b != 0 && b != 0xff).unwrap_or(15);
+        let trimmed_decimal: Vec<u8> = decimal_bytes[first_significant.min(15)..].to_vec();
+
+        // Duration: 12 bytes (months:u32, days:u32, millis:u32) little-endian
+        let duration_bytes: [u8; 12] = {
+            let months = (i % 12) as u32;
+            let days = (i % 30) as u32;
+            let millis = (i % 86400000) as u32;
+            let mut buf = [0u8; 12];
+            buf[0..4].copy_from_slice(&months.to_le_bytes());
+            buf[4..8].copy_from_slice(&days.to_le_bytes());
+            buf[8..12].copy_from_slice(&millis.to_le_bytes());
+            buf
+        };
+
+        // UUID as string
+        let uuid_str = format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            i as u32, (i % 0xFFFF) as u16, (i % 0xFFFF) as u16,
+            (i % 0xFFFF) as u16, i as u64 % 0xFFFFFFFFFFFF);
+
+        // Arrays
+        let num_tags = (i % 3) + 1;
+        let tags: Vec<Value> = (0..num_tags)
+            .map(|j| Value::String(gen_string(i * 10 + j, "tag_", avg_len / 2)))
+            .collect();
+        let num_scores = (i % 3) + 1;
+        let scores: Vec<Value> = (0..num_scores)
+            .map(|j| Value::Int(((i + j) % 100) as i32))
+            .collect();
+
+        // Map
+        let num_meta = (i % 2) + 1;
+        let metadata: std::collections::HashMap<String, Value> = (0..num_meta)
+            .map(|j| (format!("k{}", j), Value::String(gen_string(i + j, "v_", avg_len / 2))))
+            .collect();
+
+        // Struct
+        let address = Value::Record(vec![
+            ("street".into(), Value::String(gen_string(i, "st_", avg_len))),
+            ("city".into(), Value::String(gen_string(i, "city_", avg_len / 2))),
+            ("zip".into(), Value::Int((10000 + (i % 90000)) as i32)),
+        ]);
+
+        // Nullable variants with varying null patterns
+        let opt_long = if i % 5 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Long(i as i64 * 100))) };
+        let opt_int = if i % 6 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Int((i % 10000) as i32))) };
+        let opt_double = if i % 7 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Double(i as f64 * 0.01))) };
+        let opt_float = if i % 8 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Float(i as f32 * 0.1))) };
+        let opt_bool = if i % 9 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Boolean(i % 2 == 0))) };
+        let opt_string = if i % 4 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::String(gen_string(i, "opt_", avg_len)))) };
+        let opt_bytes = if i % 5 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Bytes(vec![(i % 256) as u8; 10]))) };
+        let opt_decimal = if i % 6 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Decimal(AvroDecimal::from(trimmed_decimal.clone())))) };
+        let opt_date = if i % 7 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Int((i % 20000) as i32))) };
+        let opt_timestamp = if i % 8 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Long((i as i64) * 1000000))) };
+        let opt_array = if i % 9 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Array(vec![Value::String(format!("item_{}", i))]))) };
+        let opt_map = if i % 10 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else {
+                let mut m = std::collections::HashMap::new();
+                m.insert(format!("key_{}", i), Value::String(format!("val_{}", i % 1000)));
+                Value::Union(1, Box::new(Value::Map(m)))
+            };
+
+        let record = Value::Record(vec![
+            ("id".into(), Value::Long(i as i64)),
+            ("count".into(), Value::Int((i % 1000) as i32)),
+            ("value".into(), Value::Double(i as f64 * 0.1)),
+            ("ratio".into(), Value::Float(i as f32 / 100.0)),
+            ("active".into(), Value::Boolean(i % 2 == 0)),
+            ("name".into(), Value::String(gen_string(i, "name_", avg_len))),
+            ("data".into(), Value::Bytes(data_bytes)),
+            ("checksum".into(), Value::Fixed(16, checksum_bytes.to_vec())),
+            ("amount".into(), Value::Decimal(AvroDecimal::from(trimmed_decimal))),
+            ("event_date".into(), Value::Int((i % 20000) as i32)), // days since epoch
+            ("event_time".into(), Value::Int((i % 86400000) as i32)), // millis since midnight
+            ("event_time_micros".into(), Value::Long((i as i64 % 86400000000) * 1000)), // micros since midnight
+            ("created_at".into(), Value::Long((i as i64) * 1000000)), // timestamp millis
+            ("updated_at".into(), Value::Long((i as i64) * 1000000000)), // timestamp micros
+            ("uuid_field".into(), Value::String(uuid_str)),
+            ("duration_field".into(), Value::Fixed(12, duration_bytes.to_vec())),
+            ("status".into(), Value::Enum((i % 3) as u32, ["ACTIVE", "INACTIVE", "PENDING"][i % 3].to_string())),
+            ("tags".into(), Value::Array(tags)),
+            ("scores".into(), Value::Array(scores)),
+            ("metadata".into(), Value::Map(metadata)),
+            ("address".into(), address),
+            ("opt_long".into(), opt_long),
+            ("opt_int".into(), opt_int),
+            ("opt_double".into(), opt_double),
+            ("opt_float".into(), opt_float),
+            ("opt_bool".into(), opt_bool),
+            ("opt_string".into(), opt_string),
+            ("opt_bytes".into(), opt_bytes),
+            ("opt_decimal".into(), opt_decimal),
+            ("opt_date".into(), opt_date),
+            ("opt_timestamp".into(), opt_timestamp),
+            ("opt_array".into(), opt_array),
+            ("opt_map".into(), opt_map),
+        ]);
+        out.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
+    }
+    out
+}
+
+fn gen_full_coverage_data_soe(n: usize, avg_len: usize) -> Vec<u8> {
+    let schema = ApacheSchema::parse_str(FULL_COVERAGE_SCHEMA).expect("invalid schema");
+    let prefix = make_soe_prefix(FULL_COVERAGE_SCHEMA);
+    let mut out = Vec::new();
+    for i in 0..n {
+        // Same data generation as gen_full_coverage_data
+        let data_bytes: Vec<u8> = (0..20).map(|j| ((i + j) % 256) as u8).collect();
+        let checksum_bytes: [u8; 16] = std::array::from_fn(|j| ((i * 7 + j) % 256) as u8);
+        let decimal_value = ((i as i64 % 100000) * 100) as i128;
+        let decimal_bytes = decimal_value.to_be_bytes().to_vec();
+        let first_significant = decimal_bytes.iter().position(|&b| b != 0 && b != 0xff).unwrap_or(15);
+        let trimmed_decimal: Vec<u8> = decimal_bytes[first_significant.min(15)..].to_vec();
+        let duration_bytes: [u8; 12] = {
+            let months = (i % 12) as u32;
+            let days = (i % 30) as u32;
+            let millis = (i % 86400000) as u32;
+            let mut buf = [0u8; 12];
+            buf[0..4].copy_from_slice(&months.to_le_bytes());
+            buf[4..8].copy_from_slice(&days.to_le_bytes());
+            buf[8..12].copy_from_slice(&millis.to_le_bytes());
+            buf
+        };
+        let uuid_str = format!("{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+            i as u32, (i % 0xFFFF) as u16, (i % 0xFFFF) as u16,
+            (i % 0xFFFF) as u16, i as u64 % 0xFFFFFFFFFFFF);
+        let num_tags = (i % 3) + 1;
+        let tags: Vec<Value> = (0..num_tags)
+            .map(|j| Value::String(gen_string(i * 10 + j, "tag_", avg_len / 2)))
+            .collect();
+        let num_scores = (i % 3) + 1;
+        let scores: Vec<Value> = (0..num_scores)
+            .map(|j| Value::Int(((i + j) % 100) as i32))
+            .collect();
+        let num_meta = (i % 2) + 1;
+        let metadata: std::collections::HashMap<String, Value> = (0..num_meta)
+            .map(|j| (format!("k{}", j), Value::String(gen_string(i + j, "v_", avg_len / 2))))
+            .collect();
+        let address = Value::Record(vec![
+            ("street".into(), Value::String(gen_string(i, "st_", avg_len))),
+            ("city".into(), Value::String(gen_string(i, "city_", avg_len / 2))),
+            ("zip".into(), Value::Int((10000 + (i % 90000)) as i32)),
+        ]);
+        let opt_long = if i % 5 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Long(i as i64 * 100))) };
+        let opt_int = if i % 6 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Int((i % 10000) as i32))) };
+        let opt_double = if i % 7 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Double(i as f64 * 0.01))) };
+        let opt_float = if i % 8 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Float(i as f32 * 0.1))) };
+        let opt_bool = if i % 9 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Boolean(i % 2 == 0))) };
+        let opt_string = if i % 4 == 0 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::String(gen_string(i, "opt_", avg_len)))) };
+        let opt_bytes = if i % 5 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Bytes(vec![(i % 256) as u8; 10]))) };
+        let opt_decimal = if i % 6 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Decimal(AvroDecimal::from(trimmed_decimal.clone())))) };
+        let opt_date = if i % 7 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Int((i % 20000) as i32))) };
+        let opt_timestamp = if i % 8 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Long((i as i64) * 1000000))) };
+        let opt_array = if i % 9 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else { Value::Union(1, Box::new(Value::Array(vec![Value::String(format!("item_{}", i))]))) };
+        let opt_map = if i % 10 == 1 { Value::Union(0, Box::new(Value::Null)) }
+            else {
+                let mut m = std::collections::HashMap::new();
+                m.insert(format!("key_{}", i), Value::String(format!("val_{}", i % 1000)));
+                Value::Union(1, Box::new(Value::Map(m)))
+            };
+        let record = Value::Record(vec![
+            ("id".into(), Value::Long(i as i64)),
+            ("count".into(), Value::Int((i % 1000) as i32)),
+            ("value".into(), Value::Double(i as f64 * 0.1)),
+            ("ratio".into(), Value::Float(i as f32 / 100.0)),
+            ("active".into(), Value::Boolean(i % 2 == 0)),
+            ("name".into(), Value::String(gen_string(i, "name_", avg_len))),
+            ("data".into(), Value::Bytes(data_bytes)),
+            ("checksum".into(), Value::Fixed(16, checksum_bytes.to_vec())),
+            ("amount".into(), Value::Decimal(AvroDecimal::from(trimmed_decimal))),
+            ("event_date".into(), Value::Int((i % 20000) as i32)),
+            ("event_time".into(), Value::Int((i % 86400000) as i32)),
+            ("event_time_micros".into(), Value::Long((i as i64 % 86400000000) * 1000)),
+            ("created_at".into(), Value::Long((i as i64) * 1000000)),
+            ("updated_at".into(), Value::Long((i as i64) * 1000000000)),
+            ("uuid_field".into(), Value::String(uuid_str)),
+            ("duration_field".into(), Value::Fixed(12, duration_bytes.to_vec())),
+            ("status".into(), Value::Enum((i % 3) as u32, ["ACTIVE", "INACTIVE", "PENDING"][i % 3].to_string())),
+            ("tags".into(), Value::Array(tags)),
+            ("scores".into(), Value::Array(scores)),
+            ("metadata".into(), Value::Map(metadata)),
+            ("address".into(), address),
+            ("opt_long".into(), opt_long),
+            ("opt_int".into(), opt_int),
+            ("opt_double".into(), opt_double),
+            ("opt_float".into(), opt_float),
+            ("opt_bool".into(), opt_bool),
+            ("opt_string".into(), opt_string),
+            ("opt_bytes".into(), opt_bytes),
+            ("opt_decimal".into(), opt_decimal),
+            ("opt_date".into(), opt_date),
+            ("opt_timestamp".into(), opt_timestamp),
+            ("opt_array".into(), opt_array),
+            ("opt_map".into(), opt_map),
+        ]);
+        out.extend_from_slice(&prefix);
+        out.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
+    }
+    out
+}
+
 // === Arrow Schema Creators ===
 
 fn create_flat_schema() -> Arc<Schema> {
@@ -768,13 +1058,15 @@ fn create_list_schema() -> Arc<Schema> {
 }
 
 fn create_map_schema() -> Arc<Schema> {
+    // Note: value fields are NOT nullable to match the Avro schema
+    // (Avro has plain "string" and "int", not ["null", "string"])
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("metadata", DataType::Map(
             Arc::new(Field::new("entries", DataType::Struct(
                 vec![
                     Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::Utf8, true),
+                    Field::new("value", DataType::Utf8, false),
                 ].into()
             ), false)),
             false
@@ -783,7 +1075,7 @@ fn create_map_schema() -> Arc<Schema> {
             Arc::new(Field::new("entries", DataType::Struct(
                 vec![
                     Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::Int32, true),
+                    Field::new("value", DataType::Int32, false),
                 ].into()
             ), false)),
             false
@@ -862,7 +1154,7 @@ fn create_comprehensive_schema() -> Arc<Schema> {
             Arc::new(Field::new("entries", DataType::Struct(
                 vec![
                     Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::Utf8, true),
+                    Field::new("value", DataType::Utf8, false), // Non-nullable to match Avro schema
                 ].into()
             ), false)),
             false
@@ -878,13 +1170,105 @@ fn create_comprehensive_schema() -> Arc<Schema> {
     ]))
 }
 
+fn create_full_coverage_schema() -> Arc<Schema> {
+    use arrow_schema::TimeUnit;
+
+    // Helper to create union for nullable fields
+    fn nullable_union(inner_type: DataType) -> DataType {
+        let fields = UnionFields::new(
+            vec![0, 1],
+            vec![
+                Field::new("null", DataType::Null, true),
+                Field::new("value", inner_type, false),
+            ],
+        );
+        DataType::Union(fields, UnionMode::Dense)
+    }
+
+    Arc::new(Schema::new(vec![
+        // Basic primitive types
+        Field::new("id", DataType::Int64, false),
+        Field::new("count", DataType::Int32, false),
+        Field::new("value", DataType::Float64, false),
+        Field::new("ratio", DataType::Float32, false),
+        Field::new("active", DataType::Boolean, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("data", DataType::Binary, false),
+        Field::new("checksum", DataType::FixedSizeBinary(16), false),
+
+        // Logical types
+        Field::new("amount", DataType::Binary, false), // Decimal stored as bytes
+        Field::new("event_date", DataType::Date32, false),
+        Field::new("event_time", DataType::Time32(TimeUnit::Millisecond), false),
+        Field::new("event_time_micros", DataType::Time64(TimeUnit::Microsecond), false),
+        Field::new("created_at", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+        Field::new("updated_at", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("uuid_field", DataType::Utf8, false), // UUID as string
+        Field::new("duration_field", DataType::FixedSizeBinary(12), false), // Duration as fixed 12 bytes
+
+        // Enum
+        Field::new("status", DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)), false),
+
+        // Collections
+        Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))), false),
+        Field::new("scores", DataType::List(Arc::new(Field::new("item", DataType::Int32, false))), false),
+        Field::new("metadata", DataType::Map(
+            Arc::new(Field::new("entries", DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Utf8, false), // Non-nullable map values
+                ].into()
+            ), false)),
+            false
+        ), false),
+
+        // Struct
+        Field::new("address", DataType::Struct(
+            vec![
+                Field::new("street", DataType::Utf8, false),
+                Field::new("city", DataType::Utf8, false),
+                Field::new("zip", DataType::Int32, false),
+            ].into()
+        ), false),
+
+        // Nullable primitives (unions)
+        Field::new("opt_long", nullable_union(DataType::Int64), false),
+        Field::new("opt_int", nullable_union(DataType::Int32), false),
+        Field::new("opt_double", nullable_union(DataType::Float64), false),
+        Field::new("opt_float", nullable_union(DataType::Float32), false),
+        Field::new("opt_bool", nullable_union(DataType::Boolean), false),
+        Field::new("opt_string", nullable_union(DataType::Utf8), false),
+        Field::new("opt_bytes", nullable_union(DataType::Binary), false),
+
+        // Nullable logical types
+        Field::new("opt_decimal", nullable_union(DataType::Binary), false), // Decimal as bytes
+        Field::new("opt_date", nullable_union(DataType::Date32), false),
+        Field::new("opt_timestamp", nullable_union(DataType::Timestamp(TimeUnit::Millisecond, None)), false),
+
+        // Nullable collections
+        Field::new("opt_array", nullable_union(DataType::List(
+            Arc::new(Field::new("item", DataType::Utf8, false))
+        )), false),
+        Field::new("opt_map", nullable_union(DataType::Map(
+            Arc::new(Field::new("entries", DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Utf8, false),
+                ].into()
+            ), false)),
+            false
+        )), false),
+    ]))
+}
+
 // === Buffer Layout Creators ===
 
 fn create_flat_layout(row_count: usize) -> BufferLayout {
     let mut columns = Vec::new();
     let mut offset = 0;
 
-    // id: Int64 - 8 bytes
+    // id: Int64 - 8 bytes (needs 8-byte alignment)
+    offset = align8(offset);
     let id_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -897,7 +1281,8 @@ fn create_flat_layout(row_count: usize) -> BufferLayout {
     });
     offset += id_cap;
 
-    // value: Float64 - 8 bytes
+    // value: Float64 - 8 bytes (needs 8-byte alignment)
+    offset = align8(offset);
     let val_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -910,7 +1295,8 @@ fn create_flat_layout(row_count: usize) -> BufferLayout {
     });
     offset += val_cap;
 
-    // count: Int32 - 4 bytes
+    // count: Int32 - 4 bytes (needs 4-byte alignment)
+    offset = align_to(offset, 4);
     let cnt_cap = row_count * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -923,7 +1309,8 @@ fn create_flat_layout(row_count: usize) -> BufferLayout {
     });
     offset += cnt_cap;
 
-    // ratio: Float32 - 4 bytes
+    // ratio: Float32 - 4 bytes (needs 4-byte alignment)
+    offset = align_to(offset, 4);
     let ratio_cap = row_count * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -938,7 +1325,7 @@ fn create_flat_layout(row_count: usize) -> BufferLayout {
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset),
         row_count,
     }
 }
@@ -949,22 +1336,24 @@ fn create_strings_layout(row_count: usize, avg_len: usize) -> BufferLayout {
 
     for _ in 0..3 {
         let data_cap = row_count * (avg_len + 10);
+        // Align offsets to 4 bytes
+        let offsets_offset = align_to(offset + data_cap, 4);
         let offsets_cap = (row_count + 1) * 4;
         columns.push(ColumnRegion {
             data_offset: offset,
             data_capacity: data_cap,
-            offsets_offset: Some(offset + data_cap),
+            offsets_offset: Some(offsets_offset),
             offsets_capacity: Some(offsets_cap),
             null_bitmap_offset: None,
             null_bitmap_capacity: None,
             child_regions: vec![],
         });
-        offset += data_cap + offsets_cap;
+        offset = offsets_offset + offsets_cap;
     }
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset),
         row_count,
     }
 }
@@ -973,7 +1362,8 @@ fn create_mixed_layout(row_count: usize, avg_len: usize) -> BufferLayout {
     let mut columns = Vec::new();
     let mut offset = 0;
 
-    // id: Int64
+    // id: Int64 (needs 8-byte alignment)
+    offset = align8(offset);
     let id_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -986,21 +1376,23 @@ fn create_mixed_layout(row_count: usize, avg_len: usize) -> BufferLayout {
     });
     offset += id_cap;
 
-    // name: String
+    // name: String (data is bytes, offsets need 4-byte alignment)
     let name_data_cap = row_count * (avg_len + 10);
+    let name_off_offset = align_to(offset + name_data_cap, 4);
     let name_off_cap = (row_count + 1) * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
         data_capacity: name_data_cap,
-        offsets_offset: Some(offset + name_data_cap),
+        offsets_offset: Some(name_off_offset),
         offsets_capacity: Some(name_off_cap),
         null_bitmap_offset: None,
         null_bitmap_capacity: None,
         child_regions: vec![],
     });
-    offset += name_data_cap + name_off_cap;
+    offset = name_off_offset + name_off_cap;
 
-    // value: Float64
+    // value: Float64 (needs 8-byte alignment)
+    offset = align8(offset);
     let val_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -1013,21 +1405,23 @@ fn create_mixed_layout(row_count: usize, avg_len: usize) -> BufferLayout {
     });
     offset += val_cap;
 
-    // description: String
+    // description: String (data is bytes, offsets need 4-byte alignment)
     let desc_data_cap = row_count * (avg_len * 2 + 10);
+    let desc_off_offset = align_to(offset + desc_data_cap, 4);
     let desc_off_cap = (row_count + 1) * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
         data_capacity: desc_data_cap,
-        offsets_offset: Some(offset + desc_data_cap),
+        offsets_offset: Some(desc_off_offset),
         offsets_capacity: Some(desc_off_cap),
         null_bitmap_offset: None,
         null_bitmap_capacity: None,
         child_regions: vec![],
     });
-    offset += desc_data_cap + desc_off_cap;
+    offset = desc_off_offset + desc_off_cap;
 
-    // count: Int32
+    // count: Int32 (needs 4-byte alignment)
+    offset = align_to(offset, 4);
     let cnt_cap = row_count * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -1042,7 +1436,7 @@ fn create_mixed_layout(row_count: usize, avg_len: usize) -> BufferLayout {
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset), // Ensure total size is aligned
         row_count,
     }
 }
@@ -1080,7 +1474,8 @@ fn create_all_types_layout(row_count: usize, avg_len: usize) -> BufferLayout {
     let mut columns = Vec::new();
     let mut offset = 0;
 
-    // id: Int64
+    // id: Int64 (needs 8-byte alignment)
+    offset = align8(offset);
     let id_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -1093,21 +1488,23 @@ fn create_all_types_layout(row_count: usize, avg_len: usize) -> BufferLayout {
     });
     offset += id_cap;
 
-    // name: String
+    // name: String (offsets need 4-byte alignment)
     let name_data_cap = row_count * (avg_len + 10);
+    let name_off_offset = align_to(offset + name_data_cap, 4);
     let name_off_cap = (row_count + 1) * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
         data_capacity: name_data_cap,
-        offsets_offset: Some(offset + name_data_cap),
+        offsets_offset: Some(name_off_offset),
         offsets_capacity: Some(name_off_cap),
         null_bitmap_offset: None,
         null_bitmap_capacity: None,
         child_regions: vec![],
     });
-    offset += name_data_cap + name_off_cap;
+    offset = name_off_offset + name_off_cap;
 
-    // value: Float64
+    // value: Float64 (needs 8-byte alignment)
+    offset = align8(offset);
     let val_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -1131,21 +1528,23 @@ fn create_all_types_layout(row_count: usize, avg_len: usize) -> BufferLayout {
         child_regions: vec![],
     });
 
-    // description: String
+    // description: String (offsets need 4-byte alignment)
     let desc_data_cap = row_count * (avg_len * 2 + 10);
+    let desc_off_offset = align_to(offset + desc_data_cap, 4);
     let desc_off_cap = (row_count + 1) * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
         data_capacity: desc_data_cap,
-        offsets_offset: Some(offset + desc_data_cap),
+        offsets_offset: Some(desc_off_offset),
         offsets_capacity: Some(desc_off_cap),
         null_bitmap_offset: None,
         null_bitmap_capacity: None,
         child_regions: vec![],
     });
-    offset += desc_data_cap + desc_off_cap;
+    offset = desc_off_offset + desc_off_cap;
 
-    // count: Int32
+    // count: Int32 (needs 4-byte alignment)
+    offset = align_to(offset, 4);
     let cnt_cap = row_count * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -1171,7 +1570,7 @@ fn create_all_types_layout(row_count: usize, avg_len: usize) -> BufferLayout {
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset),
         row_count,
     }
 }
@@ -1205,19 +1604,20 @@ fn create_bool_binary_layout(row_count: usize) -> BufferLayout {
     });
     offset += bool_cap;
 
-    // data: Binary (variable length ~20 bytes)
+    // data: Binary (variable length ~20 bytes, offsets need 4-byte alignment)
     let data_cap = row_count * 30; // Extra buffer
+    let data_off_offset = align_to(offset + data_cap, 4);
     let data_off_cap = (row_count + 1) * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
         data_capacity: data_cap,
-        offsets_offset: Some(offset + data_cap),
+        offsets_offset: Some(data_off_offset),
         offsets_capacity: Some(data_off_cap),
         null_bitmap_offset: None,
         null_bitmap_capacity: None,
         child_regions: vec![],
     });
-    offset += data_cap + data_off_cap;
+    offset = data_off_offset + data_off_cap;
 
     // checksum: FixedSizeBinary(16)
     let fixed_cap = row_count * 16;
@@ -1234,7 +1634,7 @@ fn create_bool_binary_layout(row_count: usize) -> BufferLayout {
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset),
         row_count,
     }
 }
@@ -1243,7 +1643,8 @@ fn create_list_layout(row_count: usize, avg_len: usize) -> BufferLayout {
     let mut columns = Vec::new();
     let mut offset = 0;
 
-    // id: Int64
+    // id: Int64 (needs 8-byte alignment)
+    offset = align8(offset);
     let id_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -1256,12 +1657,15 @@ fn create_list_layout(row_count: usize, avg_len: usize) -> BufferLayout {
     });
     offset += id_cap;
 
-    // tags: List<String> - avg 3 items per row
-    let avg_items = 3;
-    let total_items = row_count * avg_items;
+    // tags: List<String> - max 5 items per row (gen uses (i % 5) + 1 = 1-5)
+    // Use max to ensure we never exceed capacity
+    offset = align_to(offset, 4);
+    let max_tags_items = row_count * 5; // Max possible items
     let list_off_cap = (row_count + 1) * 4;
-    let item_data_cap = total_items * (avg_len + 10);
-    let item_off_cap = (total_items + 1) * 4;
+    let item_data_offset = align_to(offset + list_off_cap, 4);
+    let item_data_cap = max_tags_items * (avg_len + 10);
+    let item_off_offset = align_to(item_data_offset + item_data_cap, 4);
+    let item_off_cap = (max_tags_items + 1) * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
         data_capacity: 0, // List itself has no data buffer
@@ -1270,20 +1674,23 @@ fn create_list_layout(row_count: usize, avg_len: usize) -> BufferLayout {
         null_bitmap_offset: None,
         null_bitmap_capacity: None,
         child_regions: vec![ColumnRegion {
-            data_offset: offset + list_off_cap,
+            data_offset: item_data_offset,
             data_capacity: item_data_cap,
-            offsets_offset: Some(offset + list_off_cap + item_data_cap),
+            offsets_offset: Some(item_off_offset),
             offsets_capacity: Some(item_off_cap),
             null_bitmap_offset: None,
             null_bitmap_capacity: None,
             child_regions: vec![],
         }],
     });
-    offset += list_off_cap + item_data_cap + item_off_cap;
+    offset = item_off_offset + item_off_cap;
 
-    // scores: List<Int32> - avg 3 items per row
+    // scores: List<Int32> - max 5 items per row (gen uses (i % 4) + 2 = 2-5)
+    offset = align_to(offset, 4);
+    let max_score_items = row_count * 5; // Max possible items
     let score_list_off_cap = (row_count + 1) * 4;
-    let score_item_cap = total_items * 4;
+    let score_child_offset = align_to(offset + score_list_off_cap, 4);
+    let score_item_cap = max_score_items * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
         data_capacity: 0,
@@ -1292,7 +1699,7 @@ fn create_list_layout(row_count: usize, avg_len: usize) -> BufferLayout {
         null_bitmap_offset: None,
         null_bitmap_capacity: None,
         child_regions: vec![ColumnRegion {
-            data_offset: offset + score_list_off_cap,
+            data_offset: score_child_offset,
             data_capacity: score_item_cap,
             offsets_offset: None,
             offsets_capacity: None,
@@ -1301,11 +1708,11 @@ fn create_list_layout(row_count: usize, avg_len: usize) -> BufferLayout {
             child_regions: vec![],
         }],
     });
-    offset += score_list_off_cap + score_item_cap;
+    offset = score_child_offset + score_item_cap;
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset),
         row_count,
     }
 }
@@ -1314,7 +1721,8 @@ fn create_map_layout(row_count: usize, _avg_len: usize) -> BufferLayout {
     let mut columns = Vec::new();
     let mut offset = 0;
 
-    // id: Int64
+    // id: Int64 (needs 8-byte alignment)
+    offset = align8(offset);
     let id_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -1352,7 +1760,7 @@ fn create_map_layout(row_count: usize, _avg_len: usize) -> BufferLayout {
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset),
         row_count,
     }
 }
@@ -1361,7 +1769,8 @@ fn create_union_layout(row_count: usize, _avg_len: usize) -> BufferLayout {
     let mut columns = Vec::new();
     let mut offset = 0;
 
-    // id: Int64
+    // id: Int64 (needs 8-byte alignment)
+    offset = align8(offset);
     let id_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -1410,7 +1819,7 @@ fn create_union_layout(row_count: usize, _avg_len: usize) -> BufferLayout {
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset),
         row_count,
     }
 }
@@ -1419,7 +1828,8 @@ fn create_struct_layout(row_count: usize, avg_len: usize) -> BufferLayout {
     let mut columns = Vec::new();
     let mut offset = 0;
 
-    // id: Int64
+    // id: Int64 (needs 8-byte alignment)
+    offset = align8(offset);
     let id_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset,
@@ -1433,11 +1843,17 @@ fn create_struct_layout(row_count: usize, avg_len: usize) -> BufferLayout {
     offset += id_cap;
 
     // address: Struct { street, city, zip }
-    // Struct has child regions for each field
+    // Struct has child regions for each field (pre-allocated mode)
     let street_data_cap = row_count * (avg_len + 10);
+    let street_off_offset = align_to(offset + street_data_cap, 4);
     let street_off_cap = (row_count + 1) * 4;
+
+    let city_data_offset = street_off_offset + street_off_cap;
     let city_data_cap = row_count * (avg_len / 2 + 10);
+    let city_off_offset = align_to(city_data_offset + city_data_cap, 4);
     let city_off_cap = (row_count + 1) * 4;
+
+    let zip_offset = align_to(city_off_offset + city_off_cap, 4);
     let zip_cap = row_count * 4;
 
     columns.push(ColumnRegion {
@@ -1452,7 +1868,7 @@ fn create_struct_layout(row_count: usize, avg_len: usize) -> BufferLayout {
             ColumnRegion {
                 data_offset: offset,
                 data_capacity: street_data_cap,
-                offsets_offset: Some(offset + street_data_cap),
+                offsets_offset: Some(street_off_offset),
                 offsets_capacity: Some(street_off_cap),
                 null_bitmap_offset: None,
                 null_bitmap_capacity: None,
@@ -1460,17 +1876,17 @@ fn create_struct_layout(row_count: usize, avg_len: usize) -> BufferLayout {
             },
             // city
             ColumnRegion {
-                data_offset: offset + street_data_cap + street_off_cap,
+                data_offset: city_data_offset,
                 data_capacity: city_data_cap,
-                offsets_offset: Some(offset + street_data_cap + street_off_cap + city_data_cap),
+                offsets_offset: Some(city_off_offset),
                 offsets_capacity: Some(city_off_cap),
                 null_bitmap_offset: None,
                 null_bitmap_capacity: None,
                 child_regions: vec![],
             },
-            // zip
+            // zip (Int32 - needs 4-byte alignment)
             ColumnRegion {
-                data_offset: offset + street_data_cap + street_off_cap + city_data_cap + city_off_cap,
+                data_offset: zip_offset,
                 data_capacity: zip_cap,
                 offsets_offset: None,
                 offsets_capacity: None,
@@ -1480,25 +1896,26 @@ fn create_struct_layout(row_count: usize, avg_len: usize) -> BufferLayout {
             },
         ],
     });
-    offset += street_data_cap + street_off_cap + city_data_cap + city_off_cap + zip_cap;
+    offset = zip_offset + zip_cap;
 
-    // name: String
+    // name: String (offsets need 4-byte alignment)
     let name_data_cap = row_count * (avg_len + 10);
+    let name_off_offset = align_to(offset + name_data_cap, 4);
     let name_off_cap = (row_count + 1) * 4;
     columns.push(ColumnRegion {
         data_offset: offset,
         data_capacity: name_data_cap,
-        offsets_offset: Some(offset + name_data_cap),
+        offsets_offset: Some(name_off_offset),
         offsets_capacity: Some(name_off_cap),
         null_bitmap_offset: None,
         null_bitmap_capacity: None,
         child_regions: vec![],
     });
-    offset += name_data_cap + name_off_cap;
+    offset = name_off_offset + name_off_cap;
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset),
         row_count,
     }
 }
@@ -1509,7 +1926,8 @@ fn create_comprehensive_layout(row_count: usize, avg_len: usize) -> BufferLayout
     let mut columns = Vec::new();
     let mut offset = 0;
 
-    // id: Int64
+    // id: Int64 (needs 8-byte alignment)
+    offset = align8(offset);
     let id_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset, data_capacity: id_cap,
@@ -1529,18 +1947,20 @@ fn create_comprehensive_layout(row_count: usize, avg_len: usize) -> BufferLayout
     });
     offset += bool_cap;
 
-    // name: String
+    // name: String (offsets need 4-byte alignment)
     let name_data_cap = row_count * (avg_len + 10);
+    let name_off_offset = align_to(offset + name_data_cap, 4);
     let name_off_cap = (row_count + 1) * 4;
     columns.push(ColumnRegion {
         data_offset: offset, data_capacity: name_data_cap,
-        offsets_offset: Some(offset + name_data_cap), offsets_capacity: Some(name_off_cap),
+        offsets_offset: Some(name_off_offset), offsets_capacity: Some(name_off_cap),
         null_bitmap_offset: None, null_bitmap_capacity: None,
         child_regions: vec![],
     });
-    offset += name_data_cap + name_off_cap;
+    offset = name_off_offset + name_off_cap;
 
-    // value: Float64
+    // value: Float64 (needs 8-byte alignment)
+    offset = align8(offset);
     let val_cap = row_count * 8;
     columns.push(ColumnRegion {
         data_offset: offset, data_capacity: val_cap,
@@ -1550,7 +1970,8 @@ fn create_comprehensive_layout(row_count: usize, avg_len: usize) -> BufferLayout
     });
     offset += val_cap;
 
-    // ratio: Float32
+    // ratio: Float32 (needs 4-byte alignment)
+    offset = align_to(offset, 4);
     let ratio_cap = row_count * 4;
     columns.push(ColumnRegion {
         data_offset: offset, data_capacity: ratio_cap,
@@ -1560,7 +1981,8 @@ fn create_comprehensive_layout(row_count: usize, avg_len: usize) -> BufferLayout
     });
     offset += ratio_cap;
 
-    // count: Int32
+    // count: Int32 (needs 4-byte alignment)
+    offset = align_to(offset, 4);
     let cnt_cap = row_count * 4;
     columns.push(ColumnRegion {
         data_offset: offset, data_capacity: cnt_cap,
@@ -1570,16 +1992,17 @@ fn create_comprehensive_layout(row_count: usize, avg_len: usize) -> BufferLayout
     });
     offset += cnt_cap;
 
-    // data: Binary
+    // data: Binary (offsets need 4-byte alignment)
     let bin_data_cap = row_count * 30;
+    let bin_off_offset = align_to(offset + bin_data_cap, 4);
     let bin_off_cap = (row_count + 1) * 4;
     columns.push(ColumnRegion {
         data_offset: offset, data_capacity: bin_data_cap,
-        offsets_offset: Some(offset + bin_data_cap), offsets_capacity: Some(bin_off_cap),
+        offsets_offset: Some(bin_off_offset), offsets_capacity: Some(bin_off_cap),
         null_bitmap_offset: None, null_bitmap_capacity: None,
         child_regions: vec![],
     });
-    offset += bin_data_cap + bin_off_cap;
+    offset = bin_off_offset + bin_off_cap;
 
     // checksum: FixedSizeBinary(16)
     let fixed_cap = row_count * 16;
@@ -1641,7 +2064,247 @@ fn create_comprehensive_layout(row_count: usize, avg_len: usize) -> BufferLayout
 
     BufferLayout {
         columns,
-        total_size: offset,
+        total_size: align8(offset),
+        row_count,
+    }
+}
+
+fn create_full_coverage_layout(row_count: usize, avg_len: usize) -> BufferLayout {
+    // Full coverage layout - 34 fields with all types including logical types and nullable variants
+    // Complex types (Dictionary, List, Map, Union, Struct) use Vec internally so get minimal allocation
+    let mut columns = Vec::new();
+    let mut offset = 0;
+
+    // 1. id: Int64 (needs 8-byte alignment)
+    offset = align8(offset);
+    let id_cap = row_count * 8;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: id_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += id_cap;
+
+    // 2. count: Int32 (needs 4-byte alignment)
+    offset = align_to(offset, 4);
+    let cnt_cap = row_count * 4;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: cnt_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += cnt_cap;
+
+    // 3. value: Float64 (needs 8-byte alignment)
+    offset = align8(offset);
+    let val_cap = row_count * 8;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: val_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += val_cap;
+
+    // 4. ratio: Float32 (needs 4-byte alignment)
+    offset = align_to(offset, 4);
+    let ratio_cap = row_count * 4;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: ratio_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += ratio_cap;
+
+    // 5. active: Boolean - bit-packed (8 values per byte)
+    let bool_cap = (row_count + 7) / 8;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: bool_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += bool_cap;
+
+    // 6. name: String (offsets need 4-byte alignment)
+    let name_data_cap = row_count * (avg_len + 10);
+    let name_off_offset = align_to(offset + name_data_cap, 4);
+    let name_off_cap = (row_count + 1) * 4;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: name_data_cap,
+        offsets_offset: Some(name_off_offset), offsets_capacity: Some(name_off_cap),
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset = name_off_offset + name_off_cap;
+
+    // 7. data: Binary (offsets need 4-byte alignment)
+    let bin_data_cap = row_count * 30;
+    let bin_off_offset = align_to(offset + bin_data_cap, 4);
+    let bin_off_cap = (row_count + 1) * 4;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: bin_data_cap,
+        offsets_offset: Some(bin_off_offset), offsets_capacity: Some(bin_off_cap),
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset = bin_off_offset + bin_off_cap;
+
+    // 8. checksum: FixedSizeBinary(16)
+    let fixed_cap = row_count * 16;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: fixed_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += fixed_cap;
+
+    // 9. amount: Binary (decimal stored as bytes)
+    let dec_data_cap = row_count * 20; // Variable length decimal
+    let dec_off_offset = align_to(offset + dec_data_cap, 4);
+    let dec_off_cap = (row_count + 1) * 4;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: dec_data_cap,
+        offsets_offset: Some(dec_off_offset), offsets_capacity: Some(dec_off_cap),
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset = dec_off_offset + dec_off_cap;
+
+    // 10. event_date: Date32 (Int32 - 4 bytes)
+    offset = align_to(offset, 4);
+    let date_cap = row_count * 4;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: date_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += date_cap;
+
+    // 11. event_time: Time32(Millisecond) (Int32 - 4 bytes)
+    offset = align_to(offset, 4);
+    let time_cap = row_count * 4;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: time_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += time_cap;
+
+    // 12. event_time_micros: Time64(Microsecond) (Int64 - 8 bytes)
+    offset = align8(offset);
+    let time_micros_cap = row_count * 8;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: time_micros_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += time_micros_cap;
+
+    // 13. created_at: Timestamp(Millisecond) (Int64 - 8 bytes)
+    offset = align8(offset);
+    let ts_millis_cap = row_count * 8;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: ts_millis_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += ts_millis_cap;
+
+    // 14. updated_at: Timestamp(Microsecond) (Int64 - 8 bytes)
+    offset = align8(offset);
+    let ts_micros_cap = row_count * 8;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: ts_micros_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += ts_micros_cap;
+
+    // 15. uuid_field: Utf8 (UUID as string - 36 chars)
+    let uuid_data_cap = row_count * 40;
+    let uuid_off_offset = align_to(offset + uuid_data_cap, 4);
+    let uuid_off_cap = (row_count + 1) * 4;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: uuid_data_cap,
+        offsets_offset: Some(uuid_off_offset), offsets_capacity: Some(uuid_off_cap),
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset = uuid_off_offset + uuid_off_cap;
+
+    // 16. duration_field: FixedSizeBinary(12)
+    let dur_cap = row_count * 12;
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: dur_cap,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+    offset += dur_cap;
+
+    // 17. status: Dictionary - uses Vec internally
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: 0,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+
+    // 18. tags: List<String> - uses Vec internally
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: 0,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+
+    // 19. scores: List<Int32> - uses Vec internally
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: 0,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+
+    // 20. metadata: Map - uses Vec internally
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: 0,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+
+    // 21. address: Struct - uses Vec internally
+    columns.push(ColumnRegion {
+        data_offset: offset, data_capacity: 0,
+        offsets_offset: None, offsets_capacity: None,
+        null_bitmap_offset: None, null_bitmap_capacity: None,
+        child_regions: vec![],
+    });
+
+    // 22-33: Nullable union fields - all use Vec internally (12 fields)
+    for _ in 0..12 {
+        columns.push(ColumnRegion {
+            data_offset: offset, data_capacity: 0,
+            offsets_offset: None, offsets_capacity: None,
+            null_bitmap_offset: None, null_bitmap_capacity: None,
+            child_regions: vec![],
+        });
+    }
+
+    BufferLayout {
+        columns,
+        total_size: align8(offset),
         row_count,
     }
 }
@@ -2017,9 +2680,52 @@ fn bench_comprehensive(c: &mut Criterion) {
     group.finish();
 }
 
+/// Full coverage benchmark with ALL types including logical types and nullable variants
+fn bench_full_coverage(c: &mut Criterion) {
+    let mut group = c.benchmark_group("Full_Coverage_All_Types");
+    group.measurement_time(Duration::from_secs(10));
+    group.warm_up_time(Duration::from_secs(3));
+    group.sample_size(30);
+
+    let rows = 50000;
+    let avg_len = 20;
+
+    // Full coverage schema with ALL types including logical types and nullable variants
+    let full_raw = gen_full_coverage_data(rows, avg_len);
+    let full_soe = gen_full_coverage_data_soe(rows, avg_len);
+    let full_schema = create_full_coverage_schema();
+    let full_layout = create_full_coverage_layout(rows, avg_len);
+
+    group.throughput(Throughput::Elements(rows as u64));
+
+    // Pooled decoder
+    let full_buf = vec![0u8; full_layout.total_size.max(1)];
+    let full_provider = PooledBufferProvider::new(full_buf, full_layout.clone());
+    let mut full_pooled = PooledRecordDecoder::try_new(full_schema.clone(), full_provider).unwrap();
+    // Set dictionary values for status enum (column index 16)
+    full_pooled.set_dictionary_values(16, vec!["ACTIVE".to_string(), "INACTIVE".to_string(), "PENDING".to_string()]).unwrap();
+
+    group.bench_function("Pooled_full_coverage", |b| {
+        b.iter(|| {
+            full_pooled.decode(&full_raw, rows).unwrap();
+            black_box(full_pooled.flush().unwrap())
+        })
+    });
+
+    group.bench_function("Vec_full_coverage", |b| {
+        b.iter(|| {
+            let mut decoder = create_vec_decoder(FULL_COVERAGE_SCHEMA, rows);
+            decoder.decode(&full_soe).unwrap();
+            black_box(decoder.flush().unwrap().unwrap())
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group! {
     name = all_types;
     config = Criterion::default().configure_from_args();
-    targets = bench_all_types_comparison, bench_summary, bench_comprehensive
+    targets = bench_all_types_comparison, bench_summary, bench_comprehensive, bench_full_coverage
 }
 criterion_main!(all_types);

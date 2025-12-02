@@ -34,7 +34,7 @@ use crate::buffer_provider::BufferProvider;
 use crate::codec::{AvroDataType, Codec};
 use super::cursor::AvroCursor;
 use arrow_array::*;
-use arrow_buffer::{i256, Buffer, IntervalMonthDayNano, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{i256, Buffer, IntervalMonthDayNano, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, IntervalUnit, Schema, SchemaRef, UnionFields, UnionMode};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -97,6 +97,7 @@ enum NestedSnapshot {
         offsets_len: usize,
         child_data_len: usize,
         child_data_position: usize,
+        child_offsets_position: usize,
         total_elements: usize,
     },
     Dictionary {
@@ -104,7 +105,10 @@ enum NestedSnapshot {
     },
     Struct {
         field_data_lens: Vec<usize>,
+        field_null_bitmap_lens: Vec<usize>,
         row_count: usize,
+        field_positions: Vec<usize>,
+        field_offsets_positions: Vec<usize>,
     },
 }
 
@@ -163,6 +167,8 @@ enum NestedState {
         value_data: Vec<u8>,
         /// Value type
         value_type: DataType,
+        /// Whether value field is nullable
+        value_nullable: bool,
         /// Current total entries
         total_entries: usize,
     },
@@ -191,8 +197,12 @@ enum NestedState {
         child_data: Vec<u8>,
         /// Current position in child data (for pre-allocated buffer mode)
         child_data_position: usize,
+        /// Current position in child offsets (for pre-allocated buffer mode with Utf8/Binary)
+        child_offsets_position: usize,
         /// Child element type
         child_type: DataType,
+        /// Whether child elements are nullable
+        child_nullable: bool,
         /// Total elements
         total_elements: usize,
         /// Whether to use pre-allocated buffers (vs Vec)
@@ -215,10 +225,14 @@ enum NestedState {
         field_names: Vec<String>,
         /// Field nullability
         field_nullable: Vec<bool>,
+        /// Null bitmaps for nullable fields (bit-packed, 1=valid, 0=null)
+        field_null_bitmaps: Vec<Vec<u8>>,
         /// Row count for this struct
         row_count: usize,
-        /// Current positions per field (for pre-allocated buffer mode)
+        /// Current data positions per field (for pre-allocated buffer mode)
         field_positions: Vec<usize>,
+        /// Current offsets positions per field (for variable-length fields in pre-allocated mode)
+        field_offsets_positions: Vec<usize>,
         /// Whether to use pre-allocated buffers (vs Vec)
         use_preallocated: bool,
     },
@@ -238,34 +252,74 @@ struct ColumnState {
     row_count: usize,
     /// Is this column nullable?
     is_nullable: bool,
+    /// Null bitmap for nullable columns (bit-packed, 1=valid, 0=null)
+    /// For Avro nullable unions, we read the union tag and set the bit accordingly
+    null_bitmap: Vec<u8>,
     /// Nested type state for complex types
     nested: NestedState,
 }
 
 impl ColumnState {
-    fn new(column_index: usize, field: &Field, use_preallocated: bool) -> Self {
-        let nested = Self::create_nested_state(field.data_type(), use_preallocated);
+    fn new(column_index: usize, field: &Field, use_preallocated: bool, row_hint: usize) -> Self {
+        let nested = Self::create_nested_state(field.data_type(), use_preallocated, row_hint);
         Self {
             column_index,
             data_type: field.data_type().clone(),
             data_position: 0,
             row_count: 0,
             is_nullable: field.is_nullable(),
+            null_bitmap: Vec::new(), // Will grow as needed during decode
             nested,
         }
     }
 
-    fn create_nested_state(data_type: &DataType, use_preallocated: bool) -> NestedState {
+    /// Set a bit in the null bitmap (1 = valid/non-null, 0 = null)
+    #[inline]
+    fn set_validity(&mut self, row: usize, is_valid: bool) {
+        if !self.is_nullable {
+            return; // Non-nullable columns don't need bitmap
+        }
+
+        let byte_idx = row / 8;
+        let bit_idx = row % 8;
+
+        // Grow bitmap if needed
+        while self.null_bitmap.len() <= byte_idx {
+            self.null_bitmap.push(0);
+        }
+
+        if is_valid {
+            self.null_bitmap[byte_idx] |= 1 << bit_idx;
+        }
+        // Note: bits default to 0 (null), so we only set for valid values
+    }
+
+    /// Get the null bitmap as a NullBuffer for Arrow array construction
+    fn get_null_buffer(&self) -> Option<arrow_buffer::NullBuffer> {
+        if !self.is_nullable || self.null_bitmap.is_empty() {
+            return None;
+        }
+
+        // Convert Vec<u8> to Buffer for NullBuffer
+        let buffer = arrow_buffer::Buffer::from(self.null_bitmap.clone());
+        Some(arrow_buffer::NullBuffer::new(arrow_buffer::BooleanBuffer::new(
+            buffer,
+            0,
+            self.row_count,
+        )))
+    }
+
+    fn create_nested_state(data_type: &DataType, use_preallocated: bool, row_hint: usize) -> NestedState {
         match data_type {
             DataType::Map(entries_field, _) => {
-                // Extract value type from map entries struct
-                let value_type = if let DataType::Struct(fields) = entries_field.data_type() {
+                // Extract value type and nullability from map entries struct
+                let (value_type, value_nullable) = if let DataType::Struct(fields) = entries_field.data_type() {
                     fields.iter()
                         .find(|f| f.name() == "value")
-                        .map(|f| f.data_type().clone())
-                        .unwrap_or(DataType::Utf8)
+                        .map(|f| (f.data_type().clone(), f.is_nullable()))
+                        .unwrap_or((DataType::Utf8, false))
                 } else {
-                    DataType::Utf8
+                    (DataType::Utf8, false)
                 };
                 NestedState::Map {
                     map_offsets: vec![0],
@@ -274,16 +328,44 @@ impl ColumnState {
                     value_offsets: vec![0],
                     value_data: Vec::new(),
                     value_type,
+                    value_nullable,
                     total_entries: 0,
                 }
             }
             DataType::Union(fields, mode) => {
                 let num_variants = fields.len();
+                // Pre-size vectors based on row_hint to reduce reallocations
+                // For unions, type_ids has one entry per row
+                let type_ids = Vec::with_capacity(row_hint);
+                let offsets = if *mode == UnionMode::Dense {
+                    Some(Vec::with_capacity(row_hint))
+                } else {
+                    None
+                };
+                // Pre-size child_data based on estimated element sizes
+                // For nullable unions (null + type), estimate 50% null, 50% values
+                let child_data: Vec<Vec<u8>> = fields.iter().map(|(_, field)| {
+                    let element_size = Self::estimate_element_size(field.data_type());
+                    // Estimate half of rows go to each variant in a binary union
+                    let estimated_count = if num_variants == 2 { row_hint / 2 } else { row_hint / num_variants };
+                    Vec::with_capacity(estimated_count * element_size)
+                }).collect();
+                let child_offsets: Vec<Vec<i32>> = fields.iter().map(|(_, field)| {
+                    match field.data_type() {
+                        DataType::Utf8 | DataType::Binary => {
+                            let estimated_count = if num_variants == 2 { row_hint / 2 } else { row_hint / num_variants };
+                            let mut v = Vec::with_capacity(estimated_count + 1);
+                            v.push(0);
+                            v
+                        }
+                        _ => vec![0],
+                    }
+                }).collect();
                 NestedState::Union {
-                    type_ids: Vec::new(),
-                    offsets: if *mode == UnionMode::Dense { Some(Vec::new()) } else { None },
-                    child_data: (0..num_variants).map(|_| Vec::new()).collect(),
-                    child_offsets: (0..num_variants).map(|_| vec![0]).collect(),
+                    type_ids,
+                    offsets,
+                    child_data,
+                    child_offsets,
                     child_counts: vec![0; num_variants],
                     fields: fields.clone(),
                     mode: *mode,
@@ -294,7 +376,10 @@ impl ColumnState {
                     offsets: vec![0],
                     child_data: Vec::new(),
                     child_data_position: 0,
+                    // For pre-allocated mode with variable-length children, skip initial offset 0
+                    child_offsets_position: if use_preallocated { 4 } else { 0 },
                     child_type: child_field.data_type().clone(),
+                    child_nullable: child_field.is_nullable(),
                     total_elements: 0,
                     use_preallocated,
                 }
@@ -313,13 +398,24 @@ impl ColumnState {
                 let field_types: Vec<DataType> = fields.iter().map(|f| f.data_type().clone()).collect();
                 let field_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
                 let field_nullable: Vec<bool> = fields.iter().map(|f| f.is_nullable()).collect();
+                let field_null_bitmaps: Vec<Vec<u8>> = fields.iter().map(|_| Vec::new()).collect();
+                // For variable-length fields in pre-allocated mode, start at offset 4 to skip initial 0
+                let field_offsets_positions: Vec<usize> = fields.iter().map(|f| {
+                    if use_preallocated && matches!(f.data_type(), DataType::Utf8 | DataType::Binary) {
+                        4 // Skip initial offset 0 (pre-zeroed buffer)
+                    } else {
+                        0
+                    }
+                }).collect();
                 NestedState::Struct {
                     field_data,
                     field_types,
                     field_names,
                     field_nullable,
+                    field_null_bitmaps,
                     row_count: 0,
                     field_positions: vec![0; num_fields],
+                    field_offsets_positions,
                     use_preallocated,
                 }
             }
@@ -360,24 +456,38 @@ impl ColumnState {
                     *count = 0;
                 }
             }
-            NestedState::List { offsets, child_data, child_data_position, total_elements, .. } => {
+            NestedState::List { offsets, child_data, child_data_position, child_offsets_position, total_elements, use_preallocated, .. } => {
                 offsets.clear();
                 offsets.push(0);
                 child_data.clear();
                 *child_data_position = 0;
+                // For pre-allocated mode with variable-length children (Utf8/Binary),
+                // skip the first 4 bytes which contain the initial offset 0 (pre-zeroed buffer)
+                *child_offsets_position = if *use_preallocated { 4 } else { 0 };
                 *total_elements = 0;
             }
             NestedState::Dictionary { indices, dictionary: _ } => {
                 // Keep dictionary values (they come from schema), clear indices
                 indices.clear();
             }
-            NestedState::Struct { field_data, row_count, field_positions, .. } => {
+            NestedState::Struct { field_data, field_null_bitmaps, row_count, field_positions, field_offsets_positions, field_types, use_preallocated, .. } => {
                 for data in field_data.iter_mut() {
                     data.clear();
+                }
+                for bitmap in field_null_bitmaps.iter_mut() {
+                    bitmap.clear();
                 }
                 *row_count = 0;
                 for pos in field_positions.iter_mut() {
                     *pos = 0;
+                }
+                // Reset offset positions - skip initial 0 for variable-length fields in pre-allocated mode
+                for (i, pos) in field_offsets_positions.iter_mut().enumerate() {
+                    if *use_preallocated && matches!(field_types[i], DataType::Utf8 | DataType::Binary) {
+                        *pos = 4; // Skip initial offset 0
+                    } else {
+                        *pos = 0;
+                    }
                 }
             }
         }
@@ -406,11 +516,12 @@ impl ColumnState {
                     child_counts: child_counts.clone(),
                 }
             }
-            NestedState::List { offsets, child_data, child_data_position, total_elements, .. } => {
+            NestedState::List { offsets, child_data, child_data_position, child_offsets_position, total_elements, .. } => {
                 NestedSnapshot::List {
                     offsets_len: offsets.len(),
                     child_data_len: child_data.len(),
                     child_data_position: *child_data_position,
+                    child_offsets_position: *child_offsets_position,
                     total_elements: *total_elements,
                 }
             }
@@ -419,10 +530,13 @@ impl ColumnState {
                     indices_len: indices.len(),
                 }
             }
-            NestedState::Struct { field_data, row_count, .. } => {
+            NestedState::Struct { field_data, field_null_bitmaps, row_count, field_positions, field_offsets_positions, .. } => {
                 NestedSnapshot::Struct {
                     field_data_lens: field_data.iter().map(|d| d.len()).collect(),
+                    field_null_bitmap_lens: field_null_bitmaps.iter().map(|b| b.len()).collect(),
                     row_count: *row_count,
+                    field_positions: field_positions.clone(),
+                    field_offsets_positions: field_offsets_positions.clone(),
                 }
             }
         }
@@ -463,12 +577,13 @@ impl ColumnState {
                 child_counts.clone_from(snap_counts);
             }
             (
-                NestedState::List { offsets, child_data, child_data_position, total_elements, .. },
-                NestedSnapshot::List { offsets_len, child_data_len, child_data_position: snap_position, total_elements: snap_elements }
+                NestedState::List { offsets, child_data, child_data_position, child_offsets_position, total_elements, .. },
+                NestedSnapshot::List { offsets_len, child_data_len, child_data_position: snap_position, child_offsets_position: snap_offsets_position, total_elements: snap_elements }
             ) => {
                 offsets.truncate(*offsets_len);
                 child_data.truncate(*child_data_len);
                 *child_data_position = *snap_position;
+                *child_offsets_position = *snap_offsets_position;
                 *total_elements = *snap_elements;
             }
             (
@@ -478,17 +593,53 @@ impl ColumnState {
                 indices.truncate(*indices_len);
             }
             (
-                NestedState::Struct { field_data, row_count, .. },
-                NestedSnapshot::Struct { field_data_lens, row_count: snap_count }
+                NestedState::Struct { field_data, field_null_bitmaps, row_count, field_positions, field_offsets_positions, .. },
+                NestedSnapshot::Struct { field_data_lens, field_null_bitmap_lens, row_count: snap_count, field_positions: snap_positions, field_offsets_positions: snap_offsets_positions }
             ) => {
                 for (data, len) in field_data.iter_mut().zip(field_data_lens.iter()) {
                     data.truncate(*len);
                 }
+                for (bitmap, len) in field_null_bitmaps.iter_mut().zip(field_null_bitmap_lens.iter()) {
+                    bitmap.truncate(*len);
+                }
                 *row_count = *snap_count;
+                *field_positions = snap_positions.clone();
+                *field_offsets_positions = snap_offsets_positions.clone();
             }
             _ => {
                 // Type mismatch - this shouldn't happen
             }
+        }
+    }
+
+    /// Estimate element size in bytes for a type (used for capacity pre-sizing)
+    /// Returns a reasonable estimate for variable-length types based on typical usage
+    fn estimate_element_size(data_type: &DataType) -> usize {
+        match data_type {
+            DataType::Null => 0,
+            DataType::Boolean => 1,
+            DataType::Int8 | DataType::UInt8 => 1,
+            DataType::Int16 | DataType::UInt16 => 2,
+            DataType::Int32 | DataType::UInt32 | DataType::Date32 | DataType::Time32(_) => 4,
+            DataType::Int64 | DataType::UInt64 | DataType::Date64 | DataType::Time64(_) | DataType::Timestamp(_, _) => 8,
+            DataType::Float16 => 2,
+            DataType::Float32 => 4,
+            DataType::Float64 => 8,
+            DataType::Decimal128(_, _) => 16,
+            DataType::Decimal256(_, _) => 32,
+            DataType::Interval(_) => 16,
+            DataType::Duration(_) => 8,
+            // Variable-length types: estimate 32 bytes avg
+            DataType::Utf8 | DataType::LargeUtf8 => 32,
+            DataType::Binary | DataType::LargeBinary => 32,
+            DataType::FixedSizeBinary(size) => *size as usize,
+            // Complex types: rough estimates
+            DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => 64,
+            DataType::Struct(_) => 64,
+            DataType::Union(_, _) => 16,
+            DataType::Dictionary(_, _) => 4, // Index size
+            DataType::Map(_, _) => 64,
+            _ => 16, // Default fallback
         }
     }
 }
@@ -523,7 +674,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 // Check if provider has child regions configured for this column
                 // List needs child_index 0 for element data
                 let use_preallocated = provider.has_child_region(idx, 0);
-                ColumnState::new(idx, field.as_ref(), use_preallocated)
+                ColumnState::new(idx, field.as_ref(), use_preallocated, max_rows)
             })
             .collect();
 
@@ -618,6 +769,9 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
 
     /// Fast batch decode for flat schemas with only fixed-size types
     /// Returns bytes consumed from buffer
+    ///
+    /// For nullable fields (Avro unions like ['null', 'int']), reads the union index
+    /// before each value and tracks null bits accordingly.
     fn decode_batch_flat(
         &mut self,
         buf: &[u8],
@@ -630,20 +784,20 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
 
         let num_columns = self.columns.len();
 
-        // Build column metadata: (column_index, data_type, type_size, start_position, base_row_count)
+        // Build column metadata: (column_index, data_type, type_size, start_position, base_row_count, is_nullable)
         // We clone data_type to avoid borrowing issues
-        let col_meta: Vec<(usize, DataType, usize, usize, usize)> = self.columns
+        let col_meta: Vec<(usize, DataType, usize, usize, usize, bool)> = self.columns
             .iter()
             .map(|col| {
                 let type_size = Self::get_type_size(&col.data_type).unwrap_or(0);
-                (col.column_index, col.data_type.clone(), type_size, col.data_position, col.row_count)
+                (col.column_index, col.data_type.clone(), type_size, col.data_position, col.row_count, col.is_nullable)
             })
             .collect();
 
         // Get raw pointers for all columns upfront - this avoids borrow checker issues
         // since column regions don't overlap
         let mut ptrs: Vec<Option<*mut u8>> = Vec::with_capacity(num_columns);
-        for (column_index, data_type, _, start_pos, _) in &col_meta {
+        for (column_index, data_type, _, start_pos, _, _) in &col_meta {
             if matches!(data_type, DataType::Null) {
                 ptrs.push(None);
             } else if matches!(data_type, DataType::Boolean) {
@@ -656,12 +810,62 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             }
         }
 
+        // Track validity for nullable columns during decode
+        // validity_bits[col_idx][row] = true if value is valid (non-null)
+        let mut validity_bits: Vec<Vec<bool>> = col_meta.iter()
+            .map(|(_, _, _, _, _, is_nullable)| {
+                if *is_nullable {
+                    Vec::with_capacity(rows_to_decode)
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+
         // Now decode in a tight loop using raw pointer writes
         let mut cursor = AvroCursor::new(buf);
 
         for row in 0..rows_to_decode {
             for col_idx in 0..num_columns {
-                let (_, ref data_type, type_size, _, base_row_count) = col_meta[col_idx];
+                let (_, ref data_type, type_size, _, base_row_count, is_nullable) = col_meta[col_idx];
+
+                // For nullable columns, read the Avro union index first
+                // Index 0 = null, Index 1 (zigzag: 2) = non-null value
+                let is_null = if is_nullable {
+                    let union_index = cursor.get_long()?;
+                    let is_valid = union_index != 0;
+                    validity_bits[col_idx].push(is_valid);
+                    !is_valid
+                } else {
+                    false
+                };
+
+                // Skip value reading if null
+                if is_null {
+                    // For null values, we still need to write something to the buffer
+                    // (a default/zero value) to maintain alignment
+                    if let Some(ptr) = ptrs[col_idx] {
+                        match data_type {
+                            DataType::Boolean => {
+                                // Boolean bit is already 0 by default
+                            }
+                            DataType::Int32 | DataType::Date32 | DataType::Time32(_) | DataType::Float32 => {
+                                unsafe {
+                                    let dest = ptr.add(row * type_size);
+                                    std::ptr::write_bytes(dest, 0, 4);
+                                }
+                            }
+                            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) | DataType::Float64 => {
+                                unsafe {
+                                    let dest = ptr.add(row * type_size);
+                                    std::ptr::write_bytes(dest, 0, 8);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
 
                 match data_type {
                     DataType::Null => {
@@ -732,10 +936,17 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             }
         }
 
-        // Update column positions and counts
-        for (col_idx, (_, _, type_size, _, _)) in col_meta.iter().enumerate() {
+        // Update column positions, counts, and null bitmaps
+        for (col_idx, (_, _, type_size, _, base_row_count, is_nullable)) in col_meta.iter().enumerate() {
             self.columns[col_idx].data_position += rows_to_decode * type_size;
             self.columns[col_idx].row_count += rows_to_decode;
+
+            // Update null bitmap for nullable columns
+            if *is_nullable {
+                for (row, is_valid) in validity_bits[col_idx].iter().enumerate() {
+                    self.columns[col_idx].set_validity(base_row_count + row, *is_valid);
+                }
+            }
         }
         self.row_count += rows_to_decode;
 
@@ -1106,6 +1317,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             String,
             Binary,
             FixedBytes { size: usize },
+            Decimal128,
             Dictionary,
             List { child_type: DataType, fixed_elem_size: Option<usize>, use_preallocated: bool },
             Map { value_type: DataType },
@@ -1140,13 +1352,15 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                     DataType::Utf8 => ColKind::String,
                     DataType::Binary => ColKind::Binary,
                     DataType::FixedSizeBinary(n) => ColKind::FixedBytes { size: *n as usize },
+                    DataType::Decimal128(_, _) => ColKind::Decimal128,
                     _ => ColKind::Int64, // Fallback
                 },
             }
         }).collect();
 
-        // Pre-compute column indices
+        // Pre-compute column indices and nullability
         let column_indices: Vec<usize> = self.columns.iter().map(|c| c.column_index).collect();
+        let nullable_flags: Vec<bool> = self.columns.iter().map(|c| c.is_nullable).collect();
 
         // Process in mini-batches for better cache efficiency
         let mut rows_processed = 0;
@@ -1171,7 +1385,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                         base_row_counts.push(self.columns[col_idx].row_count);
                     }
                     ColKind::Int32 | ColKind::Int64 | ColKind::Float32 | ColKind::Float64
-                    | ColKind::FixedBytes { .. } => {
+                    | ColKind::FixedBytes { .. } | ColKind::Decimal128 => {
                         let col = &self.columns[col_idx];
                         let (data_ptr, cap) = self.provider.get_data_ptr(column_index, col.data_position)?;
                         data_ptrs.push(Some(data_ptr));
@@ -1206,9 +1420,137 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             let mut fixed_offsets: Vec<usize> = vec![0; num_columns];
             let mut var_data_offsets: Vec<usize> = vec![0; num_columns];
 
+            // Track validity for nullable columns during decode
+            let mut validity_bits: Vec<Vec<bool>> = nullable_flags.iter()
+                .map(|&is_nullable| {
+                    if is_nullable {
+                        Vec::with_capacity(batch_rows)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+
             // Tight decode loop
             for row in 0..batch_rows {
                 for col_idx in 0..num_columns {
+                    let is_nullable = nullable_flags[col_idx];
+
+                    // For nullable columns, read the Avro union index first
+                    let is_null = if is_nullable {
+                        let union_index = cursor.get_long()?;
+                        let is_valid = union_index != 0;
+                        validity_bits[col_idx].push(is_valid);
+                        !is_valid
+                    } else {
+                        false
+                    };
+
+                    // Handle null values by writing placeholder and skipping value read
+                    if is_null {
+                        match &col_kinds[col_idx] {
+                            ColKind::Null | ColKind::Boolean => {}
+                            ColKind::Int32 | ColKind::Float32 => {
+                                if let Some(ptr) = data_ptrs[col_idx] {
+                                    unsafe {
+                                        let dest = ptr.add(fixed_offsets[col_idx]);
+                                        std::ptr::write_bytes(dest, 0, 4);
+                                    }
+                                }
+                                fixed_offsets[col_idx] += 4;
+                            }
+                            ColKind::Int64 | ColKind::Float64 => {
+                                if let Some(ptr) = data_ptrs[col_idx] {
+                                    unsafe {
+                                        let dest = ptr.add(fixed_offsets[col_idx]);
+                                        std::ptr::write_bytes(dest, 0, 8);
+                                    }
+                                }
+                                fixed_offsets[col_idx] += 8;
+                            }
+                            ColKind::FixedBytes { size } => {
+                                if let Some(ptr) = data_ptrs[col_idx] {
+                                    unsafe {
+                                        let dest = ptr.add(fixed_offsets[col_idx]);
+                                        std::ptr::write_bytes(dest, 0, *size);
+                                    }
+                                }
+                                fixed_offsets[col_idx] += size;
+                            }
+                            ColKind::Decimal128 => {
+                                // Null Decimal128: write 16 zero bytes
+                                if let Some(ptr) = data_ptrs[col_idx] {
+                                    unsafe {
+                                        let dest = ptr.add(fixed_offsets[col_idx]);
+                                        std::ptr::write_bytes(dest, 0, 16);
+                                    }
+                                }
+                                fixed_offsets[col_idx] += 16;
+                            }
+                            ColKind::String | ColKind::Binary => {
+                                // Write same offset as previous (empty string for null)
+                                let current_offset = var_data_offsets[col_idx];
+                                let new_end = (base_data_positions[col_idx] + current_offset) as i32;
+                                if let Some(ptr) = offsets_ptrs[col_idx] {
+                                    unsafe {
+                                        let dest = ptr.add(row * 4);
+                                        std::ptr::copy_nonoverlapping(new_end.to_le_bytes().as_ptr(), dest, 4);
+                                    }
+                                }
+                            }
+                            ColKind::Dictionary => {
+                                // Push a placeholder index for null dictionary value
+                                if let NestedState::Dictionary { indices, .. } = &mut self.columns[col_idx].nested {
+                                    indices.push(0);
+                                }
+                                self.columns[col_idx].row_count += 1;
+                            }
+                            ColKind::List { .. } => {
+                                // Null List: add offset for empty list (same position as current)
+                                if let NestedState::List { offsets, total_elements, .. } = &mut self.columns[col_idx].nested {
+                                    offsets.push(*total_elements as i32);
+                                }
+                                self.columns[col_idx].row_count += 1;
+                            }
+                            ColKind::Map { .. } => {
+                                // Null Map: add offset for empty map (same position as current)
+                                if let NestedState::Map { map_offsets, total_entries, .. } = &mut self.columns[col_idx].nested {
+                                    map_offsets.push(*total_entries as i32);
+                                }
+                                self.columns[col_idx].row_count += 1;
+                            }
+                            ColKind::Struct { .. } => {
+                                // Null Struct: add placeholder row with null/empty field values
+                                if let NestedState::Struct { field_data, field_types, field_nullable, row_count, .. } = &mut self.columns[col_idx].nested {
+                                    // Add placeholder data for each field
+                                    for (field_idx, field_type) in field_types.iter().enumerate() {
+                                        if field_nullable[field_idx] {
+                                            // Nullable field: push null marker
+                                            field_data[field_idx].push(0);
+                                        } else {
+                                            // Non-nullable field: push placeholder value
+                                            Self::append_placeholder_to_vec(field_type, &mut field_data[field_idx]);
+                                        }
+                                    }
+                                    *row_count += 1;
+                                }
+                                self.columns[col_idx].row_count += 1;
+                            }
+                            ColKind::Union { .. } => {
+                                // Null Union: add placeholder
+                                if let NestedState::Union { type_ids, offsets, child_counts, .. } = &mut self.columns[col_idx].nested {
+                                    // Use type_id 0 for null union value
+                                    type_ids.push(0);
+                                    if let Some(offs) = offsets {
+                                        offs.push(child_counts.first().copied().unwrap_or(0) as i32);
+                                    }
+                                }
+                                self.columns[col_idx].row_count += 1;
+                            }
+                        }
+                        continue;
+                    }
+
                     match &col_kinds[col_idx] {
                         ColKind::Null => {}
                         ColKind::Boolean => {
@@ -1266,6 +1608,17 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                             }
                             fixed_offsets[col_idx] += size;
                         }
+                        ColKind::Decimal128 => {
+                            // Read length-prefixed bytes and convert to i128
+                            let bytes = cursor.get_bytes()?;
+                            let value = decode_decimal_bytes_to_i128(bytes);
+                            let offset = fixed_offsets[col_idx];
+                            unsafe {
+                                let dest = data_ptrs[col_idx].unwrap().add(offset);
+                                std::ptr::copy_nonoverlapping(value.to_le_bytes().as_ptr(), dest, 16);
+                            }
+                            fixed_offsets[col_idx] += 16;
+                        }
                         ColKind::String | ColKind::Binary => {
                             let bytes = cursor.get_bytes()?;
                             let len = bytes.len();
@@ -1295,6 +1648,13 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                             self.columns[col_idx].row_count += 1;
                         }
                         ColKind::List { child_type, fixed_elem_size, use_preallocated } => {
+                            // Extract child_nullable flag from nested state
+                            let is_child_nullable = if let NestedState::List { child_nullable, .. } = &self.columns[col_idx].nested {
+                                *child_nullable
+                            } else {
+                                false
+                            };
+
                             // Inlined list decode - read blocks until 0 count
                             let mut elements_in_row = 0usize;
                             loop {
@@ -1307,10 +1667,11 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                                     block_count as usize
                                 };
 
-                                if *use_preallocated {
+                                if *use_preallocated && !is_child_nullable {
                                     // Pre-allocated path: decode directly into provider's child region
+                                    // Note: pre-allocated path doesn't support nullable children yet
                                     let provider_col_idx = column_indices[col_idx];
-                                    if let NestedState::List { child_data_position, .. } = &mut self.columns[col_idx].nested {
+                                    if let NestedState::List { child_data_position, child_offsets_position, .. } = &mut self.columns[col_idx].nested {
                                         if let Some(elem_size) = fixed_elem_size {
                                             // Fixed-size elements directly into pre-allocated buffer
                                             let needed = count * elem_size;
@@ -1319,20 +1680,39 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                                             Self::decode_fixed_elements_batch(child_type, &mut cursor, slice, count, *elem_size)?;
                                             *child_data_position += needed;
                                         } else {
-                                            // Variable-length elements - decode each
+                                            // Variable-length elements (Utf8/Binary) - need to write both data and offsets
                                             for _ in 0..count {
-                                                let pos = *child_data_position;
                                                 let bytes = cursor.get_bytes()?;
-                                                let slice = self.provider.get_child_data_slice(provider_col_idx, 0, pos, bytes.len())?;
-                                                slice.copy_from_slice(bytes);
+
+                                                // Write string data
+                                                let data_pos = *child_data_position;
+                                                let data_slice = self.provider.get_child_data_slice(provider_col_idx, 0, data_pos, bytes.len())?;
+                                                data_slice.copy_from_slice(bytes);
                                                 *child_data_position += bytes.len();
+
+                                                // Write offset (current position after writing this element)
+                                                let off_pos = *child_offsets_position;
+                                                let off_slice = self.provider.get_child_offsets_slice(provider_col_idx, 0, off_pos, 4)?;
+                                                off_slice.copy_from_slice(&(*child_data_position as i32).to_le_bytes());
+                                                *child_offsets_position += 4;
                                             }
                                         }
                                     }
                                 } else {
-                                    // Vec fallback path
+                                    // Vec fallback path (also used for nullable children)
                                     if let NestedState::List { child_data, .. } = &mut self.columns[col_idx].nested {
-                                        if let Some(elem_size) = fixed_elem_size {
+                                        if is_child_nullable {
+                                            // Nullable elements: read union index, write marker
+                                            for _ in 0..count {
+                                                let union_index = cursor.get_long()?;
+                                                if union_index == 0 {
+                                                    child_data.push(0); // null marker
+                                                } else {
+                                                    child_data.push(1); // valid marker
+                                                    Self::decode_value_to_vec(child_type, &mut cursor, child_data)?;
+                                                }
+                                            }
+                                        } else if let Some(elem_size) = fixed_elem_size {
                                             // Fast path: fixed-size elements
                                             let old_len = child_data.len();
                                             child_data.reserve(count * elem_size);
@@ -1357,6 +1737,13 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                         }
                         ColKind::Map { value_type, .. } => {
                             // Map decode using Vec mode (more efficient for nested types)
+                            // Get value_nullable flag from nested state
+                            let is_value_nullable = if let NestedState::Map { value_nullable, .. } = &self.columns[col_idx].nested {
+                                *value_nullable
+                            } else {
+                                false
+                            };
+
                             let mut entries_in_row = 0usize;
                             loop {
                                 let block_count = cursor.get_long()?;
@@ -1374,7 +1761,18 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                                         let key_bytes = cursor.get_bytes()?;
                                         key_data.extend_from_slice(key_bytes);
                                         key_offsets.push(key_data.len() as i32);
-                                        Self::decode_value_to_vec(value_type, &mut cursor, value_data)?;
+                                        // Handle nullable values
+                                        if is_value_nullable {
+                                            let union_index = cursor.get_long()?;
+                                            if union_index == 0 {
+                                                value_data.push(0); // null marker
+                                            } else {
+                                                value_data.push(1); // valid marker
+                                                Self::decode_value_to_vec(value_type, &mut cursor, value_data)?;
+                                            }
+                                        } else {
+                                            Self::decode_value_to_vec(value_type, &mut cursor, value_data)?;
+                                        }
                                         // Track offsets for variable-length value types
                                         if needs_value_offsets {
                                             value_offsets.push(value_data.len() as i32);
@@ -1407,18 +1805,56 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                                 if let Some(offs) = offsets {
                                     offs.push(child_counts[type_index] as i32);
                                 }
-                                Self::decode_value_to_vec(child_type, &mut cursor, &mut child_data[type_index])?;
+                                // Inline fast paths for common fixed-size types
+                                let child_vec = &mut child_data[type_index];
+                                match child_type {
+                                    DataType::Null => {
+                                        // Null takes no space
+                                    }
+                                    DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
+                                        let value = cursor.get_int()?;
+                                        child_vec.extend_from_slice(&value.to_le_bytes());
+                                    }
+                                    DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => {
+                                        let value = cursor.get_long()?;
+                                        child_vec.extend_from_slice(&value.to_le_bytes());
+                                    }
+                                    DataType::Float32 => {
+                                        let value = cursor.get_float()?;
+                                        child_vec.extend_from_slice(&value.to_le_bytes());
+                                    }
+                                    DataType::Float64 => {
+                                        let value = cursor.get_double()?;
+                                        child_vec.extend_from_slice(&value.to_le_bytes());
+                                    }
+                                    DataType::Boolean => {
+                                        let value = cursor.get_bool()?;
+                                        child_vec.push(if value { 1 } else { 0 });
+                                    }
+                                    other => {
+                                        // Fall back to generic decode for complex types
+                                        Self::decode_value_to_vec(other, &mut cursor, child_vec)?;
+                                    }
+                                }
                                 child_counts[type_index] += 1;
                             }
                             self.columns[col_idx].row_count += 1;
                         }
                         ColKind::Struct { field_types, use_preallocated } => {
+                            // Extract field_nullable flags from nested state
+                            let field_nullable_flags: Vec<bool> = if let NestedState::Struct { field_nullable, .. } = &self.columns[col_idx].nested {
+                                field_nullable.clone()
+                            } else {
+                                vec![false; field_types.len()]
+                            };
+                            let has_any_nullable = field_nullable_flags.iter().any(|&n| n);
+
                             // Inlined struct decode
-                            if *use_preallocated {
+                            if *use_preallocated && !has_any_nullable {
                                 // Pre-allocated path: decode each field into provider's child region
-                                // child_index maps to field_idx for Struct fields
+                                // Note: pre-allocated path doesn't support nullable fields yet
                                 let provider_col_idx = column_indices[col_idx];
-                                if let NestedState::Struct { row_count, field_positions, .. } = &mut self.columns[col_idx].nested {
+                                if let NestedState::Struct { row_count, field_positions, field_offsets_positions, .. } = &mut self.columns[col_idx].nested {
                                     for (field_idx, field_type) in field_types.iter().enumerate() {
                                         let pos = field_positions[field_idx];
                                         let value_size = Self::get_fixed_element_size(field_type);
@@ -1428,20 +1864,37 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                                             Self::decode_fixed_elements_batch(field_type, &mut cursor, slice, 1, fixed_size)?;
                                             field_positions[field_idx] += fixed_size;
                                         } else {
-                                            // Variable-length field
+                                            // Variable-length field (Utf8/Binary)
                                             let bytes = cursor.get_bytes()?;
+                                            // Write data
                                             let slice = self.provider.get_child_data_slice(provider_col_idx, field_idx, pos, bytes.len())?;
                                             slice.copy_from_slice(bytes);
                                             field_positions[field_idx] += bytes.len();
+                                            // Write offset (current cumulative position after this element)
+                                            let off_pos = field_offsets_positions[field_idx];
+                                            let off_slice = self.provider.get_child_offsets_slice(provider_col_idx, field_idx, off_pos, 4)?;
+                                            off_slice.copy_from_slice(&(field_positions[field_idx] as i32).to_le_bytes());
+                                            field_offsets_positions[field_idx] += 4;
                                         }
                                     }
                                     *row_count += 1;
                                 }
                             } else {
-                                // Vec fallback path
+                                // Vec fallback path (also used when any field is nullable)
                                 if let NestedState::Struct { field_data, row_count, .. } = &mut self.columns[col_idx].nested {
                                     for (field_idx, field_type) in field_types.iter().enumerate() {
-                                        Self::decode_value_to_vec(field_type, &mut cursor, &mut field_data[field_idx])?;
+                                        if field_nullable_flags[field_idx] {
+                                            // Nullable field: read union index, write marker
+                                            let union_index = cursor.get_long()?;
+                                            if union_index == 0 {
+                                                field_data[field_idx].push(0); // null marker
+                                            } else {
+                                                field_data[field_idx].push(1); // valid marker
+                                                Self::decode_value_to_vec(field_type, &mut cursor, &mut field_data[field_idx])?;
+                                            }
+                                        } else {
+                                            Self::decode_value_to_vec(field_type, &mut cursor, &mut field_data[field_idx])?;
+                                        }
                                     }
                                     *row_count += 1;
                                 }
@@ -1452,8 +1905,16 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 }
             }
 
-            // Update positions and row counts after processing batch
+            // Update positions, row counts, and null bitmaps after processing batch
             for col_idx in 0..num_columns {
+                // Update null bitmaps for nullable columns
+                if nullable_flags[col_idx] && !validity_bits[col_idx].is_empty() {
+                    let base_row = base_row_counts[col_idx];
+                    for (row, is_valid) in validity_bits[col_idx].iter().enumerate() {
+                        self.columns[col_idx].set_validity(base_row + row, *is_valid);
+                    }
+                }
+
                 match &col_kinds[col_idx] {
                     ColKind::Int32 | ColKind::Float32 => {
                         self.columns[col_idx].data_position += 4 * batch_rows;
@@ -1468,6 +1929,10 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                     }
                     ColKind::FixedBytes { size } => {
                         self.columns[col_idx].data_position += size * batch_rows;
+                        self.columns[col_idx].row_count += batch_rows;
+                    }
+                    ColKind::Decimal128 => {
+                        self.columns[col_idx].data_position += 16 * batch_rows;
                         self.columns[col_idx].row_count += batch_rows;
                     }
                     ColKind::String | ColKind::Binary => {
@@ -1511,7 +1976,11 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         let mut cursor = AvroCursor::new(buf);
 
         // Pre-compute column info once (not per-batch)
-        let column_indices: Vec<usize> = self.columns.iter().map(|c| c.column_index).collect();
+        // (column_index, is_nullable, base_row_count)
+        let col_info: Vec<(usize, bool, usize)> = self.columns
+            .iter()
+            .map(|c| (c.column_index, c.is_nullable, c.row_count))
+            .collect();
 
         // Process in mini-batches
         let mut rows_processed = 0;
@@ -1523,13 +1992,15 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             let mut offsets_ptrs: Vec<*mut u8> = Vec::with_capacity(num_columns);
             let mut data_capacities: Vec<usize> = Vec::with_capacity(num_columns);
             let mut base_data_positions: Vec<usize> = Vec::with_capacity(num_columns);
+            let mut base_row_counts: Vec<usize> = Vec::with_capacity(num_columns);
 
-            for (col_idx, &column_index) in column_indices.iter().enumerate() {
+            for (col_idx, &(column_index, _is_nullable, row_count)) in col_info.iter().enumerate() {
                 let col = &self.columns[col_idx];
                 let (data_ptr, data_cap) = self.provider.get_data_ptr(column_index, col.data_position)?;
                 data_ptrs.push(data_ptr);
                 data_capacities.push(data_cap);
                 base_data_positions.push(col.data_position);
+                base_row_counts.push(row_count + rows_processed);
 
                 let offsets_pos = (col.row_count + 1) * 4;
                 let offsets_slice = self.provider.get_offsets_slice(column_index, offsets_pos, batch_rows * 4)?;
@@ -1539,9 +2010,43 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             // Track positions within batch
             let mut var_data_offsets: Vec<usize> = vec![0; num_columns];
 
-            // Tight decode loop - no type dispatch needed
+            // Track validity for nullable columns
+            let mut validity_bits: Vec<Vec<bool>> = col_info.iter()
+                .map(|(_, is_nullable, _)| {
+                    if *is_nullable {
+                        Vec::with_capacity(batch_rows)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+
+            // Tight decode loop
             for row in 0..batch_rows {
                 for col_idx in 0..num_columns {
+                    let is_nullable = col_info[col_idx].1;
+
+                    // For nullable columns, read the Avro union index first
+                    let is_null = if is_nullable {
+                        let union_index = cursor.get_long()?;
+                        let is_valid = union_index != 0;
+                        validity_bits[col_idx].push(is_valid);
+                        !is_valid
+                    } else {
+                        false
+                    };
+
+                    if is_null {
+                        // Write same offset as previous (empty string for null)
+                        let current_offset = var_data_offsets[col_idx];
+                        let new_end = (base_data_positions[col_idx] + current_offset) as i32;
+                        unsafe {
+                            let dest = offsets_ptrs[col_idx].add(row * 4);
+                            std::ptr::copy_nonoverlapping(new_end.to_le_bytes().as_ptr(), dest, 4);
+                        }
+                        continue;
+                    }
+
                     let bytes = cursor.get_bytes()?;
                     let len = bytes.len();
                     let current_offset = var_data_offsets[col_idx];
@@ -1571,8 +2076,18 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 }
             }
 
-            // Update positions after batch
+            // Update positions, counts, and null bitmaps after batch
             for col_idx in 0..num_columns {
+                let is_nullable = col_info[col_idx].1;
+
+                // Update null bitmaps for nullable columns
+                if is_nullable {
+                    let base_row = base_row_counts[col_idx];
+                    for (row, is_valid) in validity_bits[col_idx].iter().enumerate() {
+                        self.columns[col_idx].set_validity(base_row + row, *is_valid);
+                    }
+                }
+
                 self.columns[col_idx].data_position += var_data_offsets[col_idx];
                 self.columns[col_idx].row_count += batch_rows;
             }
@@ -1603,11 +2118,12 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             let batch_rows = (total_rows - rows_processed).min(Self::BATCH_SIZE);
 
             // Build column metadata for this batch
-            let col_meta: Vec<(usize, DataType, Option<usize>, usize, usize)> = self.columns
+            // (column_index, data_type, type_size, start_position, base_row_count, is_nullable)
+            let col_meta: Vec<(usize, DataType, Option<usize>, usize, usize, bool)> = self.columns
                 .iter()
                 .map(|col| {
                     let type_size = Self::get_type_size(&col.data_type);
-                    (col.column_index, col.data_type.clone(), type_size, col.data_position, col.row_count)
+                    (col.column_index, col.data_type.clone(), type_size, col.data_position, col.row_count, col.is_nullable)
                 })
                 .collect();
 
@@ -1617,7 +2133,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             let mut offsets_ptrs: Vec<Option<*mut u8>> = Vec::with_capacity(num_columns);
             let mut data_capacities: Vec<usize> = Vec::with_capacity(num_columns);
 
-            for (column_index, data_type, type_size, start_pos, row_count) in &col_meta {
+            for (column_index, data_type, type_size, start_pos, row_count, _is_nullable) in &col_meta {
                 match data_type {
                     DataType::Null => {
                         data_ptrs.push(None);
@@ -1666,10 +2182,76 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             let mut var_data_offsets: Vec<usize> = vec![0; num_columns];
             let mut var_offset_idx: Vec<usize> = vec![0; num_columns];
 
+            // Track validity for nullable columns during decode
+            let mut validity_bits: Vec<Vec<bool>> = col_meta.iter()
+                .map(|(_, _, _, _, _, is_nullable)| {
+                    if *is_nullable {
+                        Vec::with_capacity(batch_rows)
+                    } else {
+                        Vec::new()
+                    }
+                })
+                .collect();
+
             // Decode batch
             for row in 0..batch_rows {
                 for col_idx in 0..num_columns {
-                    let (_, ref data_type, _type_size, _, base_row_count) = col_meta[col_idx];
+                    let (_, ref data_type, _type_size, _, base_row_count, is_nullable) = col_meta[col_idx];
+
+                    // For nullable columns, read the Avro union index first
+                    let is_null = if is_nullable {
+                        let union_index = cursor.get_long()?;
+                        let is_valid = union_index != 0;
+                        validity_bits[col_idx].push(is_valid);
+                        !is_valid
+                    } else {
+                        false
+                    };
+
+                    // Skip value reading for null values, write zero placeholder
+                    if is_null {
+                        match data_type {
+                            DataType::Null | DataType::Boolean => {}
+                            DataType::Int32 | DataType::Date32 | DataType::Time32(_) | DataType::Float32 => {
+                                if let Some(ptr) = data_ptrs[col_idx] {
+                                    unsafe {
+                                        let dest = ptr.add(row * 4);
+                                        std::ptr::write_bytes(dest, 0, 4);
+                                    }
+                                }
+                            }
+                            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) | DataType::Float64 => {
+                                if let Some(ptr) = data_ptrs[col_idx] {
+                                    unsafe {
+                                        let dest = ptr.add(row * 8);
+                                        std::ptr::write_bytes(dest, 0, 8);
+                                    }
+                                }
+                            }
+                            DataType::Utf8 | DataType::Binary => {
+                                // Write same offset as previous (empty string/bytes)
+                                let current_offset = var_data_offsets[col_idx];
+                                let new_end = (col_meta[col_idx].3 + current_offset) as i32;
+                                if let Some(ptr) = offsets_ptrs[col_idx] {
+                                    unsafe {
+                                        let dest = ptr.add(var_offset_idx[col_idx] * 4);
+                                        std::ptr::copy_nonoverlapping(new_end.to_le_bytes().as_ptr(), dest, 4);
+                                    }
+                                }
+                                var_offset_idx[col_idx] += 1;
+                            }
+                            DataType::FixedSizeBinary(size) => {
+                                if let Some(ptr) = data_ptrs[col_idx] {
+                                    unsafe {
+                                        let dest = ptr.add(row * (*size as usize));
+                                        std::ptr::write_bytes(dest, 0, *size as usize);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
 
                     match data_type {
                         DataType::Null => {}
@@ -1774,9 +2356,17 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 }
             }
 
-            // Update column positions and counts after batch
+            // Update column positions, counts, and null bitmaps after batch
             for col_idx in 0..num_columns {
-                let (_, ref data_type, type_size, _, _) = col_meta[col_idx];
+                let (_, ref data_type, type_size, _, base_row_count, is_nullable) = col_meta[col_idx];
+
+                // Update null bitmaps for nullable columns
+                if is_nullable {
+                    for (row, is_valid) in validity_bits[col_idx].iter().enumerate() {
+                        self.columns[col_idx].set_validity(base_row_count + row, *is_valid);
+                    }
+                }
+
                 match data_type {
                     DataType::Null => {
                         self.columns[col_idx].row_count += batch_rows;
@@ -2128,14 +2718,45 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     ) -> Result<(), ArrowError> {
         let col = &mut self.columns[col_idx];
 
-        if let NestedState::Struct { field_data, field_types, row_count, .. } = &mut col.nested {
+        if let NestedState::Struct { field_data, field_types, field_nullable, field_null_bitmaps, row_count, .. } = &mut col.nested {
             let num_fields = field_types.len();
             let field_types_clone: Vec<DataType> = field_types.clone();
+            let field_nullable_clone: Vec<bool> = field_nullable.clone();
+            let current_row = *row_count;
 
             // Avro records encode fields in schema order
             for field_idx in 0..num_fields {
                 let field_type = &field_types_clone[field_idx];
-                Self::decode_value_to_vec(field_type, cursor, &mut field_data[field_idx])?;
+                let is_nullable = field_nullable_clone[field_idx];
+
+                if is_nullable {
+                    // Read union index for nullable fields
+                    let union_index = cursor.get_long()?;
+                    let is_null = union_index == 0;
+
+                    // Track validity in bit-packed null bitmap
+                    let byte_idx = current_row / 8;
+                    let bit_idx = current_row % 8;
+
+                    // Ensure bitmap has enough bytes
+                    while field_null_bitmaps[field_idx].len() <= byte_idx {
+                        field_null_bitmaps[field_idx].push(0);
+                    }
+
+                    if !is_null {
+                        // Set bit to 1 for valid values
+                        field_null_bitmaps[field_idx][byte_idx] |= 1 << bit_idx;
+                        // Decode the actual value
+                        Self::decode_value_to_vec(field_type, cursor, &mut field_data[field_idx])?;
+                    } else {
+                        // For null values, we still need to add placeholder data for fixed-size types
+                        // or just leave the bitmap bit as 0 (null)
+                        Self::append_null_placeholder(field_type, &mut field_data[field_idx]);
+                    }
+                } else {
+                    // Non-nullable field - decode directly
+                    Self::decode_value_to_vec(field_type, cursor, &mut field_data[field_idx])?;
+                }
             }
 
             *row_count += 1;
@@ -2149,6 +2770,31 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         }
     }
 
+    /// Append null placeholder data for a given type
+    /// This ensures fixed-size arrays have consistent element counts
+    fn append_null_placeholder(data_type: &DataType, output: &mut Vec<u8>) {
+        match data_type {
+            DataType::Boolean => output.push(0),
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) | DataType::Float32 => {
+                output.extend_from_slice(&[0u8; 4]);
+            }
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) | DataType::Float64 => {
+                output.extend_from_slice(&[0u8; 8]);
+            }
+            DataType::Utf8 | DataType::Binary => {
+                // For variable-length types, store 0 length
+                output.extend_from_slice(&0i32.to_le_bytes());
+            }
+            DataType::FixedSizeBinary(size) => {
+                output.extend(std::iter::repeat(0u8).take(*size as usize));
+            }
+            _ => {
+                // For complex types (List, Map, Struct), null is tracked in bitmap only
+                // No placeholder data needed as they use their own internal structures
+            }
+        }
+    }
+
     /// Decode a Map value from Avro block encoding (Vec mode only)
     /// Avro maps: { key: string, value: T } with block encoding
     fn decode_map_value(
@@ -2156,11 +2802,11 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         col_idx: usize,
         cursor: &mut AvroCursor<'_>,
     ) -> Result<(), ArrowError> {
-        // Extract value type from nested state
-        let value_type_clone = {
+        // Extract value type and nullability from nested state
+        let (value_type_clone, is_value_nullable) = {
             let col = &self.columns[col_idx];
-            if let NestedState::Map { value_type, .. } = &col.nested {
-                value_type.clone()
+            if let NestedState::Map { value_type, value_nullable, .. } = &col.nested {
+                (value_type.clone(), *value_nullable)
             } else {
                 return Err(ArrowError::InvalidArgumentError(
                     "Map column missing nested state".to_string()
@@ -2183,7 +2829,18 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                             let key_bytes = cursor.get_bytes()?;
                             key_data.extend_from_slice(key_bytes);
                             key_offsets.push(key_data.len() as i32);
-                            Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
+                            // Handle nullable values
+                            if is_value_nullable {
+                                let union_index = cursor.get_long()?;
+                                if union_index == 0 {
+                                    value_data.push(0); // null marker
+                                } else {
+                                    value_data.push(1); // valid marker
+                                    Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
+                                }
+                            } else {
+                                Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
+                            }
                         }
                     }
                     entries_in_row += count;
@@ -2195,7 +2852,18 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                             let key_bytes = cursor.get_bytes()?;
                             key_data.extend_from_slice(key_bytes);
                             key_offsets.push(key_data.len() as i32);
-                            Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
+                            // Handle nullable values
+                            if is_value_nullable {
+                                let union_index = cursor.get_long()?;
+                                if union_index == 0 {
+                                    value_data.push(0); // null marker
+                                } else {
+                                    value_data.push(1); // valid marker
+                                    Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
+                                }
+                            } else {
+                                Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
+                            }
                         }
                     }
                     entries_in_row += count;
@@ -2214,6 +2882,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     }
 
     /// Decode a Union value (type tag + value)
+    /// Optimized with inline fast paths for common fixed-size types
     fn decode_union_value(
         &mut self,
         col_idx: usize,
@@ -2245,9 +2914,37 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 offs.push(child_counts[type_index] as i32);
             }
 
-            // Decode the value into the appropriate child data vector
-            let child_type = field.data_type().clone();
-            Self::decode_value_to_vec(&child_type, cursor, &mut child_data[type_index])?;
+            // Inline fast paths for common fixed-size types to avoid function call overhead
+            let child_vec = &mut child_data[type_index];
+            match field.data_type() {
+                DataType::Null => {
+                    // Null takes no space - nothing to decode
+                }
+                DataType::Int32 | DataType::Date32 | DataType::Time32(_) => {
+                    let value = cursor.get_int()?;
+                    child_vec.extend_from_slice(&value.to_le_bytes());
+                }
+                DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) => {
+                    let value = cursor.get_long()?;
+                    child_vec.extend_from_slice(&value.to_le_bytes());
+                }
+                DataType::Float32 => {
+                    let value = cursor.get_float()?;
+                    child_vec.extend_from_slice(&value.to_le_bytes());
+                }
+                DataType::Float64 => {
+                    let value = cursor.get_double()?;
+                    child_vec.extend_from_slice(&value.to_le_bytes());
+                }
+                DataType::Boolean => {
+                    let value = cursor.get_bool()?;
+                    child_vec.push(if value { 1 } else { 0 });
+                }
+                other => {
+                    // Fall back to generic decode for complex/variable-length types
+                    Self::decode_value_to_vec(other, cursor, child_vec)?;
+                }
+            }
             child_counts[type_index] += 1;
 
             col.row_count += 1;
@@ -2266,10 +2963,10 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         cursor: &mut AvroCursor<'_>,
     ) -> Result<(), ArrowError> {
         // Extract info we need from nested state first
-        let (child_type_clone, use_prealloc, mut current_position) = {
+        let (child_type_clone, is_child_nullable, use_prealloc, mut current_position) = {
             let col = &self.columns[col_idx];
-            if let NestedState::List { child_type, use_preallocated, child_data_position, .. } = &col.nested {
-                (child_type.clone(), *use_preallocated, *child_data_position)
+            if let NestedState::List { child_type, child_nullable, use_preallocated, child_data_position, .. } = &col.nested {
+                (child_type.clone(), *child_nullable, *use_preallocated, *child_data_position)
             } else {
                 return Err(ArrowError::InvalidArgumentError(
                     "List column missing nested state".to_string()
@@ -2297,7 +2994,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                         )?;
                     } else {
                         current_position = self.decode_list_block_vec(
-                            col_idx, cursor, count, &child_type_clone
+                            col_idx, cursor, count, &child_type_clone, is_child_nullable
                         )?;
                     }
                     elements_in_row += count;
@@ -2311,7 +3008,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                         )?;
                     } else {
                         current_position = self.decode_list_block_vec(
-                            col_idx, cursor, count, &child_type_clone
+                            col_idx, cursor, count, &child_type_clone, is_child_nullable
                         )?;
                     }
                     elements_in_row += count;
@@ -2406,11 +3103,23 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         cursor: &mut AvroCursor<'_>,
         count: usize,
         child_type: &DataType,
+        child_nullable: bool,
     ) -> Result<usize, ArrowError> {
         for _ in 0..count {
             let col = &mut self.columns[col_idx];
             if let NestedState::List { child_data, .. } = &mut col.nested {
-                Self::decode_value_to_vec(child_type, cursor, child_data)?;
+                if child_nullable {
+                    // Read union index for nullable items
+                    let union_index = cursor.get_long()?;
+                    if union_index == 0 {
+                        child_data.push(0); // null marker
+                    } else {
+                        child_data.push(1); // valid marker
+                        Self::decode_value_to_vec(child_type, cursor, child_data)?;
+                    }
+                } else {
+                    Self::decode_value_to_vec(child_type, cursor, child_data)?;
+                }
             }
         }
         // Return final position
@@ -2631,23 +3340,35 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             }
             // Recursive: List<T>
             DataType::List(child_field) => {
-                Self::decode_list_to_vec(child_field.data_type(), cursor, output)?;
+                Self::decode_list_to_vec(child_field.data_type(), child_field.is_nullable(), cursor, output)?;
             }
             // Recursive: Map<K, V>
             DataType::Map(entries_field, _) => {
-                let value_type = if let DataType::Struct(fields) = entries_field.data_type() {
+                let (value_type, value_nullable) = if let DataType::Struct(fields) = entries_field.data_type() {
                     fields.iter().nth(1)
-                        .map(|f| f.data_type().clone())
-                        .unwrap_or(DataType::Utf8)
+                        .map(|f| (f.data_type().clone(), f.is_nullable()))
+                        .unwrap_or((DataType::Utf8, false))
                 } else {
-                    DataType::Utf8
+                    (DataType::Utf8, false)
                 };
-                Self::decode_map_to_vec(&value_type, cursor, output)?;
+                Self::decode_map_to_vec(&value_type, value_nullable, cursor, output)?;
             }
             // Recursive: Struct
             DataType::Struct(fields) => {
                 for field in fields.iter() {
-                    Self::decode_value_to_vec(field.data_type(), cursor, output)?;
+                    if field.is_nullable() {
+                        // Read union index for nullable fields
+                        let union_index = cursor.get_long()?;
+                        if union_index == 0 {
+                            // Field is null - store marker and skip value
+                            output.push(0); // null marker
+                        } else {
+                            output.push(1); // valid marker
+                            Self::decode_value_to_vec(field.data_type(), cursor, output)?;
+                        }
+                    } else {
+                        Self::decode_value_to_vec(field.data_type(), cursor, output)?;
+                    }
                 }
             }
             // Recursive: Union
@@ -2678,6 +3399,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     /// Decode an Avro array (List) into Vec<u8> with format: [total_count:i32][elem0][elem1]...
     fn decode_list_to_vec(
         child_type: &DataType,
+        child_nullable: bool,
         cursor: &mut AvroCursor<'_>,
         output: &mut Vec<u8>,
     ) -> Result<(), ArrowError> {
@@ -2696,14 +3418,34 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                     let count = (-block_count) as usize;
                     let _size = cursor.get_long()?; // skip size hint
                     for _ in 0..count {
-                        Self::decode_value_to_vec(child_type, cursor, output)?;
+                        if child_nullable {
+                            let union_index = cursor.get_long()?;
+                            if union_index == 0 {
+                                output.push(0); // null marker
+                            } else {
+                                output.push(1); // valid marker
+                                Self::decode_value_to_vec(child_type, cursor, output)?;
+                            }
+                        } else {
+                            Self::decode_value_to_vec(child_type, cursor, output)?;
+                        }
                     }
                     total_count += count as i32;
                 }
                 Ordering::Greater => {
                     let count = block_count as usize;
                     for _ in 0..count {
-                        Self::decode_value_to_vec(child_type, cursor, output)?;
+                        if child_nullable {
+                            let union_index = cursor.get_long()?;
+                            if union_index == 0 {
+                                output.push(0); // null marker
+                            } else {
+                                output.push(1); // valid marker
+                                Self::decode_value_to_vec(child_type, cursor, output)?;
+                            }
+                        } else {
+                            Self::decode_value_to_vec(child_type, cursor, output)?;
+                        }
                     }
                     total_count += count as i32;
                 }
@@ -2718,6 +3460,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     /// Decode an Avro map into Vec<u8> with format: [total_count:i32][key_len:i32][key][value]...
     fn decode_map_to_vec(
         value_type: &DataType,
+        value_nullable: bool,
         cursor: &mut AvroCursor<'_>,
         output: &mut Vec<u8>,
     ) -> Result<(), ArrowError> {
@@ -2740,8 +3483,18 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                         let key = cursor.get_bytes()?;
                         output.extend_from_slice(&(key.len() as i32).to_le_bytes());
                         output.extend_from_slice(key);
-                        // Value is recursive
-                        Self::decode_value_to_vec(value_type, cursor, output)?;
+                        // Value may be nullable
+                        if value_nullable {
+                            let union_index = cursor.get_long()?;
+                            if union_index == 0 {
+                                output.push(0); // null marker
+                            } else {
+                                output.push(1); // valid marker
+                                Self::decode_value_to_vec(value_type, cursor, output)?;
+                            }
+                        } else {
+                            Self::decode_value_to_vec(value_type, cursor, output)?;
+                        }
                     }
                     total_count += count as i32;
                 }
@@ -2751,7 +3504,17 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                         let key = cursor.get_bytes()?;
                         output.extend_from_slice(&(key.len() as i32).to_le_bytes());
                         output.extend_from_slice(key);
-                        Self::decode_value_to_vec(value_type, cursor, output)?;
+                        if value_nullable {
+                            let union_index = cursor.get_long()?;
+                            if union_index == 0 {
+                                output.push(0); // null marker
+                            } else {
+                                output.push(1); // valid marker
+                                Self::decode_value_to_vec(value_type, cursor, output)?;
+                            }
+                        } else {
+                            Self::decode_value_to_vec(value_type, cursor, output)?;
+                        }
                     }
                     total_count += count as i32;
                 }
@@ -2858,6 +3621,8 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         let row_count = col.row_count;
         let data_position = col.data_position;
         let data_type = col.data_type.clone();
+        // Get null buffer for nullable columns
+        let null_buffer = col.get_null_buffer();
 
         match &data_type {
             DataType::Null => {
@@ -2866,37 +3631,37 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             DataType::Int32 => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * 4)?;
                 let values = ScalarBuffer::<i32>::from(buffer);
-                Ok(Arc::new(Int32Array::new(values, None)))
+                Ok(Arc::new(Int32Array::new(values, null_buffer)))
             }
             DataType::Int64 => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * 8)?;
                 let values = ScalarBuffer::<i64>::from(buffer);
-                Ok(Arc::new(Int64Array::new(values, None)))
+                Ok(Arc::new(Int64Array::new(values, null_buffer)))
             }
             DataType::Float32 => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * 4)?;
                 let values = ScalarBuffer::<f32>::from(buffer);
-                Ok(Arc::new(Float32Array::new(values, None)))
+                Ok(Arc::new(Float32Array::new(values, null_buffer)))
             }
             DataType::Float64 => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * 8)?;
                 let values = ScalarBuffer::<f64>::from(buffer);
-                Ok(Arc::new(Float64Array::new(values, None)))
+                Ok(Arc::new(Float64Array::new(values, null_buffer)))
             }
             DataType::Date32 => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * 4)?;
                 let values = ScalarBuffer::<i32>::from(buffer);
-                Ok(Arc::new(Date32Array::new(values, None)))
+                Ok(Arc::new(Date32Array::new(values, null_buffer)))
             }
             DataType::Time32(unit) => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * 4)?;
                 let values = ScalarBuffer::<i32>::from(buffer);
                 let array: ArrayRef = match unit {
                     arrow_schema::TimeUnit::Second => {
-                        Arc::new(Time32SecondArray::new(values, None))
+                        Arc::new(Time32SecondArray::new(values, null_buffer))
                     }
                     arrow_schema::TimeUnit::Millisecond => {
-                        Arc::new(Time32MillisecondArray::new(values, None))
+                        Arc::new(Time32MillisecondArray::new(values, null_buffer))
                     }
                     _ => {
                         return Err(ArrowError::InvalidArgumentError(format!(
@@ -2912,10 +3677,10 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 let values = ScalarBuffer::<i64>::from(buffer);
                 let array: ArrayRef = match unit {
                     arrow_schema::TimeUnit::Microsecond => {
-                        Arc::new(Time64MicrosecondArray::new(values, None))
+                        Arc::new(Time64MicrosecondArray::new(values, null_buffer))
                     }
                     arrow_schema::TimeUnit::Nanosecond => {
-                        Arc::new(Time64NanosecondArray::new(values, None))
+                        Arc::new(Time64NanosecondArray::new(values, null_buffer))
                     }
                     _ => {
                         return Err(ArrowError::InvalidArgumentError(format!(
@@ -2931,16 +3696,16 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 let values = ScalarBuffer::<i64>::from(buffer);
                 let array: ArrayRef = match unit {
                     arrow_schema::TimeUnit::Second => {
-                        Arc::new(TimestampSecondArray::new(values, None).with_timezone_opt(tz.clone()))
+                        Arc::new(TimestampSecondArray::new(values, null_buffer.clone()).with_timezone_opt(tz.clone()))
                     }
                     arrow_schema::TimeUnit::Millisecond => {
-                        Arc::new(TimestampMillisecondArray::new(values, None).with_timezone_opt(tz.clone()))
+                        Arc::new(TimestampMillisecondArray::new(values, null_buffer.clone()).with_timezone_opt(tz.clone()))
                     }
                     arrow_schema::TimeUnit::Microsecond => {
-                        Arc::new(TimestampMicrosecondArray::new(values, None).with_timezone_opt(tz.clone()))
+                        Arc::new(TimestampMicrosecondArray::new(values, null_buffer.clone()).with_timezone_opt(tz.clone()))
                     }
                     arrow_schema::TimeUnit::Nanosecond => {
-                        Arc::new(TimestampNanosecondArray::new(values, None).with_timezone_opt(tz.clone()))
+                        Arc::new(TimestampNanosecondArray::new(values, null_buffer.clone()).with_timezone_opt(tz.clone()))
                     }
                 };
                 Ok(array)
@@ -2949,38 +3714,38 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 let bitmap_bytes = (row_count + 7) / 8;
                 let buffer = self.provider.finalize_data_buffer(column_index, bitmap_bytes)?;
                 let bool_buffer = arrow_buffer::BooleanBuffer::new(buffer, 0, row_count);
-                Ok(Arc::new(BooleanArray::new(bool_buffer, None)))
+                Ok(Arc::new(BooleanArray::new(bool_buffer, null_buffer)))
             }
             DataType::Utf8 => {
                 let data_buffer = self.provider.finalize_data_buffer(column_index, data_position)?;
                 let offsets_buffer = self.provider.finalize_offsets_buffer(column_index, (row_count + 1) * 4)?;
                 let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
-                Ok(Arc::new(StringArray::try_new(offsets, data_buffer, None)?))
+                Ok(Arc::new(StringArray::try_new(offsets, data_buffer, null_buffer)?))
             }
             DataType::Binary => {
                 let data_buffer = self.provider.finalize_data_buffer(column_index, data_position)?;
                 let offsets_buffer = self.provider.finalize_offsets_buffer(column_index, (row_count + 1) * 4)?;
                 let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
-                Ok(Arc::new(BinaryArray::try_new(offsets, data_buffer, None)?))
+                Ok(Arc::new(BinaryArray::try_new(offsets, data_buffer, null_buffer)?))
             }
             DataType::FixedSizeBinary(size) => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * (*size as usize))?;
-                Ok(Arc::new(FixedSizeBinaryArray::try_new(*size, buffer, None)?))
+                Ok(Arc::new(FixedSizeBinaryArray::try_new(*size, buffer, null_buffer)?))
             }
             DataType::Decimal128(precision, scale) => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * 16)?;
                 let values = ScalarBuffer::<i128>::from(buffer);
-                Ok(Arc::new(Decimal128Array::new(values, None).with_precision_and_scale(*precision, *scale)?))
+                Ok(Arc::new(Decimal128Array::new(values, null_buffer).with_precision_and_scale(*precision, *scale)?))
             }
             DataType::Decimal256(precision, scale) => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * 32)?;
                 let values = ScalarBuffer::<i256>::from(buffer);
-                Ok(Arc::new(Decimal256Array::new(values, None).with_precision_and_scale(*precision, *scale)?))
+                Ok(Arc::new(Decimal256Array::new(values, null_buffer).with_precision_and_scale(*precision, *scale)?))
             }
             DataType::Interval(IntervalUnit::MonthDayNano) => {
                 let buffer = self.provider.finalize_data_buffer(column_index, row_count * 16)?;
                 let values = ScalarBuffer::<IntervalMonthDayNano>::from(buffer);
-                Ok(Arc::new(IntervalMonthDayNanoArray::new(values, None)))
+                Ok(Arc::new(IntervalMonthDayNanoArray::new(values, null_buffer)))
             }
             DataType::Map(entries_field, keys_sorted) => {
                 self.flush_map_column(col_idx, entries_field.clone(), *keys_sorted)
@@ -3077,20 +3842,17 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         keys_sorted: bool,
     ) -> Result<ArrayRef, ArrowError> {
         let col = &mut self.columns[col_idx];
+        let col_null_buffer = col.get_null_buffer();
 
         if let NestedState::Map {
-            map_offsets, key_offsets, key_data, value_offsets, value_data, value_type, ..
+            map_offsets, key_offsets, key_data, value_offsets, value_data, value_type, value_nullable, ..
         } = &mut col.nested {
 
             // Vec mode: use the Vec buffers directly
             let key_data_buffer = Buffer::from_slice_ref(key_data);
             let key_offsets_buffer = Buffer::from_slice_ref(key_offsets);
-            let value_data_buffer = Buffer::from_slice_ref(value_data);
-            let value_offsets_buffer = if matches!(value_type, DataType::Utf8 | DataType::Binary) {
-                Some(Buffer::from_slice_ref(value_offsets))
-            } else {
-                None
-            };
+            let is_value_nullable = *value_nullable;
+            let value_type_clone = value_type.clone();
 
             // Create key array (StringArray)
             let key_array = StringArray::try_new(
@@ -3099,32 +3861,43 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 None,
             )?;
 
-            // Create value array based on type
-            let value_array: ArrayRef = if let Some(value_off_buf) = value_offsets_buffer {
-                // Variable-length values: build directly from offsets
-                match value_type {
-                    DataType::Utf8 => Arc::new(StringArray::try_new(
-                        OffsetBuffer::new(ScalarBuffer::<i32>::from(value_off_buf)),
-                        value_data_buffer,
-                        None,
-                    )?),
-                    DataType::Binary => Arc::new(BinaryArray::try_new(
-                        OffsetBuffer::new(ScalarBuffer::<i32>::from(value_off_buf)),
-                        value_data_buffer,
-                        None,
-                    )?),
-                    _ => Self::build_array_from_vec(value_type.clone(), value_data_buffer.as_slice())?,
-                }
+            // Create value array based on type and nullability
+            let value_array: ArrayRef = if is_value_nullable {
+                // Nullable values: handle marker bytes
+                Self::build_array_from_vec_with_markers(value_type_clone.clone(), value_data)?
             } else {
-                // Fixed-size values: use build_array_from_vec
-                Self::build_array_from_vec(value_type.clone(), value_data_buffer.as_slice())?
+                let value_data_buffer = Buffer::from_slice_ref(value_data);
+                let value_offsets_buffer = if matches!(value_type_clone, DataType::Utf8 | DataType::Binary) {
+                    Some(Buffer::from_slice_ref(value_offsets))
+                } else {
+                    None
+                };
+                if let Some(value_off_buf) = value_offsets_buffer {
+                    // Variable-length values: build directly from offsets
+                    match &value_type_clone {
+                        DataType::Utf8 => Arc::new(StringArray::try_new(
+                            OffsetBuffer::new(ScalarBuffer::<i32>::from(value_off_buf)),
+                            value_data_buffer,
+                            None,
+                        )?),
+                        DataType::Binary => Arc::new(BinaryArray::try_new(
+                            OffsetBuffer::new(ScalarBuffer::<i32>::from(value_off_buf)),
+                            value_data_buffer,
+                            None,
+                        )?),
+                        _ => Self::build_array_from_vec(value_type_clone.clone(), value_data_buffer.as_slice())?,
+                    }
+                } else {
+                    // Fixed-size values: use build_array_from_vec
+                    Self::build_array_from_vec(value_type_clone.clone(), value_data_buffer.as_slice())?
+                }
             };
 
             // Create entries struct array
             let entries_struct = StructArray::new(
                 Fields::from(vec![
                     Arc::new(Field::new("key", DataType::Utf8, false)),
-                    Arc::new(Field::new("value", value_type.clone(), true)),
+                    Arc::new(Field::new("value", value_type_clone, is_value_nullable)),
                 ]),
                 vec![Arc::new(key_array), value_array],
                 None,
@@ -3134,12 +3907,12 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             let map_offsets_buffer = Buffer::from_slice_ref(map_offsets);
             let map_offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(map_offsets_buffer));
 
-            // Create MapArray
+            // Create MapArray with column-level null buffer if applicable
             let map_array = MapArray::new(
                 entries_field,
                 map_offsets,
                 entries_struct,
-                None,
+                col_null_buffer,
                 keys_sorted,
             );
 
@@ -3209,10 +3982,11 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         child_field: FieldRef,
     ) -> Result<ArrayRef, ArrowError> {
         // Extract info we need first to avoid borrow conflicts
-        let (offsets_clone, child_type_clone, child_data_position, use_prealloc) = {
+        let (offsets_clone, child_type_clone, child_data_position, child_offsets_position, use_prealloc, is_child_nullable, col_null_buffer) = {
             let col = &self.columns[col_idx];
-            if let NestedState::List { offsets, child_type, child_data_position, use_preallocated, .. } = &col.nested {
-                (offsets.clone(), child_type.clone(), *child_data_position, *use_preallocated)
+            let null_buf = col.get_null_buffer();
+            if let NestedState::List { offsets, child_type, child_data_position, child_offsets_position, use_preallocated, child_nullable, .. } = &col.nested {
+                (offsets.clone(), child_type.clone(), *child_data_position, *child_offsets_position, *use_preallocated, *child_nullable, null_buf)
             } else {
                 return Err(ArrowError::InvalidArgumentError(
                     "List column missing nested state".to_string()
@@ -3223,13 +3997,29 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         // Build child array based on mode
         let child_array = if use_prealloc {
             // Pre-allocated mode: get buffer from provider
-            let child_data_buffer = self.provider.finalize_child_data_buffer(col_idx, 0, child_data_position)?;
-            Self::build_array_from_buffer(child_type_clone, child_data_buffer)?
+            match &child_type_clone {
+                DataType::Utf8 | DataType::Binary => {
+                    // Variable-length types need both data and offsets buffers
+                    let child_data_buffer = self.provider.finalize_child_data_buffer(col_idx, 0, child_data_position)?;
+                    let child_offsets_buffer = self.provider.finalize_child_offsets_buffer(col_idx, 0, child_offsets_position)?;
+                    Self::build_string_array_from_buffers(child_type_clone, child_data_buffer, child_offsets_buffer)?
+                }
+                _ => {
+                    // Fixed-size types only need data buffer
+                    let child_data_buffer = self.provider.finalize_child_data_buffer(col_idx, 0, child_data_position)?;
+                    Self::build_array_from_buffer(child_type_clone, child_data_buffer)?
+                }
+            }
         } else {
-            // Vec mode: use existing approach
+            // Vec mode: handle nullable markers if present
             let col = &mut self.columns[col_idx];
             if let NestedState::List { child_data, child_type, .. } = &mut col.nested {
-                Self::build_array_from_vec(child_type.clone(), child_data)?
+                if is_child_nullable {
+                    // Parse markers and extract values
+                    Self::build_array_from_vec_with_markers(child_type.clone(), child_data)?
+                } else {
+                    Self::build_array_from_vec(child_type.clone(), child_data)?
+                }
             } else {
                 return Err(ArrowError::InvalidArgumentError(
                     "List column missing nested state".to_string()
@@ -3241,10 +4031,81 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         let offsets_buffer = Buffer::from_slice_ref(&offsets_clone);
         let list_offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
 
-        // Create ListArray
-        let list_array = ListArray::new(child_field, list_offsets, child_array, None);
+        // Create ListArray with column-level null buffer if applicable
+        let list_array = ListArray::new(child_field, list_offsets, child_array, col_null_buffer);
 
         Ok(Arc::new(list_array))
+    }
+
+    /// Build a string/binary array from pre-allocated data and offsets buffers
+    fn build_string_array_from_buffers(
+        data_type: DataType,
+        data_buffer: Buffer,
+        offsets_buffer: Buffer,
+    ) -> Result<ArrayRef, ArrowError> {
+        // Handle empty case
+        if offsets_buffer.is_empty() {
+            return match data_type {
+                DataType::Utf8 => Ok(Arc::new(StringArray::new_null(0))),
+                DataType::Binary => Ok(Arc::new(BinaryArray::new_null(0))),
+                _ => Err(ArrowError::InvalidArgumentError(format!(
+                    "build_string_array_from_buffers called with non-string type: {:?}",
+                    data_type
+                ))),
+            };
+        }
+
+        // Create offsets from buffer
+        let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
+
+        match data_type {
+            DataType::Utf8 => {
+                let array = StringArray::new(offsets, data_buffer, None);
+                Ok(Arc::new(array))
+            }
+            DataType::Binary => {
+                let array = BinaryArray::new(offsets, data_buffer, None);
+                Ok(Arc::new(array))
+            }
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "build_string_array_from_buffers called with non-string type: {:?}",
+                data_type
+            ))),
+        }
+    }
+
+    /// Build an array from Vec data that contains inline nullable markers
+    /// Format: [marker0:1][value0]...[marker1:1][value1]...
+    /// marker = 0 for null, 1 for valid
+    fn build_array_from_vec_with_markers(data_type: DataType, data: &[u8]) -> Result<ArrayRef, ArrowError> {
+        // First pass: extract validity and values
+        let mut values: Vec<u8> = Vec::new();
+        let mut validity: Vec<bool> = Vec::new();
+        let mut pos = 0;
+
+        while pos < data.len() {
+            let marker = data[pos];
+            pos += 1;
+
+            validity.push(marker != 0);
+
+            if marker == 0 {
+                // Null - add placeholder
+                Self::append_placeholder_to_vec(&data_type, &mut values);
+            } else {
+                // Valid - copy the value
+                let value_start = pos;
+                pos = Self::skip_serialized_value(&data_type, data, pos)?;
+                values.extend_from_slice(&data[value_start..pos]);
+            }
+        }
+
+        // Build array with nulls
+        if validity.is_empty() {
+            Self::build_array_from_vec(data_type, &values)
+        } else {
+            Self::build_array_from_vec_with_nulls(data_type, &values, &validity)
+        }
     }
 
     /// Build an Arrow array from a pre-allocated buffer
@@ -3309,16 +4170,58 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         _fields: Fields,
     ) -> Result<ArrayRef, ArrowError> {
         let col = &mut self.columns[col_idx];
+        let col_null_buffer = col.get_null_buffer();
+        let provider_col_idx = col.column_index;
 
         if let NestedState::Struct {
-            field_data, field_types, field_names, field_nullable, ..
+            field_data, field_types, field_names, field_nullable, row_count,
+            field_positions, field_offsets_positions, use_preallocated, ..
         } = &mut col.nested {
-            // Build child arrays from field data
             let mut child_arrays: Vec<ArrayRef> = Vec::with_capacity(field_types.len());
+            let total_rows = *row_count;
 
-            for (i, field_type) in field_types.iter().enumerate() {
-                let child_array = Self::build_array_from_vec(field_type.clone(), &field_data[i])?;
-                child_arrays.push(child_array);
+            if *use_preallocated {
+                // Pre-allocated path: finalize buffers from provider
+                for (field_idx, field_type) in field_types.iter().enumerate() {
+                    let data_pos = field_positions[field_idx];
+                    let child_array = match field_type {
+                        DataType::Utf8 | DataType::Binary => {
+                            // Variable-length: need both data and offsets buffers
+                            let data_buffer = self.provider.finalize_child_data_buffer(provider_col_idx, field_idx, data_pos)?;
+                            let offsets_pos = field_offsets_positions[field_idx];
+                            let offsets_buffer = self.provider.finalize_child_offsets_buffer(provider_col_idx, field_idx, offsets_pos)?;
+                            Self::build_string_array_from_buffers(field_type.clone(), data_buffer, offsets_buffer)?
+                        }
+                        _ => {
+                            // Fixed-size: only data buffer
+                            let data_buffer = self.provider.finalize_child_data_buffer(provider_col_idx, field_idx, data_pos)?;
+                            Self::build_array_from_buffer(field_type.clone(), data_buffer)?
+                        }
+                    };
+                    child_arrays.push(child_array);
+                }
+            } else {
+                // Vec fallback path: build from field_data
+                for (i, field_type) in field_types.iter().enumerate() {
+                    let is_nullable = field_nullable[i];
+                    let child_array = if is_nullable && !field_data[i].is_empty() {
+                        // Parse markers from field_data to build array with nulls
+                        Self::build_array_from_vec_with_markers(field_type.clone(), &field_data[i])?
+                    } else {
+                        Self::build_array_from_vec(field_type.clone(), &field_data[i])?
+                    };
+                    child_arrays.push(child_array);
+                }
+            }
+
+            // Validate all child arrays have same length
+            for (i, child) in child_arrays.iter().enumerate() {
+                if child.len() != total_rows {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "Struct field {} has {} rows, expected {} (use_preallocated={})",
+                        field_names[i], child.len(), total_rows, *use_preallocated
+                    )));
+                }
             }
 
             // Build struct fields
@@ -3330,11 +4233,11 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 })
                 .collect();
 
-            // Create StructArray
+            // Create StructArray with column-level null buffer if applicable
             let struct_array = StructArray::new(
                 Fields::from(struct_fields),
                 child_arrays,
-                None,
+                col_null_buffer,
             );
 
             Ok(Arc::new(struct_array))
@@ -3504,6 +4407,10 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             DataType::List(child_field) => {
                 Self::build_list_from_vec(child_field.clone(), data)
             }
+            // Map: [count:i32][key_len:i32][key][marker?][value]... per map, then next map
+            DataType::Map(entries_field, keys_sorted) => {
+                Self::build_map_from_vec(entries_field.clone(), keys_sorted, data)
+            }
             // Struct: data = [field0][field1]...[field0][field1]... (row-major)
             DataType::Struct(fields) => {
                 Self::build_struct_from_vec(&fields, data)
@@ -3516,9 +4423,11 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     }
 
     /// Build a ListArray from serialized Vec data
-    /// Format: [count0:i32][elem0_0]...[count1:i32][elem1_0]...
+    /// Format: [count0:i32][marker?][elem0_0]...[count1:i32][marker?][elem1_0]...
+    /// If child_field is nullable, each element has a 1-byte marker (0=null, 1=valid)
     fn build_list_from_vec(child_field: FieldRef, data: &[u8]) -> Result<ArrayRef, ArrowError> {
         let child_type = child_field.data_type();
+        let is_nullable = child_field.is_nullable();
 
         if data.is_empty() {
             // Empty list array
@@ -3533,25 +4442,49 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
 
         let mut offsets: Vec<i32> = vec![0];
         let mut all_child_data: Vec<u8> = Vec::new();
+        let mut null_bitmap: Vec<bool> = Vec::new(); // true = valid, false = null
         let mut pos = 0;
 
-        // Parse each list: [count:i32][elem0][elem1]...
+        // Parse each list: [count:i32][marker?][elem0][marker?][elem1]...
         while pos + 4 <= data.len() {
             let count = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
             pos += 4;
 
             // Parse 'count' elements
             for _ in 0..count {
-                let elem_start = pos;
-                pos = Self::skip_serialized_value(child_type, data, pos)?;
-                all_child_data.extend_from_slice(&data[elem_start..pos]);
+                if is_nullable {
+                    if pos >= data.len() {
+                        return Err(ArrowError::ParseError("Truncated nullable marker in list".to_string()));
+                    }
+                    let marker = data[pos];
+                    pos += 1;
+                    if marker == 0 {
+                        // Null element - add placeholder data and mark as null
+                        null_bitmap.push(false);
+                        Self::append_placeholder_to_vec(child_type, &mut all_child_data);
+                    } else {
+                        // Valid element
+                        null_bitmap.push(true);
+                        let elem_start = pos;
+                        pos = Self::skip_serialized_value(child_type, data, pos)?;
+                        all_child_data.extend_from_slice(&data[elem_start..pos]);
+                    }
+                } else {
+                    let elem_start = pos;
+                    pos = Self::skip_serialized_value(child_type, data, pos)?;
+                    all_child_data.extend_from_slice(&data[elem_start..pos]);
+                }
             }
 
             offsets.push(offsets.last().unwrap() + count);
         }
 
-        // Build child array from collected data
-        let child_array = Self::build_array_from_vec(child_type.clone(), &all_child_data)?;
+        // Build child array from collected data, with null buffer if needed
+        let child_array = if is_nullable && !null_bitmap.is_empty() {
+            Self::build_array_from_vec_with_nulls(child_type.clone(), &all_child_data, &null_bitmap)?
+        } else {
+            Self::build_array_from_vec(child_type.clone(), &all_child_data)?
+        };
 
         Ok(Arc::new(ListArray::new(
             child_field,
@@ -3561,8 +4494,243 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         )))
     }
 
+    /// Build a MapArray from serialized Vec data
+    /// Format: [count:i32][key_len:i32][key_bytes][marker?][value]... per map
+    /// Keys are always strings; values may be nullable (marker = 0 for null, 1 for valid)
+    fn build_map_from_vec(entries_field: FieldRef, keys_sorted: bool, data: &[u8]) -> Result<ArrayRef, ArrowError> {
+        // Extract value type and nullability from entries struct
+        let (value_type, value_nullable) = if let DataType::Struct(fields) = entries_field.data_type() {
+            fields.iter()
+                .find(|f| f.name() == "value")
+                .map(|f| (f.data_type().clone(), f.is_nullable()))
+                .unwrap_or((DataType::Utf8, false))
+        } else {
+            return Err(ArrowError::InvalidArgumentError(
+                "Map entries field must be a Struct".to_string()
+            ));
+        };
+
+        // Extract struct fields from entries_field
+        let struct_fields = match entries_field.data_type() {
+            DataType::Struct(fields) => fields.clone(),
+            _ => return Err(ArrowError::InvalidArgumentError(
+                "Map entries field must be a Struct".to_string()
+            )),
+        };
+
+        if data.is_empty() {
+            // Empty map array
+            let empty_keys = Arc::new(StringArray::new_null(0)) as ArrayRef;
+            let empty_values = Self::build_empty_array(&value_type)?;
+            let entries_struct = StructArray::new(
+                struct_fields.clone(),
+                vec![empty_keys, empty_values],
+                None,
+            );
+            return Ok(Arc::new(MapArray::new(
+                entries_field,
+                OffsetBuffer::new(ScalarBuffer::from(vec![0i32])),
+                entries_struct,
+                None,
+                keys_sorted,
+            )));
+        }
+
+        let mut offsets: Vec<i32> = vec![0];
+        let mut all_keys: Vec<String> = Vec::new();
+        let mut all_values_data: Vec<u8> = Vec::new();
+        let mut value_nulls: Vec<bool> = Vec::new(); // true = valid
+        let mut pos = 0;
+
+        // Parse each map: [count:i32][key_len:i32][key][marker?][value]...
+        while pos + 4 <= data.len() {
+            let count = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+
+            // Parse 'count' key-value pairs
+            for _ in 0..count {
+                // Read key (always string): [key_len:i32][key_bytes]
+                if pos + 4 > data.len() {
+                    return Err(ArrowError::ParseError("Truncated key length in map".to_string()));
+                }
+                let key_len = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+
+                if pos + key_len > data.len() {
+                    return Err(ArrowError::ParseError("Truncated key data in map".to_string()));
+                }
+                let key = std::str::from_utf8(&data[pos..pos + key_len])
+                    .map_err(|e| ArrowError::ParseError(format!("Invalid UTF-8 in map key: {}", e)))?;
+                all_keys.push(key.to_string());
+                pos += key_len;
+
+                // Read value (may have nullable marker)
+                if value_nullable {
+                    if pos >= data.len() {
+                        return Err(ArrowError::ParseError("Truncated value marker in map".to_string()));
+                    }
+                    let marker = data[pos];
+                    pos += 1;
+                    if marker == 0 {
+                        // Null value
+                        value_nulls.push(false);
+                        Self::append_placeholder_to_vec(&value_type, &mut all_values_data);
+                    } else {
+                        // Valid value
+                        value_nulls.push(true);
+                        let value_start = pos;
+                        pos = Self::skip_serialized_value(&value_type, data, pos)?;
+                        all_values_data.extend_from_slice(&data[value_start..pos]);
+                    }
+                } else {
+                    let value_start = pos;
+                    pos = Self::skip_serialized_value(&value_type, data, pos)?;
+                    all_values_data.extend_from_slice(&data[value_start..pos]);
+                }
+            }
+
+            offsets.push(offsets.last().unwrap() + count);
+        }
+
+        // Build key array (always StringArray)
+        let key_array: ArrayRef = Arc::new(StringArray::from(all_keys));
+
+        // Build value array with null handling if needed
+        let value_array = if value_nullable && !value_nulls.is_empty() {
+            Self::build_array_from_vec_with_nulls(value_type, &all_values_data, &value_nulls)?
+        } else {
+            Self::build_array_from_vec(value_type, &all_values_data)?
+        };
+
+        // Create entries struct array
+        let entries_struct = StructArray::new(
+            struct_fields,
+            vec![key_array, value_array],
+            None,
+        );
+
+        Ok(Arc::new(MapArray::new(
+            entries_field,
+            OffsetBuffer::new(ScalarBuffer::from(offsets)),
+            entries_struct,
+            None,
+            keys_sorted,
+        )))
+    }
+
+    /// Append placeholder data for a null value (used when building arrays with null bitmap)
+    fn append_placeholder_to_vec(data_type: &DataType, output: &mut Vec<u8>) {
+        match data_type {
+            DataType::Null => {}
+            DataType::Boolean => output.push(0),
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) | DataType::Float32 => {
+                output.extend_from_slice(&[0u8; 4]);
+            }
+            DataType::Int64 | DataType::Time64(_) | DataType::Timestamp(_, _) | DataType::Float64 => {
+                output.extend_from_slice(&[0u8; 8]);
+            }
+            DataType::Utf8 | DataType::Binary => {
+                // Store 0 length
+                output.extend_from_slice(&0i32.to_le_bytes());
+            }
+            DataType::Decimal128(_, _) | DataType::Interval(IntervalUnit::MonthDayNano) => {
+                output.extend_from_slice(&[0u8; 16]);
+            }
+            DataType::FixedSizeBinary(size) => {
+                output.extend(std::iter::repeat(0u8).take(*size as usize));
+            }
+            // Complex types: add minimal placeholder
+            DataType::List(_) => {
+                // Empty list: count = 0
+                output.extend_from_slice(&0i32.to_le_bytes());
+            }
+            DataType::Struct(fields) => {
+                // Add placeholders for each field
+                for field in fields.iter() {
+                    if field.is_nullable() {
+                        output.push(0); // null marker
+                    } else {
+                        Self::append_placeholder_to_vec(field.data_type(), output);
+                    }
+                }
+            }
+            DataType::Map(_, _) => {
+                // Empty map: count = 0
+                output.extend_from_slice(&0i32.to_le_bytes());
+            }
+            _ => {
+                // For unknown types, add nothing (will likely cause issues but better than wrong data)
+            }
+        }
+    }
+
+    /// Build an array from Vec data with explicit null bitmap
+    fn build_array_from_vec_with_nulls(data_type: DataType, data: &[u8], nulls: &[bool]) -> Result<ArrayRef, ArrowError> {
+        // Build the null buffer
+        let null_buffer = NullBuffer::from_iter(nulls.iter().copied());
+
+        match data_type {
+            DataType::Int32 => {
+                let buffer = Buffer::from_slice_ref(data);
+                let values = ScalarBuffer::<i32>::from(buffer);
+                Ok(Arc::new(Int32Array::new(values, Some(null_buffer))))
+            }
+            DataType::Int64 => {
+                let buffer = Buffer::from_slice_ref(data);
+                let values = ScalarBuffer::<i64>::from(buffer);
+                Ok(Arc::new(Int64Array::new(values, Some(null_buffer))))
+            }
+            DataType::Float32 => {
+                let buffer = Buffer::from_slice_ref(data);
+                let values = ScalarBuffer::<f32>::from(buffer);
+                Ok(Arc::new(Float32Array::new(values, Some(null_buffer))))
+            }
+            DataType::Float64 => {
+                let buffer = Buffer::from_slice_ref(data);
+                let values = ScalarBuffer::<f64>::from(buffer);
+                Ok(Arc::new(Float64Array::new(values, Some(null_buffer))))
+            }
+            DataType::Boolean => {
+                let mut builder = BooleanArray::builder(data.len());
+                for (i, &byte) in data.iter().enumerate() {
+                    if i < nulls.len() && !nulls[i] {
+                        builder.append_null();
+                    } else {
+                        builder.append_value(byte != 0);
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::Utf8 => {
+                // Parse length-prefixed strings
+                let mut strings: Vec<Option<&str>> = Vec::new();
+                let mut pos = 0;
+                let mut idx = 0;
+                while pos + 4 <= data.len() && idx < nulls.len() {
+                    let len = i32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+                    pos += 4;
+                    if !nulls[idx] {
+                        strings.push(None);
+                    } else if pos + len <= data.len() {
+                        let s = std::str::from_utf8(&data[pos..pos+len])
+                            .map_err(|e| ArrowError::ParseError(format!("Invalid UTF-8: {}", e)))?;
+                        strings.push(Some(s));
+                    } else {
+                        break;
+                    }
+                    pos += len;
+                    idx += 1;
+                }
+                Ok(Arc::new(StringArray::from(strings)))
+            }
+            // For other types, fall back to non-null version (not ideal but safe)
+            other => Self::build_array_from_vec(other, data),
+        }
+    }
+
     /// Build a StructArray from serialized Vec data
-    /// Format: [field0_row0][field1_row0]...[field0_row1][field1_row1]...
+    /// Format: [marker?][field0_row0][marker?][field1_row0]...[marker?][field0_row1]...
+    /// Each nullable field is prefixed with a 1-byte marker (0=null, 1=valid)
     fn build_struct_from_vec(fields: &Fields, data: &[u8]) -> Result<ArrayRef, ArrowError> {
         if data.is_empty() || fields.is_empty() {
             let empty_children: Vec<ArrayRef> = fields
@@ -3572,17 +4740,37 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             return Ok(Arc::new(StructArray::new(fields.clone(), empty_children, None)));
         }
 
-        // Collect data for each field separately
+        // Collect data for each field separately, with null tracking
         let mut field_data: Vec<Vec<u8>> = vec![Vec::new(); fields.len()];
+        let mut field_nulls: Vec<Vec<bool>> = vec![Vec::new(); fields.len()]; // true = valid
         let mut pos = 0;
         let mut row_count = 0;
 
         // Parse row-by-row
         while pos < data.len() {
             for (i, field) in fields.iter().enumerate() {
-                let field_start = pos;
-                pos = Self::skip_serialized_value(field.data_type(), data, pos)?;
-                field_data[i].extend_from_slice(&data[field_start..pos]);
+                if field.is_nullable() {
+                    if pos >= data.len() {
+                        return Err(ArrowError::ParseError("Truncated nullable marker in struct".to_string()));
+                    }
+                    let marker = data[pos];
+                    pos += 1;
+                    if marker == 0 {
+                        // Null field
+                        field_nulls[i].push(false);
+                        Self::append_placeholder_to_vec(field.data_type(), &mut field_data[i]);
+                    } else {
+                        // Valid field
+                        field_nulls[i].push(true);
+                        let field_start = pos;
+                        pos = Self::skip_serialized_value(field.data_type(), data, pos)?;
+                        field_data[i].extend_from_slice(&data[field_start..pos]);
+                    }
+                } else {
+                    let field_start = pos;
+                    pos = Self::skip_serialized_value(field.data_type(), data, pos)?;
+                    field_data[i].extend_from_slice(&data[field_start..pos]);
+                }
             }
             row_count += 1;
 
@@ -3594,14 +4782,41 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             }
         }
 
-        // Build each field's array
+        // Build each field's array with appropriate null handling
         let child_arrays: Vec<ArrayRef> = fields
             .iter()
             .enumerate()
-            .map(|(i, field)| Self::build_array_from_vec(field.data_type().clone(), &field_data[i]))
+            .map(|(i, field)| {
+                if field.is_nullable() && !field_nulls[i].is_empty() {
+                    Self::build_array_from_vec_with_nulls(field.data_type().clone(), &field_data[i], &field_nulls[i])
+                } else {
+                    Self::build_array_from_vec(field.data_type().clone(), &field_data[i])
+                }
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Arc::new(StructArray::new(fields.clone(), child_arrays, None)))
+    }
+
+    /// Skip over a serialized value, returning the new position
+    /// This version is nullable-aware and handles the marker byte for nullable fields
+    fn skip_serialized_field(field: &Field, data: &[u8], pos: usize) -> Result<usize, ArrowError> {
+        if field.is_nullable() {
+            // Nullable field has a marker byte first
+            if pos >= data.len() {
+                return Err(ArrowError::ParseError("Truncated nullable marker".to_string()));
+            }
+            let marker = data[pos];
+            if marker == 0 {
+                // Null value - just the marker, no data
+                Ok(pos + 1)
+            } else {
+                // Valid value - marker + data
+                Self::skip_serialized_value(field.data_type(), data, pos + 1)
+            }
+        } else {
+            Self::skip_serialized_value(field.data_type(), data, pos)
+        }
     }
 
     /// Skip over a serialized value, returning the new position
@@ -3630,28 +4845,32 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 let count = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                 let mut new_pos = pos + 4;
                 for _ in 0..count {
-                    new_pos = Self::skip_serialized_value(child_field.data_type(), data, new_pos)?;
+                    // Use field-aware skip to handle nullable child elements
+                    new_pos = Self::skip_serialized_field(child_field, data, new_pos)?;
                 }
                 Ok(new_pos)
             }
             DataType::Struct(fields) => {
                 let mut new_pos = pos;
                 for field in fields.iter() {
-                    new_pos = Self::skip_serialized_value(field.data_type(), data, new_pos)?;
+                    // Use field-aware skip to handle nullable struct fields
+                    new_pos = Self::skip_serialized_field(field, data, new_pos)?;
                 }
                 Ok(new_pos)
             }
             DataType::Map(entries_field, _) => {
-                // Map: [count:i32][key_len:i32][key][value]...
+                // Map: [count:i32][key_len:i32][key][marker?][value]...
                 if pos + 4 > data.len() {
                     return Err(ArrowError::ParseError("Truncated map count".to_string()));
                 }
                 let count = i32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
                 let mut new_pos = pos + 4;
-                let value_type = if let DataType::Struct(fields) = entries_field.data_type() {
-                    fields.iter().nth(1).map(|f| f.data_type()).unwrap_or(&DataType::Utf8)
+                let (value_type, value_nullable) = if let DataType::Struct(fields) = entries_field.data_type() {
+                    fields.iter().nth(1)
+                        .map(|f| (f.data_type().clone(), f.is_nullable()))
+                        .unwrap_or((DataType::Utf8, false))
                 } else {
-                    &DataType::Utf8
+                    (DataType::Utf8, false)
                 };
                 for _ in 0..count {
                     // Skip key (string)
@@ -3660,8 +4879,19 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                     }
                     let key_len = i32::from_le_bytes(data[new_pos..new_pos + 4].try_into().unwrap()) as usize;
                     new_pos += 4 + key_len;
-                    // Skip value
-                    new_pos = Self::skip_serialized_value(value_type, data, new_pos)?;
+                    // Skip value with nullable awareness
+                    if value_nullable {
+                        if new_pos >= data.len() {
+                            return Err(ArrowError::ParseError("Truncated map value marker".to_string()));
+                        }
+                        let marker = data[new_pos];
+                        new_pos += 1;
+                        if marker != 0 {
+                            new_pos = Self::skip_serialized_value(&value_type, data, new_pos)?;
+                        }
+                    } else {
+                        new_pos = Self::skip_serialized_value(&value_type, data, new_pos)?;
+                    }
                 }
                 Ok(new_pos)
             }
@@ -3840,6 +5070,7 @@ mod tests {
             data_position: 0,
             row_count: 0,
             is_nullable: false,
+            null_bitmap: Vec::new(),
             nested: NestedState::Map {
                 map_offsets: vec![0, 2],
                 key_offsets: vec![0, 3, 7],
@@ -3847,6 +5078,7 @@ mod tests {
                 value_offsets: vec![0],  // Not used for Int32 values
                 value_data: vec![1, 2, 3, 4, 5, 6, 7, 8],
                 value_type: DataType::Int32,
+                value_nullable: false,
                 total_entries: 2,
             },
         };
@@ -3880,11 +5112,14 @@ mod tests {
             data_position: 10,
             row_count: 2,
             is_nullable: false,
+            null_bitmap: Vec::new(),
             nested: NestedState::List {
                 offsets: vec![0, 3, 5],
                 child_data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
                 child_data_position: 10,
+                child_offsets_position: 0,
                 child_type: DataType::Int32,
+                child_nullable: false,
                 total_elements: 5,
                 use_preallocated: false,
             },
@@ -3994,11 +5229,14 @@ mod tests {
             data_position: 0,
             row_count: 0,
             is_nullable: false,
+            null_bitmap: Vec::new(),
             nested: NestedState::List {
                 offsets: vec![0],
                 child_data: Vec::new(),
                 child_data_position: 0,
+                child_offsets_position: 0,
                 child_type: DataType::Int32,
+                child_nullable: false,
                 total_elements: 0,
                 use_preallocated: false,
             },
@@ -4035,11 +5273,14 @@ mod tests {
             data_position: 0,
             row_count: 2,
             is_nullable: false,
+            null_bitmap: Vec::new(),
             nested: NestedState::List {
                 offsets: vec![0, 2, 5],
                 child_data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], // 5 i32s
                 child_data_position: 20,
+                child_offsets_position: 0,
                 child_type: DataType::Int32,
+                child_nullable: false,
                 total_elements: 5,
                 use_preallocated: false,
             },
@@ -4965,6 +6206,7 @@ mod tests {
         let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
 
         // Encode test data - Avro map format: block_count, (key, value)..., 0 (end)
+        // Value is nullable, so we need union index (1=non-null, zigzag: 2) before each value
         let mut avro_data = Vec::new();
         for i in 0..rows {
             // id
@@ -4972,8 +6214,10 @@ mod tests {
             // map with 2 entries: {"a": i*10, "b": i*10+1}
             avro_data.extend(encode_varint_i64(2)); // block count
             avro_data.extend(encode_bytes(b"a"));
+            avro_data.extend(encode_varint_i64(1)); // union index: non-null (zigzag: 2)
             avro_data.extend(encode_varint_i32((i * 10) as i32));
             avro_data.extend(encode_bytes(b"b"));
+            avro_data.extend(encode_varint_i64(1)); // union index: non-null (zigzag: 2)
             avro_data.extend(encode_varint_i32((i * 10 + 1) as i32));
             avro_data.extend(encode_varint_i64(0)); // end of map
         }
@@ -5073,6 +6317,7 @@ mod tests {
         let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
 
         // Encode test data - Avro map format: block_count, (key, value)..., 0 (end)
+        // Value is nullable, so we need union index (1=non-null, zigzag: 2) before each value
         let mut avro_data = Vec::new();
         for i in 0..rows {
             // id
@@ -5080,8 +6325,10 @@ mod tests {
             // map with 2 entries: {"a": i*10, "b": i*10+1}
             avro_data.extend(encode_varint_i64(2)); // block count
             avro_data.extend(encode_bytes(b"a"));
+            avro_data.extend(encode_varint_i64(1)); // union index: non-null (zigzag: 2)
             avro_data.extend(encode_varint_i32((i * 10) as i32));
             avro_data.extend(encode_bytes(b"b"));
+            avro_data.extend(encode_varint_i64(1)); // union index: non-null (zigzag: 2)
             avro_data.extend(encode_varint_i32((i * 10 + 1) as i32));
             avro_data.extend(encode_varint_i64(0)); // end of map
         }
@@ -5671,19 +6918,23 @@ mod tests {
 
         // Row 0: {"a": {x:1, y:2}, "b": {x:3, y:4}}
         // Row 1: {"c": {x:5, y:6}}
+        // Value (Struct) is nullable, so need union index (1=non-null) before each struct
         let mut avro_data = Vec::new();
         // Row 0: 2 entries
         avro_data.extend(encode_varint_i64(2));
         avro_data.extend(encode_bytes(b"a"));
+        avro_data.extend(encode_varint_i64(1)); // union index: non-null (zigzag: 2)
         avro_data.extend(encode_varint_i32(1)); // x
         avro_data.extend(encode_varint_i32(2)); // y
         avro_data.extend(encode_bytes(b"b"));
+        avro_data.extend(encode_varint_i64(1)); // union index: non-null (zigzag: 2)
         avro_data.extend(encode_varint_i32(3)); // x
         avro_data.extend(encode_varint_i32(4)); // y
         avro_data.extend(encode_varint_i64(0)); // end map
         // Row 1: 1 entry
         avro_data.extend(encode_varint_i64(1));
         avro_data.extend(encode_bytes(b"c"));
+        avro_data.extend(encode_varint_i64(1)); // union index: non-null (zigzag: 2)
         avro_data.extend(encode_varint_i32(5)); // x
         avro_data.extend(encode_varint_i32(6)); // y
         avro_data.extend(encode_varint_i64(0)); // end map
@@ -5782,5 +7033,424 @@ mod tests {
         let tags_arr = alice_tags.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(tags_arr.value(0), "a");
         assert_eq!(tags_arr.value(1), "b");
+    }
+
+    #[test]
+    fn test_list_utf8_preallocated() {
+        use arrow_array::ListArray;
+        use crate::buffer_provider::align_to;
+
+        // Test List<String> with pre-allocated buffers (not Vec mode)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))), false),
+        ]));
+
+        let rows = 5;
+        let max_tags = 3; // max tags per row
+        let max_tag_len = 20;
+        let total_items = rows * max_tags;
+
+        // Calculate aligned layout for List<Utf8>
+        let mut offset = 0;
+
+        // id: Int64 (8-byte aligned)
+        offset = align_to(offset, 8);
+        let id_offset = offset;
+        let id_cap = rows * 8;
+        offset += id_cap;
+
+        // tags: List<Utf8>
+        // List offsets: (rows + 1) * 4
+        offset = align_to(offset, 4);
+        let list_off_offset = offset;
+        let list_off_cap = (rows + 1) * 4;
+        offset += list_off_cap;
+
+        // Child string data
+        let child_data_offset = offset;
+        let child_data_cap = total_items * max_tag_len;
+        offset += child_data_cap;
+
+        // Child string offsets: (total_items + 1) * 4
+        offset = align_to(offset, 4);
+        let child_off_offset = offset;
+        let child_off_cap = (total_items + 1) * 4;
+        offset += child_off_cap;
+
+        let total_size = align_to(offset, 8);
+
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(id_offset, id_cap),
+                ColumnRegion {
+                    data_offset: list_off_offset,
+                    data_capacity: 0, // List itself has no data
+                    offsets_offset: Some(list_off_offset),
+                    offsets_capacity: Some(list_off_cap),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![
+                        ColumnRegion {
+                            data_offset: child_data_offset,
+                            data_capacity: child_data_cap,
+                            offsets_offset: Some(child_off_offset),
+                            offsets_capacity: Some(child_off_cap),
+                            null_bitmap_offset: None,
+                            null_bitmap_capacity: None,
+                            child_regions: vec![],
+                        },
+                    ],
+                },
+            ],
+            total_size,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            // id
+            avro_data.extend(encode_varint_i64(i as i64 * 100));
+            // tags array
+            let num_tags = (i % 3) + 1; // 1-3 tags
+            avro_data.extend(encode_varint_i64(num_tags as i64)); // block count
+            for j in 0..num_tags {
+                avro_data.extend(encode_bytes(format!("tag_{}_{}", i, j).as_bytes()));
+            }
+            avro_data.extend(encode_varint_i64(0)); // end of array
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        // Verify id column
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(id_col.value(0), 0);
+        assert_eq!(id_col.value(1), 100);
+        assert_eq!(id_col.value(2), 200);
+
+        // Verify list column
+        let list_col = batch.column(1).as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(list_col.len(), rows);
+
+        // Check row 0: 1 tag
+        let row0 = list_col.value(0);
+        let row0_strings = row0.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(row0_strings.len(), 1);
+        assert_eq!(row0_strings.value(0), "tag_0_0");
+
+        // Check row 1: 2 tags
+        let row1 = list_col.value(1);
+        let row1_strings = row1.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(row1_strings.len(), 2);
+        assert_eq!(row1_strings.value(0), "tag_1_0");
+        assert_eq!(row1_strings.value(1), "tag_1_1");
+
+        // Check row 2: 3 tags
+        let row2 = list_col.value(2);
+        let row2_strings = row2.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(row2_strings.len(), 3);
+        assert_eq!(row2_strings.value(0), "tag_2_0");
+        assert_eq!(row2_strings.value(1), "tag_2_1");
+        assert_eq!(row2_strings.value(2), "tag_2_2");
+    }
+
+    #[test]
+    fn test_list_utf8_parity_pooled_vs_vec() {
+        use arrow_array::ListArray;
+        use crate::buffer_provider::align_to;
+
+        // Test that pre-allocated List<Utf8> produces same results as Vec mode
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("tags", DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))), false),
+        ]));
+
+        let rows = 10;
+
+        // Encode test data (same for both decoders)
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            let num_tags = (i % 4) + 1; // 1-4 tags
+            avro_data.extend(encode_varint_i64(num_tags as i64));
+            for j in 0..num_tags {
+                avro_data.extend(encode_bytes(format!("item_{}_{}", i, j).as_bytes()));
+            }
+            avro_data.extend(encode_varint_i64(0));
+        }
+
+        // === Vec mode decoder ===
+        let vec_layout = BufferLayout {
+            columns: vec![ColumnRegion::fixed(0, 0)], // Vec mode
+            total_size: 1,
+            row_count: rows,
+        };
+        let vec_buffer = vec![0u8; vec_layout.total_size];
+        let vec_provider = PooledBufferProvider::new(vec_buffer, vec_layout);
+        let mut vec_decoder = PooledRecordDecoder::try_new(schema.clone(), vec_provider).unwrap();
+
+        let _ = vec_decoder.decode(&avro_data, rows).unwrap();
+        let vec_batch = vec_decoder.flush().unwrap();
+
+        // === Pre-allocated mode decoder ===
+        let max_items = rows * 4;
+        let max_item_len = 20;
+
+        let list_off_cap = (rows + 1) * 4;
+        let child_data_cap = max_items * max_item_len;
+        let child_off_cap = (max_items + 1) * 4;
+
+        let mut offset = 0;
+        offset = align_to(offset, 4);
+        let list_off_offset = offset;
+        offset += list_off_cap;
+
+        let child_data_offset = offset;
+        offset += child_data_cap;
+
+        offset = align_to(offset, 4);
+        let child_off_offset = offset;
+        offset += child_off_cap;
+
+        let total_size = align_to(offset, 8);
+
+        let pooled_layout = BufferLayout {
+            columns: vec![
+                ColumnRegion {
+                    data_offset: list_off_offset,
+                    data_capacity: 0,
+                    offsets_offset: Some(list_off_offset),
+                    offsets_capacity: Some(list_off_cap),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![
+                        ColumnRegion {
+                            data_offset: child_data_offset,
+                            data_capacity: child_data_cap,
+                            offsets_offset: Some(child_off_offset),
+                            offsets_capacity: Some(child_off_cap),
+                            null_bitmap_offset: None,
+                            null_bitmap_capacity: None,
+                            child_regions: vec![],
+                        },
+                    ],
+                },
+            ],
+            total_size,
+            row_count: rows,
+        };
+
+        let pooled_buffer = vec![0u8; pooled_layout.total_size];
+        let pooled_provider = PooledBufferProvider::new(pooled_buffer, pooled_layout);
+        let mut pooled_decoder = PooledRecordDecoder::try_new(schema, pooled_provider).unwrap();
+
+        let _ = pooled_decoder.decode(&avro_data, rows).unwrap();
+        let pooled_batch = pooled_decoder.flush().unwrap();
+
+        // === Compare results ===
+        assert_eq!(vec_batch.num_rows(), pooled_batch.num_rows());
+
+        let vec_list = vec_batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        let pooled_list = pooled_batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+
+        assert_eq!(vec_list.len(), pooled_list.len());
+
+        for row in 0..rows {
+            let vec_row = vec_list.value(row);
+            let pooled_row = pooled_list.value(row);
+
+            let vec_strings = vec_row.as_any().downcast_ref::<StringArray>().unwrap();
+            let pooled_strings = pooled_row.as_any().downcast_ref::<StringArray>().unwrap();
+
+            assert_eq!(vec_strings.len(), pooled_strings.len(), "Row {} length mismatch", row);
+
+            for i in 0..vec_strings.len() {
+                assert_eq!(
+                    vec_strings.value(i),
+                    pooled_strings.value(i),
+                    "Row {} item {} mismatch",
+                    row,
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_simple_utf8_preallocated() {
+        use crate::buffer_provider::align_to;
+
+        // Test simple String field with pre-allocated buffers
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let rows = 5;
+        let max_name_len = 30;
+
+        // Calculate aligned layout
+        let mut offset = 0;
+
+        // id: Int64 (8-byte aligned)
+        offset = align_to(offset, 8);
+        let id_offset = offset;
+        let id_cap = rows * 8;
+        offset += id_cap;
+
+        // name: Utf8
+        let name_data_offset = offset;
+        let name_data_cap = rows * max_name_len;
+        offset += name_data_cap;
+
+        offset = align_to(offset, 4);
+        let name_off_offset = offset;
+        let name_off_cap = (rows + 1) * 4;
+        offset += name_off_cap;
+
+        let total_size = align_to(offset, 8);
+
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion::fixed(id_offset, id_cap),
+                ColumnRegion {
+                    data_offset: name_data_offset,
+                    data_capacity: name_data_cap,
+                    offsets_offset: Some(name_off_offset),
+                    offsets_capacity: Some(name_off_cap),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![],
+                },
+            ],
+            total_size,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data
+        let mut avro_data = Vec::new();
+        let names = ["alice", "bob", "charlie", "david", "eve"];
+        for (i, name) in names.iter().enumerate() {
+            avro_data.extend(encode_varint_i64(i as i64));
+            avro_data.extend(encode_bytes(name.as_bytes()));
+        }
+
+        // Decode
+        let bytes_consumed = decoder.decode(&avro_data, rows).unwrap();
+        assert!(bytes_consumed > 0);
+
+        // Flush and verify
+        let batch = decoder.flush().unwrap();
+        assert_eq!(batch.num_rows(), rows);
+
+        let id_col = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let name_col = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(id_col.value(i), i as i64);
+            assert_eq!(name_col.value(i), *name);
+        }
+    }
+
+    #[test]
+    fn test_utf8_multiple_columns() {
+        use crate::buffer_provider::align_to;
+
+        // Test multiple Utf8 columns with pre-allocated buffers
+        // Note: strings-only schema always uses pre-allocated path (no Vec fallback)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("desc", DataType::Utf8, false),
+        ]));
+
+        let rows = 10;
+        let max_len = 50;
+
+        // Calculate aligned layout
+        let mut offset = 0;
+
+        let name_data_offset = offset;
+        let name_data_cap = rows * max_len;
+        offset += name_data_cap;
+
+        offset = align_to(offset, 4);
+        let name_off_offset = offset;
+        let name_off_cap = (rows + 1) * 4;
+        offset += name_off_cap;
+
+        let desc_data_offset = offset;
+        let desc_data_cap = rows * max_len;
+        offset += desc_data_cap;
+
+        offset = align_to(offset, 4);
+        let desc_off_offset = offset;
+        let desc_off_cap = (rows + 1) * 4;
+        offset += desc_off_cap;
+
+        let total_size = align_to(offset, 8);
+
+        let layout = BufferLayout {
+            columns: vec![
+                ColumnRegion {
+                    data_offset: name_data_offset,
+                    data_capacity: name_data_cap,
+                    offsets_offset: Some(name_off_offset),
+                    offsets_capacity: Some(name_off_cap),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![],
+                },
+                ColumnRegion {
+                    data_offset: desc_data_offset,
+                    data_capacity: desc_data_cap,
+                    offsets_offset: Some(desc_off_offset),
+                    offsets_capacity: Some(desc_off_cap),
+                    null_bitmap_offset: None,
+                    null_bitmap_capacity: None,
+                    child_regions: vec![],
+                },
+            ],
+            total_size,
+            row_count: rows,
+        };
+
+        let buffer = vec![0u8; layout.total_size];
+        let provider = PooledBufferProvider::new(buffer, layout);
+        let mut decoder = PooledRecordDecoder::try_new(schema, provider).unwrap();
+
+        // Encode test data
+        let mut avro_data = Vec::new();
+        for i in 0..rows {
+            avro_data.extend(encode_bytes(format!("name_{}", i).as_bytes()));
+            avro_data.extend(encode_bytes(format!("description_for_{}", i).as_bytes()));
+        }
+
+        // Decode
+        let _ = decoder.decode(&avro_data, rows).unwrap();
+        let batch = decoder.flush().unwrap();
+
+        // Verify
+        assert_eq!(batch.num_rows(), rows);
+
+        let name_col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let desc_col = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+
+        for i in 0..rows {
+            assert_eq!(name_col.value(i), format!("name_{}", i));
+            assert_eq!(desc_col.value(i), format!("description_for_{}", i));
+        }
     }
 }

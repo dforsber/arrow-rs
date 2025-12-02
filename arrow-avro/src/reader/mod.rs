@@ -511,9 +511,8 @@ pub mod pooled_decoder;
 // The 47 roundtrip tests in pooled_decoder.rs verify correctness for all types
 // including deeply nested List<Struct>, List<List>, Map<String,Struct>, etc.
 //
-// TODO: Update parity tests to use current APIs when time permits
-// #[cfg(test)]
-// mod pooled_decoder_parity_test;
+#[cfg(test)]
+mod pooled_decoder_parity_test;
 
 #[cfg(test)]
 mod pooled_decoder_stress_test;
