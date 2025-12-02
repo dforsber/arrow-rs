@@ -84,6 +84,7 @@ enum NestedSnapshot {
         key_data_len: usize,
         value_offsets_len: usize,
         value_data_len: usize,
+        value_validity_len: usize,
         total_entries: usize,
     },
     Union {
@@ -96,6 +97,7 @@ enum NestedSnapshot {
     List {
         offsets_len: usize,
         child_data_len: usize,
+        child_validity_len: usize,
         child_data_position: usize,
         child_offsets_position: usize,
         total_elements: usize,
@@ -106,6 +108,7 @@ enum NestedSnapshot {
     Struct {
         field_data_lens: Vec<usize>,
         field_null_bitmap_lens: Vec<usize>,
+        field_validity_lens: Vec<usize>,
         row_count: usize,
         field_positions: Vec<usize>,
         field_offsets_positions: Vec<usize>,
@@ -163,8 +166,10 @@ enum NestedState {
         key_data: Vec<u8>,
         /// Value offsets for variable-length values
         value_offsets: Vec<i32>,
-        /// Value data - stored as raw bytes
+        /// Value data - stored as raw bytes (no markers, placeholders for nulls)
         value_data: Vec<u8>,
+        /// Value validity bitmap (true=valid, false=null) - separate from data
+        value_validity: Vec<bool>,
         /// Value type
         value_type: DataType,
         /// Whether value field is nullable
@@ -195,6 +200,8 @@ enum NestedState {
         offsets: Vec<i32>,
         /// Child element data (Vec for transitional, will migrate to pre-allocated)
         child_data: Vec<u8>,
+        /// Child validity tracking (true=valid, false=null) - separate from data
+        child_validity: Vec<bool>,
         /// Current position in child data (for pre-allocated buffer mode)
         child_data_position: usize,
         /// Current position in child offsets (for pre-allocated buffer mode with Utf8/Binary)
@@ -227,6 +234,8 @@ enum NestedState {
         field_nullable: Vec<bool>,
         /// Null bitmaps for nullable fields (bit-packed, 1=valid, 0=null)
         field_null_bitmaps: Vec<Vec<u8>>,
+        /// Separate validity tracking per field (true=valid, false=null) - single pass decoding
+        field_validity: Vec<Vec<bool>>,
         /// Row count for this struct
         row_count: usize,
         /// Current data positions per field (for pre-allocated buffer mode)
@@ -327,6 +336,7 @@ impl ColumnState {
                     key_data: Vec::new(),
                     value_offsets: vec![0],
                     value_data: Vec::new(),
+                    value_validity: Vec::new(), // Separate validity tracking
                     value_type,
                     value_nullable,
                     total_entries: 0,
@@ -375,6 +385,7 @@ impl ColumnState {
                 NestedState::List {
                     offsets: vec![0],
                     child_data: Vec::new(),
+                    child_validity: Vec::new(),
                     child_data_position: 0,
                     // For pre-allocated mode with variable-length children, skip initial offset 0
                     child_offsets_position: if use_preallocated { 4 } else { 0 },
@@ -393,30 +404,27 @@ impl ColumnState {
                 }
             }
             DataType::Struct(fields) => {
+                // NOTE: Struct always uses Vec mode - preallocated mode has excessive
+                // per-row overhead from get_child_data_slice calls and batch-of-1 decoding.
+                // Vec mode with simple appends is significantly faster.
                 let num_fields = fields.len();
                 let field_data: Vec<Vec<u8>> = fields.iter().map(|_| Vec::new()).collect();
                 let field_types: Vec<DataType> = fields.iter().map(|f| f.data_type().clone()).collect();
                 let field_names: Vec<String> = fields.iter().map(|f| f.name().clone()).collect();
                 let field_nullable: Vec<bool> = fields.iter().map(|f| f.is_nullable()).collect();
                 let field_null_bitmaps: Vec<Vec<u8>> = fields.iter().map(|_| Vec::new()).collect();
-                // For variable-length fields in pre-allocated mode, start at offset 4 to skip initial 0
-                let field_offsets_positions: Vec<usize> = fields.iter().map(|f| {
-                    if use_preallocated && matches!(f.data_type(), DataType::Utf8 | DataType::Binary) {
-                        4 // Skip initial offset 0 (pre-zeroed buffer)
-                    } else {
-                        0
-                    }
-                }).collect();
+                let field_validity: Vec<Vec<bool>> = fields.iter().map(|_| Vec::new()).collect();
                 NestedState::Struct {
                     field_data,
                     field_types,
                     field_names,
                     field_nullable,
                     field_null_bitmaps,
+                    field_validity,
                     row_count: 0,
                     field_positions: vec![0; num_fields],
-                    field_offsets_positions,
-                    use_preallocated,
+                    field_offsets_positions: vec![0; num_fields],
+                    use_preallocated: false, // Always Vec mode
                 }
             }
             _ => NestedState::None,
@@ -429,7 +437,7 @@ impl ColumnState {
         // Reset nested state
         match &mut self.nested {
             NestedState::None => {}
-            NestedState::Map { map_offsets, key_offsets, key_data, value_offsets, value_data, total_entries, .. } => {
+            NestedState::Map { map_offsets, key_offsets, key_data, value_offsets, value_data, value_validity, total_entries, .. } => {
                 map_offsets.clear();
                 map_offsets.push(0);
                 key_offsets.clear();
@@ -438,6 +446,7 @@ impl ColumnState {
                 value_offsets.clear();
                 value_offsets.push(0);
                 value_data.clear();
+                value_validity.clear();
                 *total_entries = 0;
             }
             NestedState::Union { type_ids, offsets, child_data, child_offsets, child_counts, .. } => {
@@ -456,10 +465,11 @@ impl ColumnState {
                     *count = 0;
                 }
             }
-            NestedState::List { offsets, child_data, child_data_position, child_offsets_position, total_elements, use_preallocated, .. } => {
+            NestedState::List { offsets, child_data, child_validity, child_data_position, child_offsets_position, total_elements, use_preallocated, .. } => {
                 offsets.clear();
                 offsets.push(0);
                 child_data.clear();
+                child_validity.clear();
                 *child_data_position = 0;
                 // For pre-allocated mode with variable-length children (Utf8/Binary),
                 // skip the first 4 bytes which contain the initial offset 0 (pre-zeroed buffer)
@@ -470,12 +480,15 @@ impl ColumnState {
                 // Keep dictionary values (they come from schema), clear indices
                 indices.clear();
             }
-            NestedState::Struct { field_data, field_null_bitmaps, row_count, field_positions, field_offsets_positions, field_types, use_preallocated, .. } => {
+            NestedState::Struct { field_data, field_null_bitmaps, field_validity, row_count, field_positions, field_offsets_positions, field_types, use_preallocated, .. } => {
                 for data in field_data.iter_mut() {
                     data.clear();
                 }
                 for bitmap in field_null_bitmaps.iter_mut() {
                     bitmap.clear();
+                }
+                for validity in field_validity.iter_mut() {
+                    validity.clear();
                 }
                 *row_count = 0;
                 for pos in field_positions.iter_mut() {
@@ -497,13 +510,14 @@ impl ColumnState {
     fn create_snapshot(&self) -> NestedSnapshot {
         match &self.nested {
             NestedState::None => NestedSnapshot::None,
-            NestedState::Map { map_offsets, key_offsets, key_data, value_offsets, value_data, total_entries, .. } => {
+            NestedState::Map { map_offsets, key_offsets, key_data, value_offsets, value_data, value_validity, total_entries, .. } => {
                 NestedSnapshot::Map {
                     map_offsets_len: map_offsets.len(),
                     key_offsets_len: key_offsets.len(),
                     key_data_len: key_data.len(),
                     value_offsets_len: value_offsets.len(),
                     value_data_len: value_data.len(),
+                    value_validity_len: value_validity.len(),
                     total_entries: *total_entries,
                 }
             }
@@ -516,10 +530,11 @@ impl ColumnState {
                     child_counts: child_counts.clone(),
                 }
             }
-            NestedState::List { offsets, child_data, child_data_position, child_offsets_position, total_elements, .. } => {
+            NestedState::List { offsets, child_data, child_validity, child_data_position, child_offsets_position, total_elements, .. } => {
                 NestedSnapshot::List {
                     offsets_len: offsets.len(),
                     child_data_len: child_data.len(),
+                    child_validity_len: child_validity.len(),
                     child_data_position: *child_data_position,
                     child_offsets_position: *child_offsets_position,
                     total_elements: *total_elements,
@@ -530,10 +545,11 @@ impl ColumnState {
                     indices_len: indices.len(),
                 }
             }
-            NestedState::Struct { field_data, field_null_bitmaps, row_count, field_positions, field_offsets_positions, .. } => {
+            NestedState::Struct { field_data, field_null_bitmaps, field_validity, row_count, field_positions, field_offsets_positions, .. } => {
                 NestedSnapshot::Struct {
                     field_data_lens: field_data.iter().map(|d| d.len()).collect(),
                     field_null_bitmap_lens: field_null_bitmaps.iter().map(|b| b.len()).collect(),
+                    field_validity_lens: field_validity.iter().map(|v| v.len()).collect(),
                     row_count: *row_count,
                     field_positions: field_positions.clone(),
                     field_offsets_positions: field_offsets_positions.clone(),
@@ -547,10 +563,10 @@ impl ColumnState {
         match (&mut self.nested, snapshot) {
             (NestedState::None, NestedSnapshot::None) => {}
             (
-                NestedState::Map { map_offsets, key_offsets, key_data, value_offsets, value_data, total_entries, .. },
+                NestedState::Map { map_offsets, key_offsets, key_data, value_offsets, value_data, value_validity, total_entries, .. },
                 NestedSnapshot::Map {
                     map_offsets_len, key_offsets_len, key_data_len, value_offsets_len, value_data_len,
-                    total_entries: snap_entries,
+                    value_validity_len, total_entries: snap_entries,
                 }
             ) => {
                 map_offsets.truncate(*map_offsets_len);
@@ -558,6 +574,7 @@ impl ColumnState {
                 key_data.truncate(*key_data_len);
                 value_offsets.truncate(*value_offsets_len);
                 value_data.truncate(*value_data_len);
+                value_validity.truncate(*value_validity_len);
                 *total_entries = *snap_entries;
             }
             (
@@ -577,11 +594,12 @@ impl ColumnState {
                 child_counts.clone_from(snap_counts);
             }
             (
-                NestedState::List { offsets, child_data, child_data_position, child_offsets_position, total_elements, .. },
-                NestedSnapshot::List { offsets_len, child_data_len, child_data_position: snap_position, child_offsets_position: snap_offsets_position, total_elements: snap_elements }
+                NestedState::List { offsets, child_data, child_validity, child_data_position, child_offsets_position, total_elements, .. },
+                NestedSnapshot::List { offsets_len, child_data_len, child_validity_len, child_data_position: snap_position, child_offsets_position: snap_offsets_position, total_elements: snap_elements }
             ) => {
                 offsets.truncate(*offsets_len);
                 child_data.truncate(*child_data_len);
+                child_validity.truncate(*child_validity_len);
                 *child_data_position = *snap_position;
                 *child_offsets_position = *snap_offsets_position;
                 *total_elements = *snap_elements;
@@ -593,14 +611,17 @@ impl ColumnState {
                 indices.truncate(*indices_len);
             }
             (
-                NestedState::Struct { field_data, field_null_bitmaps, row_count, field_positions, field_offsets_positions, .. },
-                NestedSnapshot::Struct { field_data_lens, field_null_bitmap_lens, row_count: snap_count, field_positions: snap_positions, field_offsets_positions: snap_offsets_positions }
+                NestedState::Struct { field_data, field_null_bitmaps, field_validity, row_count, field_positions, field_offsets_positions, .. },
+                NestedSnapshot::Struct { field_data_lens, field_null_bitmap_lens, field_validity_lens, row_count: snap_count, field_positions: snap_positions, field_offsets_positions: snap_offsets_positions }
             ) => {
                 for (data, len) in field_data.iter_mut().zip(field_data_lens.iter()) {
                     data.truncate(*len);
                 }
                 for (bitmap, len) in field_null_bitmaps.iter_mut().zip(field_null_bitmap_lens.iter()) {
                     bitmap.truncate(*len);
+                }
+                for (validity, len) in field_validity.iter_mut().zip(field_validity_lens.iter()) {
+                    validity.truncate(*len);
                 }
                 *row_count = *snap_count;
                 *field_positions = snap_positions.clone();
@@ -1521,12 +1542,13 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                             }
                             ColKind::Struct { .. } => {
                                 // Null Struct: add placeholder row with null/empty field values
-                                if let NestedState::Struct { field_data, field_types, field_nullable, row_count, .. } = &mut self.columns[col_idx].nested {
+                                if let NestedState::Struct { field_data, field_types, field_nullable, field_validity, row_count, .. } = &mut self.columns[col_idx].nested {
                                     // Add placeholder data for each field
                                     for (field_idx, field_type) in field_types.iter().enumerate() {
                                         if field_nullable[field_idx] {
-                                            // Nullable field: push null marker
-                                            field_data[field_idx].push(0);
+                                            // Nullable field: track validity separately and add placeholder
+                                            field_validity[field_idx].push(false); // null
+                                            Self::append_placeholder_to_vec(field_type, &mut field_data[field_idx]);
                                         } else {
                                             // Non-nullable field: push placeholder value
                                             Self::append_placeholder_to_vec(field_type, &mut field_data[field_idx]);
@@ -1700,15 +1722,16 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                                     }
                                 } else {
                                     // Vec fallback path (also used for nullable children)
-                                    if let NestedState::List { child_data, .. } = &mut self.columns[col_idx].nested {
+                                    if let NestedState::List { child_data, child_validity, .. } = &mut self.columns[col_idx].nested {
                                         if is_child_nullable {
-                                            // Nullable elements: read union index, write marker
+                                            // Nullable elements: read union index, track validity separately
                                             for _ in 0..count {
                                                 let union_index = cursor.get_long()?;
                                                 if union_index == 0 {
-                                                    child_data.push(0); // null marker
+                                                    child_validity.push(false); // null
+                                                    Self::append_placeholder_to_vec(child_type, child_data);
                                                 } else {
-                                                    child_data.push(1); // valid marker
+                                                    child_validity.push(true); // valid
                                                     Self::decode_value_to_vec(child_type, &mut cursor, child_data)?;
                                                 }
                                             }
@@ -1755,19 +1778,20 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                                     block_count as usize
                                 };
 
-                                if let NestedState::Map { key_offsets, key_data, value_offsets, value_data, .. } = &mut self.columns[col_idx].nested {
+                                if let NestedState::Map { key_offsets, key_data, value_offsets, value_data, value_validity, .. } = &mut self.columns[col_idx].nested {
                                     let needs_value_offsets = matches!(value_type, DataType::Utf8 | DataType::Binary);
                                     for _ in 0..count {
                                         let key_bytes = cursor.get_bytes()?;
                                         key_data.extend_from_slice(key_bytes);
                                         key_offsets.push(key_data.len() as i32);
-                                        // Handle nullable values
+                                        // Handle nullable values with separate validity tracking
                                         if is_value_nullable {
                                             let union_index = cursor.get_long()?;
                                             if union_index == 0 {
-                                                value_data.push(0); // null marker
+                                                value_validity.push(false); // null
+                                                Self::append_placeholder_to_vec(value_type, value_data);
                                             } else {
-                                                value_data.push(1); // valid marker
+                                                value_validity.push(true); // valid
                                                 Self::decode_value_to_vec(value_type, &mut cursor, value_data)?;
                                             }
                                         } else {
@@ -1881,15 +1905,16 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                                 }
                             } else {
                                 // Vec fallback path (also used when any field is nullable)
-                                if let NestedState::Struct { field_data, row_count, .. } = &mut self.columns[col_idx].nested {
+                                if let NestedState::Struct { field_data, field_validity, row_count, .. } = &mut self.columns[col_idx].nested {
                                     for (field_idx, field_type) in field_types.iter().enumerate() {
                                         if field_nullable_flags[field_idx] {
-                                            // Nullable field: read union index, write marker
+                                            // Nullable field: read union index, track validity separately
                                             let union_index = cursor.get_long()?;
                                             if union_index == 0 {
-                                                field_data[field_idx].push(0); // null marker
+                                                field_validity[field_idx].push(false); // null
+                                                Self::append_null_placeholder(field_type, &mut field_data[field_idx]);
                                             } else {
-                                                field_data[field_idx].push(1); // valid marker
+                                                field_validity[field_idx].push(true); // valid
                                                 Self::decode_value_to_vec(field_type, &mut cursor, &mut field_data[field_idx])?;
                                             }
                                         } else {
@@ -2711,6 +2736,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     }
 
     /// Decode a Struct value (Avro record - fields in schema order)
+    /// Optimized to avoid cloning field metadata on each call
     fn decode_struct_value(
         &mut self,
         col_idx: usize,
@@ -2718,43 +2744,34 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     ) -> Result<(), ArrowError> {
         let col = &mut self.columns[col_idx];
 
-        if let NestedState::Struct { field_data, field_types, field_nullable, field_null_bitmaps, row_count, .. } = &mut col.nested {
+        if let NestedState::Struct { field_data, field_types, field_nullable, field_validity, row_count, .. } = &mut col.nested {
             let num_fields = field_types.len();
-            let field_types_clone: Vec<DataType> = field_types.clone();
-            let field_nullable_clone: Vec<bool> = field_nullable.clone();
-            let current_row = *row_count;
 
             // Avro records encode fields in schema order
+            // Use index-based iteration to avoid cloning field metadata
             for field_idx in 0..num_fields {
-                let field_type = &field_types_clone[field_idx];
-                let is_nullable = field_nullable_clone[field_idx];
+                let is_nullable = field_nullable[field_idx];
 
                 if is_nullable {
                     // Read union index for nullable fields
                     let union_index = cursor.get_long()?;
                     let is_null = union_index == 0;
 
-                    // Track validity in bit-packed null bitmap
-                    let byte_idx = current_row / 8;
-                    let bit_idx = current_row % 8;
-
-                    // Ensure bitmap has enough bytes
-                    while field_null_bitmaps[field_idx].len() <= byte_idx {
-                        field_null_bitmaps[field_idx].push(0);
-                    }
+                    // Track validity separately (single pass, no markers)
+                    field_validity[field_idx].push(!is_null);
 
                     if !is_null {
-                        // Set bit to 1 for valid values
-                        field_null_bitmaps[field_idx][byte_idx] |= 1 << bit_idx;
-                        // Decode the actual value
+                        // Decode the actual value - get type by index
+                        let field_type = &field_types[field_idx];
                         Self::decode_value_to_vec(field_type, cursor, &mut field_data[field_idx])?;
                     } else {
-                        // For null values, we still need to add placeholder data for fixed-size types
-                        // or just leave the bitmap bit as 0 (null)
+                        // For null values, add placeholder data
+                        let field_type = &field_types[field_idx];
                         Self::append_null_placeholder(field_type, &mut field_data[field_idx]);
                     }
                 } else {
                     // Non-nullable field - decode directly
+                    let field_type = &field_types[field_idx];
                     Self::decode_value_to_vec(field_type, cursor, &mut field_data[field_idx])?;
                 }
             }
@@ -2824,18 +2841,19 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 Ordering::Less => {
                     let count = (-block_count) as usize;
                     let _size_in_bytes = cursor.get_long()?; // Skip size hint
-                    if let NestedState::Map { key_offsets, key_data, value_data, .. } = &mut self.columns[col_idx].nested {
+                    if let NestedState::Map { key_offsets, key_data, value_data, value_validity, .. } = &mut self.columns[col_idx].nested {
                         for _ in 0..count {
                             let key_bytes = cursor.get_bytes()?;
                             key_data.extend_from_slice(key_bytes);
                             key_offsets.push(key_data.len() as i32);
-                            // Handle nullable values
+                            // Handle nullable values with separate validity tracking
                             if is_value_nullable {
                                 let union_index = cursor.get_long()?;
                                 if union_index == 0 {
-                                    value_data.push(0); // null marker
+                                    value_validity.push(false); // null
+                                    Self::append_placeholder_to_vec(&value_type_clone, value_data);
                                 } else {
-                                    value_data.push(1); // valid marker
+                                    value_validity.push(true); // valid
                                     Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
                                 }
                             } else {
@@ -2847,18 +2865,19 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 }
                 Ordering::Greater => {
                     let count = block_count as usize;
-                    if let NestedState::Map { key_offsets, key_data, value_data, .. } = &mut self.columns[col_idx].nested {
+                    if let NestedState::Map { key_offsets, key_data, value_data, value_validity, .. } = &mut self.columns[col_idx].nested {
                         for _ in 0..count {
                             let key_bytes = cursor.get_bytes()?;
                             key_data.extend_from_slice(key_bytes);
                             key_offsets.push(key_data.len() as i32);
-                            // Handle nullable values
+                            // Handle nullable values with separate validity tracking
                             if is_value_nullable {
                                 let union_index = cursor.get_long()?;
                                 if union_index == 0 {
-                                    value_data.push(0); // null marker
+                                    value_validity.push(false); // null
+                                    Self::append_placeholder_to_vec(&value_type_clone, value_data);
                                 } else {
-                                    value_data.push(1); // valid marker
+                                    value_validity.push(true); // valid
                                     Self::decode_value_to_vec(&value_type_clone, cursor, value_data)?;
                                 }
                             } else {
@@ -3107,14 +3126,15 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     ) -> Result<usize, ArrowError> {
         for _ in 0..count {
             let col = &mut self.columns[col_idx];
-            if let NestedState::List { child_data, .. } = &mut col.nested {
+            if let NestedState::List { child_data, child_validity, .. } = &mut col.nested {
                 if child_nullable {
-                    // Read union index for nullable items
+                    // Read union index for nullable items, track validity separately
                     let union_index = cursor.get_long()?;
                     if union_index == 0 {
-                        child_data.push(0); // null marker
+                        child_validity.push(false); // null
+                        Self::append_placeholder_to_vec(child_type, child_data);
                     } else {
-                        child_data.push(1); // valid marker
+                        child_validity.push(true); // valid
                         Self::decode_value_to_vec(child_type, cursor, child_data)?;
                     }
                 } else {
@@ -3845,16 +3865,18 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         let col_null_buffer = col.get_null_buffer();
 
         if let NestedState::Map {
-            map_offsets, key_offsets, key_data, value_offsets, value_data, value_type, value_nullable, ..
+            map_offsets, key_offsets, key_data, value_offsets, value_data, value_validity, value_type, value_nullable, ..
         } = &mut col.nested {
-
-            // Vec mode: use the Vec buffers directly
-            let key_data_buffer = Buffer::from_slice_ref(key_data);
-            let key_offsets_buffer = Buffer::from_slice_ref(key_offsets);
             let is_value_nullable = *value_nullable;
             let value_type_clone = value_type.clone();
 
-            // Create key array (StringArray)
+            // Zero-copy: take ownership of Vecs and convert directly to Buffer
+            let key_data_vec = std::mem::take(key_data);
+            let key_offsets_vec = std::mem::take(key_offsets);
+            let key_data_buffer = Buffer::from_vec(key_data_vec);
+            let key_offsets_buffer = Buffer::from_vec(key_offsets_vec);
+
+            // Create key array (StringArray) - zero-copy
             let key_array = StringArray::try_new(
                 OffsetBuffer::new(ScalarBuffer::<i32>::from(key_offsets_buffer)),
                 key_data_buffer,
@@ -3863,33 +3885,39 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
 
             // Create value array based on type and nullability
             let value_array: ArrayRef = if is_value_nullable {
-                // Nullable values: handle marker bytes
-                Self::build_array_from_vec_with_markers(value_type_clone.clone(), value_data)?
+                // Nullable values: use separate validity tracking (single pass, no markers)
+                let value_data_vec = std::mem::take(value_data);
+                let validity_vec = std::mem::take(value_validity);
+                Self::build_array_from_vec_with_nulls_owned(value_type_clone.clone(), value_data_vec, validity_vec)?
             } else {
-                let value_data_buffer = Buffer::from_slice_ref(value_data);
-                let value_offsets_buffer = if matches!(value_type_clone, DataType::Utf8 | DataType::Binary) {
-                    Some(Buffer::from_slice_ref(value_offsets))
-                } else {
-                    None
-                };
-                if let Some(value_off_buf) = value_offsets_buffer {
-                    // Variable-length values: build directly from offsets
-                    match &value_type_clone {
-                        DataType::Utf8 => Arc::new(StringArray::try_new(
-                            OffsetBuffer::new(ScalarBuffer::<i32>::from(value_off_buf)),
+                let value_data_vec = std::mem::take(value_data);
+                match &value_type_clone {
+                    DataType::Utf8 => {
+                        // Variable-length string values: zero-copy from offsets
+                        let value_offsets_vec = std::mem::take(value_offsets);
+                        let value_data_buffer = Buffer::from_vec(value_data_vec);
+                        let value_offsets_buffer = Buffer::from_vec(value_offsets_vec);
+                        Arc::new(StringArray::try_new(
+                            OffsetBuffer::new(ScalarBuffer::<i32>::from(value_offsets_buffer)),
                             value_data_buffer,
                             None,
-                        )?),
-                        DataType::Binary => Arc::new(BinaryArray::try_new(
-                            OffsetBuffer::new(ScalarBuffer::<i32>::from(value_off_buf)),
-                            value_data_buffer,
-                            None,
-                        )?),
-                        _ => Self::build_array_from_vec(value_type_clone.clone(), value_data_buffer.as_slice())?,
+                        )?)
                     }
-                } else {
-                    // Fixed-size values: use build_array_from_vec
-                    Self::build_array_from_vec(value_type_clone.clone(), value_data_buffer.as_slice())?
+                    DataType::Binary => {
+                        // Variable-length binary values: zero-copy from offsets
+                        let value_offsets_vec = std::mem::take(value_offsets);
+                        let value_data_buffer = Buffer::from_vec(value_data_vec);
+                        let value_offsets_buffer = Buffer::from_vec(value_offsets_vec);
+                        Arc::new(BinaryArray::try_new(
+                            OffsetBuffer::new(ScalarBuffer::<i32>::from(value_offsets_buffer)),
+                            value_data_buffer,
+                            None,
+                        )?)
+                    }
+                    _ => {
+                        // Fixed-size values: zero-copy build
+                        Self::build_array_from_vec_owned(value_type_clone.clone(), value_data_vec)?
+                    }
                 }
             };
 
@@ -3903,8 +3931,9 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 None,
             );
 
-            // Create map offsets
-            let map_offsets_buffer = Buffer::from_slice_ref(map_offsets);
+            // Zero-copy map offsets
+            let map_offsets_vec = std::mem::take(map_offsets);
+            let map_offsets_buffer = Buffer::from_vec(map_offsets_vec);
             let map_offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(map_offsets_buffer));
 
             // Create MapArray with column-level null buffer if applicable
@@ -3925,6 +3954,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     }
 
     /// Flush a Union column from nested state to Arrow UnionArray (Vec mode only)
+    /// Uses zero-copy Buffer conversion where possible
     fn flush_union_column(
         &mut self,
         col_idx: usize,
@@ -3936,20 +3966,22 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         if let NestedState::Union {
             type_ids, offsets, child_data, child_counts, ..
         } = &mut col.nested {
-            // Build type_ids buffer
-            let type_ids_buffer = ScalarBuffer::<i8>::from(Buffer::from_slice_ref(type_ids));
+            // Zero-copy: take ownership of type_ids Vec
+            let type_ids_vec = std::mem::take(type_ids);
+            let type_ids_buffer = ScalarBuffer::<i8>::from(Buffer::from_vec(type_ids_vec));
 
-            // Build child arrays using Vec mode
+            // Build child arrays using zero-copy owned versions
             let mut children: Vec<ArrayRef> = Vec::with_capacity(fields.len());
             for (i, (_, field)) in fields.iter().enumerate() {
                 let child_type = field.data_type().clone();
                 match child_type {
                     DataType::Null => {
-                        // For Null type, create NullArray with the correct count
                         children.push(Arc::new(NullArray::new(child_counts[i])));
                     }
                     _ => {
-                        let child_array = Self::build_array_from_vec(child_type, &child_data[i])?;
+                        // Zero-copy: take ownership of child data Vec
+                        let child_data_vec = std::mem::take(&mut child_data[i]);
+                        let child_array = Self::build_array_from_vec_owned(child_type, child_data_vec)?;
                         children.push(child_array);
                     }
                 }
@@ -3958,8 +3990,12 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             // Create union array based on mode
             let union_array = match mode {
                 UnionMode::Dense => {
-                    let offsets_buffer = offsets.as_ref()
-                        .map(|o| ScalarBuffer::<i32>::from(Buffer::from_slice_ref(o)));
+                    // Zero-copy offsets
+                    let offsets_buffer = offsets.as_mut()
+                        .map(|o| {
+                            let offs_vec = std::mem::take(o);
+                            ScalarBuffer::<i32>::from(Buffer::from_vec(offs_vec))
+                        });
                     UnionArray::try_new(fields, type_ids_buffer, offsets_buffer, children)?
                 }
                 UnionMode::Sparse => {
@@ -4011,14 +4047,17 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 }
             }
         } else {
-            // Vec mode: handle nullable markers if present
+            // Vec mode: handle nullable with separate validity tracking
             let col = &mut self.columns[col_idx];
-            if let NestedState::List { child_data, child_type, .. } = &mut col.nested {
-                if is_child_nullable {
-                    // Parse markers and extract values
-                    Self::build_array_from_vec_with_markers(child_type.clone(), child_data)?
+            if let NestedState::List { child_data, child_validity, child_type, .. } = &mut col.nested {
+                if is_child_nullable && !child_validity.is_empty() {
+                    // Use separate validity tracking (single pass, no markers)
+                    let child_data_vec = std::mem::take(child_data);
+                    let validity_vec = std::mem::take(child_validity);
+                    Self::build_array_from_vec_with_nulls_owned(child_type.clone(), child_data_vec, validity_vec)?
                 } else {
-                    Self::build_array_from_vec(child_type.clone(), child_data)?
+                    let child_data_vec = std::mem::take(child_data);
+                    Self::build_array_from_vec_owned(child_type.clone(), child_data_vec)?
                 }
             } else {
                 return Err(ArrowError::InvalidArgumentError(
@@ -4073,41 +4112,6 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             ))),
         }
     }
-
-    /// Build an array from Vec data that contains inline nullable markers
-    /// Format: [marker0:1][value0]...[marker1:1][value1]...
-    /// marker = 0 for null, 1 for valid
-    fn build_array_from_vec_with_markers(data_type: DataType, data: &[u8]) -> Result<ArrayRef, ArrowError> {
-        // First pass: extract validity and values
-        let mut values: Vec<u8> = Vec::new();
-        let mut validity: Vec<bool> = Vec::new();
-        let mut pos = 0;
-
-        while pos < data.len() {
-            let marker = data[pos];
-            pos += 1;
-
-            validity.push(marker != 0);
-
-            if marker == 0 {
-                // Null - add placeholder
-                Self::append_placeholder_to_vec(&data_type, &mut values);
-            } else {
-                // Valid - copy the value
-                let value_start = pos;
-                pos = Self::skip_serialized_value(&data_type, data, pos)?;
-                values.extend_from_slice(&data[value_start..pos]);
-            }
-        }
-
-        // Build array with nulls
-        if validity.is_empty() {
-            Self::build_array_from_vec(data_type, &values)
-        } else {
-            Self::build_array_from_vec_with_nulls(data_type, &values, &validity)
-        }
-    }
-
     /// Build an Arrow array from a pre-allocated buffer
     fn build_array_from_buffer(data_type: DataType, buffer: Buffer) -> Result<ArrayRef, ArrowError> {
         // Handle empty buffers specially - ScalarBuffer::from panics on unaligned empty buffers
@@ -4174,7 +4178,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
         let provider_col_idx = col.column_index;
 
         if let NestedState::Struct {
-            field_data, field_types, field_names, field_nullable, row_count,
+            field_data, field_types, field_names, field_nullable, field_validity, row_count,
             field_positions, field_offsets_positions, use_preallocated, ..
         } = &mut col.nested {
             let mut child_arrays: Vec<ArrayRef> = Vec::with_capacity(field_types.len());
@@ -4201,14 +4205,17 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                     child_arrays.push(child_array);
                 }
             } else {
-                // Vec fallback path: build from field_data
+                // Vec fallback path: build from field_data using zero-copy and separate validity
                 for (i, field_type) in field_types.iter().enumerate() {
                     let is_nullable = field_nullable[i];
-                    let child_array = if is_nullable && !field_data[i].is_empty() {
-                        // Parse markers from field_data to build array with nulls
-                        Self::build_array_from_vec_with_markers(field_type.clone(), &field_data[i])?
+                    // Zero-copy: take ownership of field data and validity Vecs
+                    let field_data_vec = std::mem::take(&mut field_data[i]);
+                    let child_array = if is_nullable && !field_validity[i].is_empty() {
+                        // Use separate validity tracking (single pass, no markers)
+                        let validity_vec = std::mem::take(&mut field_validity[i]);
+                        Self::build_array_from_vec_with_nulls_owned(field_type.clone(), field_data_vec, validity_vec)?
                     } else {
-                        Self::build_array_from_vec(field_type.clone(), &field_data[i])?
+                        Self::build_array_from_vec_owned(field_type.clone(), field_data_vec)?
                     };
                     child_arrays.push(child_array);
                 }
@@ -4419,6 +4426,182 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                 "build_array_from_vec not implemented for {:?}",
                 other
             ))),
+        }
+    }
+
+    /// Zero-copy version: build Arrow array taking ownership of Vec<u8>
+    /// Avoids memory copy by using Buffer::from_vec()
+    fn build_array_from_vec_owned(data_type: DataType, data: Vec<u8>) -> Result<ArrayRef, ArrowError> {
+        // Handle empty data case - return properly typed empty array
+        if data.is_empty() {
+            return Self::build_empty_array(&data_type);
+        }
+
+        match data_type {
+            DataType::Null => Ok(Arc::new(NullArray::new(0))),
+            DataType::Int32 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i32>::from(buffer);
+                Ok(Arc::new(Int32Array::new(values, None)))
+            }
+            DataType::Int64 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i64>::from(buffer);
+                Ok(Arc::new(Int64Array::new(values, None)))
+            }
+            DataType::Float32 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<f32>::from(buffer);
+                Ok(Arc::new(Float32Array::new(values, None)))
+            }
+            DataType::Float64 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<f64>::from(buffer);
+                Ok(Arc::new(Float64Array::new(values, None)))
+            }
+            DataType::Boolean => {
+                let mut builder = BooleanArray::builder(data.len());
+                for byte in &data {
+                    builder.append_value(*byte != 0);
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::Decimal128(precision, scale) => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i128>::from(buffer);
+                Ok(Arc::new(Decimal128Array::new(values, None)
+                    .with_precision_and_scale(precision, scale)?))
+            }
+            DataType::Date32 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i32>::from(buffer);
+                Ok(Arc::new(Date32Array::new(values, None)))
+            }
+            DataType::Time32(unit) => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i32>::from(buffer);
+                match unit {
+                    arrow_schema::TimeUnit::Second => Ok(Arc::new(Time32SecondArray::new(values, None))),
+                    arrow_schema::TimeUnit::Millisecond => Ok(Arc::new(Time32MillisecondArray::new(values, None))),
+                    _ => Err(ArrowError::InvalidArgumentError(format!("Invalid Time32 unit: {:?}", unit))),
+                }
+            }
+            DataType::Time64(unit) => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i64>::from(buffer);
+                match unit {
+                    arrow_schema::TimeUnit::Microsecond => Ok(Arc::new(Time64MicrosecondArray::new(values, None))),
+                    arrow_schema::TimeUnit::Nanosecond => Ok(Arc::new(Time64NanosecondArray::new(values, None))),
+                    _ => Err(ArrowError::InvalidArgumentError(format!("Invalid Time64 unit: {:?}", unit))),
+                }
+            }
+            DataType::Timestamp(unit, tz) => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i64>::from(buffer);
+                match unit {
+                    arrow_schema::TimeUnit::Second => {
+                        let arr = TimestampSecondArray::new(values, None);
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                    arrow_schema::TimeUnit::Millisecond => {
+                        let arr = TimestampMillisecondArray::new(values, None);
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                    arrow_schema::TimeUnit::Microsecond => {
+                        let arr = TimestampMicrosecondArray::new(values, None);
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                    arrow_schema::TimeUnit::Nanosecond => {
+                        let arr = TimestampNanosecondArray::new(values, None);
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                }
+            }
+            // For complex types, fall back to slice version (they need parsing anyway)
+            other => Self::build_array_from_vec(other, &data),
+        }
+    }
+
+    /// Zero-copy version of build_array_from_vec_with_nulls
+    fn build_array_from_vec_with_nulls_owned(data_type: DataType, data: Vec<u8>, validity: Vec<bool>) -> Result<ArrayRef, ArrowError> {
+        let null_buffer = NullBuffer::from(validity.iter().copied().collect::<Vec<bool>>());
+
+        match data_type {
+            DataType::Int32 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i32>::from(buffer);
+                Ok(Arc::new(Int32Array::new(values, Some(null_buffer))))
+            }
+            DataType::Int64 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i64>::from(buffer);
+                Ok(Arc::new(Int64Array::new(values, Some(null_buffer))))
+            }
+            DataType::Float32 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<f32>::from(buffer);
+                Ok(Arc::new(Float32Array::new(values, Some(null_buffer))))
+            }
+            DataType::Float64 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<f64>::from(buffer);
+                Ok(Arc::new(Float64Array::new(values, Some(null_buffer))))
+            }
+            DataType::Boolean => {
+                let mut builder = BooleanArray::builder(data.len());
+                for (i, byte) in data.iter().enumerate() {
+                    if validity.get(i).copied().unwrap_or(false) {
+                        builder.append_value(*byte != 0);
+                    } else {
+                        builder.append_null();
+                    }
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::Decimal128(precision, scale) => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i128>::from(buffer);
+                Ok(Arc::new(Decimal128Array::new(values, Some(null_buffer))
+                    .with_precision_and_scale(precision, scale)?))
+            }
+            DataType::Date32 => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i32>::from(buffer);
+                Ok(Arc::new(Date32Array::new(values, Some(null_buffer))))
+            }
+            DataType::Time64(unit) => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i64>::from(buffer);
+                match unit {
+                    arrow_schema::TimeUnit::Microsecond => Ok(Arc::new(Time64MicrosecondArray::new(values, Some(null_buffer)))),
+                    arrow_schema::TimeUnit::Nanosecond => Ok(Arc::new(Time64NanosecondArray::new(values, Some(null_buffer)))),
+                    _ => Err(ArrowError::InvalidArgumentError(format!("Invalid Time64 unit: {:?}", unit))),
+                }
+            }
+            DataType::Timestamp(unit, tz) => {
+                let buffer = Buffer::from_vec(data);
+                let values = ScalarBuffer::<i64>::from(buffer);
+                match unit {
+                    arrow_schema::TimeUnit::Second => {
+                        let arr = TimestampSecondArray::new(values, Some(null_buffer));
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                    arrow_schema::TimeUnit::Millisecond => {
+                        let arr = TimestampMillisecondArray::new(values, Some(null_buffer));
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                    arrow_schema::TimeUnit::Microsecond => {
+                        let arr = TimestampMicrosecondArray::new(values, Some(null_buffer));
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                    arrow_schema::TimeUnit::Nanosecond => {
+                        let arr = TimestampNanosecondArray::new(values, Some(null_buffer));
+                        Ok(Arc::new(if let Some(tz) = tz { arr.with_timezone(tz.as_ref()) } else { arr }))
+                    }
+                }
+            }
+            // For complex types fall back to slice version
+            other => Self::build_array_from_vec_with_nulls(other, &data, &validity.iter().copied().collect::<Vec<_>>()),
         }
     }
 
@@ -5077,6 +5260,7 @@ mod tests {
                 key_data: b"foobar!".to_vec(),
                 value_offsets: vec![0],  // Not used for Int32 values
                 value_data: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                value_validity: Vec::new(),
                 value_type: DataType::Int32,
                 value_nullable: false,
                 total_entries: 2,
@@ -5091,6 +5275,7 @@ mod tests {
             key_data_len,
             value_offsets_len,
             value_data_len,
+            value_validity_len: _,
             total_entries,
         } = snapshot {
             assert_eq!(map_offsets_len, 2);
@@ -5116,6 +5301,7 @@ mod tests {
             nested: NestedState::List {
                 offsets: vec![0, 3, 5],
                 child_data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+                child_validity: Vec::new(),
                 child_data_position: 10,
                 child_offsets_position: 0,
                 child_type: DataType::Int32,
@@ -5233,6 +5419,7 @@ mod tests {
             nested: NestedState::List {
                 offsets: vec![0],
                 child_data: Vec::new(),
+                child_validity: Vec::new(),
                 child_data_position: 0,
                 child_offsets_position: 0,
                 child_type: DataType::Int32,
@@ -5277,6 +5464,7 @@ mod tests {
             nested: NestedState::List {
                 offsets: vec![0, 2, 5],
                 child_data: vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], // 5 i32s
+                child_validity: Vec::new(),
                 child_data_position: 20,
                 child_offsets_position: 0,
                 child_type: DataType::Int32,
