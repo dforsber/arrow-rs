@@ -46,6 +46,16 @@ pub struct BufferSet {
 }
 
 impl BufferSet {
+    /// Convert validity to NullBuffer (zero-copy, consumes validity)
+    fn into_null_buffer(validity: Option<Vec<u8>>, row_count: usize) -> Option<NullBuffer> {
+        validity.map(|v| {
+            let buffer = Buffer::from_vec(v);
+            NullBuffer::new(BooleanBuffer::new(buffer, 0, row_count))
+        })
+    }
+}
+
+impl BufferSet {
     /// Create a new buffer set for fixed-size column
     pub fn new_fixed(capacity: usize) -> Self {
         Self {
@@ -345,6 +355,273 @@ pub fn buffer_to_array(
     }
 }
 
+/// Convert a single column's buffers to an Arrow ArrayRef (zero-copy, consumes BufferSet)
+///
+/// This version takes ownership of the BufferSet and converts it to Arrow arrays
+/// without copying the underlying data. Use this when you don't need to reuse the buffers.
+///
+/// # Arguments
+/// * `field` - Arrow field describing the column type
+/// * `buffer_set` - The decoded buffer data (consumed)
+/// * `row_count` - Number of rows decoded
+///
+/// # Returns
+/// Arrow ArrayRef wrapping the buffer data (zero-copy)
+pub fn buffer_to_array_owned(
+    field: &Field,
+    buffer_set: BufferSet,
+    row_count: usize,
+) -> Result<ArrayRef, ArrowError> {
+    let data_type = field.data_type();
+
+    // Extract validity first (before consuming other buffers)
+    let validity = buffer_set.validity;
+
+    match data_type {
+        // Boolean (1 bit per value, packed)
+        DataType::Boolean => {
+            let buffer = Buffer::from_vec(buffer_set.primary);
+            let bool_buffer = BooleanBuffer::new(buffer, 0, row_count);
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(BooleanArray::new(bool_buffer, null_buffer)))
+        }
+
+        // Signed integers
+        DataType::Int8 => {
+            let buffer = ScalarBuffer::<i8>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Int8Array::new(buffer, null_buffer)))
+        }
+        DataType::Int16 => {
+            let buffer = ScalarBuffer::<i16>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Int16Array::new(buffer, null_buffer)))
+        }
+        DataType::Int32 => {
+            let buffer = ScalarBuffer::<i32>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Int32Array::new(buffer, null_buffer)))
+        }
+        DataType::Int64 => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Int64Array::new(buffer, null_buffer)))
+        }
+
+        // Unsigned integers
+        DataType::UInt8 => {
+            let buffer = ScalarBuffer::<u8>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(UInt8Array::new(buffer, null_buffer)))
+        }
+        DataType::UInt16 => {
+            let buffer = ScalarBuffer::<u16>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(UInt16Array::new(buffer, null_buffer)))
+        }
+        DataType::UInt32 => {
+            let buffer = ScalarBuffer::<u32>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(UInt32Array::new(buffer, null_buffer)))
+        }
+        DataType::UInt64 => {
+            let buffer = ScalarBuffer::<u64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(UInt64Array::new(buffer, null_buffer)))
+        }
+
+        // Floating point
+        DataType::Float32 => {
+            let buffer = ScalarBuffer::<f32>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Float32Array::new(buffer, null_buffer)))
+        }
+        DataType::Float64 => {
+            let buffer = ScalarBuffer::<f64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Float64Array::new(buffer, null_buffer)))
+        }
+
+        // Date types
+        DataType::Date32 => {
+            let buffer = ScalarBuffer::<i32>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Date32Array::new(buffer, null_buffer)))
+        }
+        DataType::Date64 => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Date64Array::new(buffer, null_buffer)))
+        }
+
+        // Time types
+        DataType::Time32(TimeUnit::Second) => {
+            let buffer = ScalarBuffer::<i32>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Time32SecondArray::new(buffer, null_buffer)))
+        }
+        DataType::Time32(TimeUnit::Millisecond) => {
+            let buffer = ScalarBuffer::<i32>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Time32MillisecondArray::new(buffer, null_buffer)))
+        }
+        DataType::Time64(TimeUnit::Microsecond) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Time64MicrosecondArray::new(buffer, null_buffer)))
+        }
+        DataType::Time64(TimeUnit::Nanosecond) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(Time64NanosecondArray::new(buffer, null_buffer)))
+        }
+
+        // Timestamp types
+        DataType::Timestamp(TimeUnit::Second, tz) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(TimestampSecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+        }
+        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(TimestampMillisecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(TimestampMicrosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+        }
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(TimestampNanosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+        }
+
+        // Duration types
+        DataType::Duration(TimeUnit::Second) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(DurationSecondArray::new(buffer, null_buffer)))
+        }
+        DataType::Duration(TimeUnit::Millisecond) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(DurationMillisecondArray::new(buffer, null_buffer)))
+        }
+        DataType::Duration(TimeUnit::Microsecond) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(DurationMicrosecondArray::new(buffer, null_buffer)))
+        }
+        DataType::Duration(TimeUnit::Nanosecond) => {
+            let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(DurationNanosecondArray::new(buffer, null_buffer)))
+        }
+
+        // Interval types
+        DataType::Interval(IntervalUnit::YearMonth) => {
+            let buffer = ScalarBuffer::<i32>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(IntervalYearMonthArray::new(buffer, null_buffer)))
+        }
+        DataType::Interval(IntervalUnit::DayTime) => {
+            let buffer = ScalarBuffer::<IntervalDayTime>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(IntervalDayTimeArray::new(buffer, null_buffer)))
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let buffer = ScalarBuffer::<IntervalMonthDayNano>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(IntervalMonthDayNanoArray::new(buffer, null_buffer)))
+        }
+
+        // Decimal types
+        DataType::Decimal128(precision, scale) => {
+            let buffer = ScalarBuffer::<i128>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(
+                Decimal128Array::new(buffer, null_buffer)
+                    .with_precision_and_scale(*precision, *scale)?,
+            ))
+        }
+        DataType::Decimal256(precision, scale) => {
+            let buffer = ScalarBuffer::<i256>::from(Buffer::from_vec(buffer_set.primary));
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(
+                Decimal256Array::new(buffer, null_buffer)
+                    .with_precision_and_scale(*precision, *scale)?,
+            ))
+        }
+
+        // Fixed-size binary
+        DataType::FixedSizeBinary(size) => {
+            let buffer = Buffer::from_vec(buffer_set.primary);
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(FixedSizeBinaryArray::new(*size, buffer, null_buffer)))
+        }
+
+        // Variable-length string (UTF-8)
+        DataType::Utf8 => {
+            let offsets_buffer = Buffer::from_vec(buffer_set.primary);
+            let data_buffer = Buffer::from_vec(
+                buffer_set
+                    .secondary
+                    .ok_or_else(|| ArrowError::InvalidArgumentError("Utf8 requires data buffer".into()))?,
+            );
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
+            Ok(Arc::new(StringArray::new(offsets, data_buffer, null_buffer)))
+        }
+
+        // Large string (i64 offsets)
+        DataType::LargeUtf8 => {
+            let offsets_buffer = Buffer::from_vec(buffer_set.primary);
+            let data_buffer = Buffer::from_vec(
+                buffer_set
+                    .secondary
+                    .ok_or_else(|| ArrowError::InvalidArgumentError("LargeUtf8 requires data buffer".into()))?,
+            );
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            let offsets = OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets_buffer));
+            Ok(Arc::new(LargeStringArray::new(offsets, data_buffer, null_buffer)))
+        }
+
+        // Variable-length binary
+        DataType::Binary => {
+            let offsets_buffer = Buffer::from_vec(buffer_set.primary);
+            let data_buffer = Buffer::from_vec(
+                buffer_set
+                    .secondary
+                    .ok_or_else(|| ArrowError::InvalidArgumentError("Binary requires data buffer".into()))?,
+            );
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
+            Ok(Arc::new(BinaryArray::new(offsets, data_buffer, null_buffer)))
+        }
+
+        // Large binary (i64 offsets)
+        DataType::LargeBinary => {
+            let offsets_buffer = Buffer::from_vec(buffer_set.primary);
+            let data_buffer = Buffer::from_vec(
+                buffer_set
+                    .secondary
+                    .ok_or_else(|| ArrowError::InvalidArgumentError("LargeBinary requires data buffer".into()))?,
+            );
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            let offsets = OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets_buffer));
+            Ok(Arc::new(LargeBinaryArray::new(offsets, data_buffer, null_buffer)))
+        }
+
+        // Unsupported types
+        _ => Err(ArrowError::NotYetImplemented(format!(
+            "buffer_to_array_owned does not yet support {:?}",
+            data_type
+        ))),
+    }
+}
+
 /// Convert multiple buffer sets to a RecordBatch
 ///
 /// # Arguments
@@ -372,6 +649,41 @@ pub fn buffers_to_batch(
         .iter()
         .zip(buffer_sets.iter())
         .map(|(field, buffer_set)| buffer_to_array(field, buffer_set, row_count))
+        .collect();
+
+    RecordBatch::try_new(schema.clone(), arrays?)
+}
+
+/// Convert multiple buffer sets to a RecordBatch (zero-copy, consumes buffer sets)
+///
+/// This version takes ownership of the buffer sets and converts them to Arrow arrays
+/// without copying the underlying data. Use this when you don't need to reuse the buffers.
+///
+/// # Arguments
+/// * `schema` - Arrow schema for the batch
+/// * `buffer_sets` - One BufferSet per column (consumed)
+/// * `row_count` - Number of rows decoded
+///
+/// # Returns
+/// A RecordBatch containing all columns (zero-copy from buffers)
+pub fn buffers_to_batch_owned(
+    schema: &SchemaRef,
+    buffer_sets: Vec<BufferSet>,
+    row_count: usize,
+) -> Result<RecordBatch, ArrowError> {
+    if buffer_sets.len() != schema.fields().len() {
+        return Err(ArrowError::InvalidArgumentError(format!(
+            "Expected {} buffer sets for schema, got {}",
+            schema.fields().len(),
+            buffer_sets.len()
+        )));
+    }
+
+    let arrays: Result<Vec<ArrayRef>, ArrowError> = schema
+        .fields()
+        .iter()
+        .zip(buffer_sets.into_iter())
+        .map(|(field, buffer_set)| buffer_to_array_owned(field, buffer_set, row_count))
         .collect();
 
     RecordBatch::try_new(schema.clone(), arrays?)

@@ -136,50 +136,28 @@ FieldOp::Null => {
 
 ### High Impact
 
-#### 1. SIMD Varint Decoding (2-3x for int-heavy schemas)
-**Current**: Byte-by-byte varint parsing
-```rust
-// Current slow path
-loop {
-    let byte = input[cursor];
-    cursor += 1;
-    value |= ((byte & 0x7F) as i64) << shift;
-    if byte < 0x80 { break; }
-    shift += 7;
-}
-```
+#### 1. SIMD Varint Decoding ⏸️ DEFERRED
+**Reason**: SIMD batch decode requires architectural changes to integrate with row-oriented JIT.
+Row-by-row decoding can't easily batch varints across rows. Would need two-pass approach
+(scan all varints first, then decode) which adds complexity for limited applicability
+(int-only schemas). Standalone benchmark showed 2.5x speedup but integration not practical.
 
-**Optimized**: Batch decode using SIMD gather
-- Pre-scan continuation bits to find varint boundaries
-- Use SIMD to extract values in parallel
-- Falls back to scalar for edge cases
-
-#### 2. Batch String Memcpy (1.5-2x for string-heavy)
-**Current**: Individual memcpy per string
-**Optimized**:
-- Pre-scan to compute all string lengths
-- Single large memcpy for consecutive strings
-- SIMD offset computation
-
-#### 3. Prefetch Hints (10-20% for large batches)
+#### 2. Prefetch Hints (10-20% for large batches) ⏸️ DEFERRED
 **Current**: No prefetch instructions
 **Optimized**: Add software prefetch for:
 - Input buffer (next cache line)
 - Output buffers (write position + N)
 
-#### 4. Loop Unrolling (15-20% for fixed schemas)
-**Current**: One row per loop iteration
-**Optimized**: Unroll 4-8 rows for schemas with only fixed-size fields
-- Reduces loop overhead
-- Better instruction pipelining
-- Only applies when all fields are fixed-size
+#### 3. Loop Unrolling (15-20% for fixed schemas) ⏸️ DEFERRED
+**Reason**: Limited to fixed-size-only schemas (niche), modest gain doesn't justify complexity.
+Column-batched variant analyzed: ~10-30% potential gain from write locality + ILP, but still niche.
 
 ### Medium Impact
 
-#### 5. Nullable Skip Optimization
+#### 4. Nullable Skip Optimization
 For mostly-non-null data, track "all valid" state and skip validity bitmap writes.
 
-#### 6. Branch Prediction Hints
+#### 5. Branch Prediction Hints
 Add likely/unlikely hints for:
 - Varint continuation (usually single byte)
 - Null checks (usually non-null)
@@ -196,25 +174,11 @@ Add likely/unlikely hints for:
 2. ✅ Proper Map codegen (key skipping, value decoding)
 3. ✅ Union with Null variant
 
-### Phase 3: SIMD Optimizations ✅ COMPLETE
-1. ✅ SIMD varint decoder - **2.5-3x faster** for single-byte varints (array lengths, enum indices)
-2. ⏸️ Batch string memcpy (deferred - requires integration into JIT codegen)
-3. ⏸️ Loop unrolling (deferred - requires JIT codegen changes)
-
-#### SIMD Varint Benchmark Results (100,000 elements)
-
-| Type | SIMD | Scalar | Speedup |
-|------|------|--------|---------|
-| Single-byte i64 | 21.8 µs (4.6 Gelem/s) | 53.3 µs (1.9 Gelem/s) | **2.45x** |
-| Single-byte i32 | 15.2 µs (6.6 Gelem/s) | 41.9 µs (2.4 Gelem/s) | **2.76x** |
-| Mixed-size i64 | 172.7 µs | 151.1 µs | 0.88x |
-
-**Platform Support:**
-- x86_64: SSE2 intrinsics (`_mm_loadu_si128`, `_mm_movemask_epi8`)
-- aarch64: NEON intrinsics (`vld1q_u8`, `vshrq_n_u8`, `vmaxvq_u8`)
-- Fallback: Scalar implementation for other platforms
-
-**Key Finding:** SIMD is optimal for single-byte varints (common case). Mixed-size varints use scalar fallback which has lower overhead for multi-byte values.
+### Phase 3: Further Optimizations ⏸️ DEFERRED
+All remaining optimizations deferred due to limited applicability or modest gains:
+1. ⏸️ SIMD varint - requires architectural changes, limited to int-only schemas
+2. ⏸️ Loop unrolling - limited to fixed-size-only schemas
+3. ⏸️ Prefetch hints - hardware prefetchers effective
 
 ## Testing Strategy
 
@@ -236,15 +200,13 @@ Add likely/unlikely hints for:
 arrow-avro/src/reader/
 ├── jit_decoder.rs      # JIT compiler and decoder
 ├── jit_buffer_utils.rs # Buffer-to-array utilities (public API)
-├── simd_varint.rs      # SIMD-optimized varint decoding (x86_64/aarch64)
 ├── mod.rs              # Module exports
 └── pooled_decoder.rs   # Interpreted decoder (fallback)
 
 arrow-avro/benches/
 ├── jit_vs_apache_benchmark.rs
 ├── jit_per_type_benchmark.rs
-├── jit_benchmark.rs
-└── simd_varint_benchmark.rs
+└── jit_benchmark.rs
 ```
 
 ## Usage Example
@@ -271,13 +233,12 @@ let batch = buffers_to_batch(&schema, &buffer_sets, row_count)?;
 
 ## Changelog
 
-### 2025-12-03 (Phase 3: SIMD Complete)
-- ✅ Implemented SIMD varint decoder for x86_64 (SSE2) and aarch64 (NEON)
-- ✅ Single-byte varints: **2.5-3x faster** (4.6-6.6 Gelem/s)
-- ✅ i32 decoder: **7.4 Gelem/s** peak throughput
-- ✅ Provides function pointers for JIT integration
-- ✅ 6 unit tests passing for SIMD module
-- Note: Mixed-size varints use scalar fallback (optimal for multi-byte)
+### 2025-12-03 (Optimization Review)
+- Explored SIMD varint decoding: standalone benchmarks showed 2.5-3x speedup for single-byte varints
+- Deferred SIMD integration: row-oriented JIT can't easily batch varints, would need architectural changes
+- Deferred loop unrolling: limited to fixed-size-only schemas (niche use case)
+- Removed batch string memcpy from roadmap: Avro string data not contiguous (length varints interleaved)
+- **Conclusion**: JIT decoder already 5-6x faster than Apache Avro; further optimizations have diminishing returns
 
 ### 2025-12-03 (Phase 1 & 2 Complete)
 - ✅ Implemented `DataType::Null` support for nullable unions
