@@ -140,10 +140,15 @@ fn bench_list(c: &mut Criterion) {
         let id = format!("avg_len_{}", avg_len);
         group.bench_with_input(BenchmarkId::new("decode", id), &row_count, |b, &n| {
             b.iter(|| {
-                // Estimate max output size
-                let max_size = n * (avg_len + 10) * 16;
-                let mut output = vec![0u8; max_size];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                // List requires 2 buffers: offsets (row_count+1 i32s) + data
+                let offsets_size = (n + 1) * 4;
+                let mut offsets = vec![0u8; offsets_size];
+                let data_size = n * (avg_len + 10) * 16;
+                let mut data_buf = vec![0u8; data_size];
+                let buffers = vec![
+                    OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
+                    OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+                ];
                 let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
@@ -244,10 +249,15 @@ fn bench_map(c: &mut Criterion) {
         let id = format!("avg_entries_{}", avg_entries);
         group.bench_with_input(BenchmarkId::new("decode", id), &row_count, |b, &n| {
             b.iter(|| {
-                // Estimate max output size
-                let max_size = n * (avg_entries + 5) * 64;
-                let mut output = vec![0u8; max_size];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                // Map requires 2 buffers: offsets (row_count+1 i32s) + data
+                let offsets_size = (n + 1) * 4;
+                let mut offsets = vec![0u8; offsets_size];
+                let data_size = n * (avg_entries + 5) * 64;
+                let mut data_buf = vec![0u8; data_size];
+                let buffers = vec![
+                    OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
+                    OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+                ];
                 let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });

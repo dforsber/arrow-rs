@@ -24,7 +24,7 @@ use arrow_array::{
     ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
     RecordBatch, StringArray,
 };
-use arrow_buffer::{Buffer, ScalarBuffer};
+use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema};
 use std::sync::Arc;
 
@@ -71,11 +71,14 @@ pub struct JitDecoder {
     _module: SyncJitModule,
     /// Schema for reference
     schema: Arc<Schema>,
-    /// Number of columns
+    /// Number of schema columns
     num_columns: usize,
-    /// Column types for buffer layout (Variable columns need 2 buffers: data + offsets)
-    #[allow(dead_code)]
+    /// Column types for buffer layout (Variable columns need 2 buffers: offsets + data)
     column_types: Vec<ColumnType>,
+    /// Buffer slot mapping: column index -> buffer indices
+    buffer_slots: Vec<BufferSlot>,
+    /// Total number of output buffers needed (accounts for variable-length types needing 2)
+    total_buffers: usize,
 }
 
 /// Decode operation for a single field
@@ -124,8 +127,24 @@ enum FieldOp {
 pub enum ColumnType {
     /// Fixed-size column: single data buffer
     Fixed,
-    /// Variable-size column: data buffer + offsets buffer
+    /// Variable-size column: offsets buffer + data buffer
     Variable,
+}
+
+/// Buffer slot descriptor for a schema column
+#[derive(Debug, Clone, Copy)]
+pub struct BufferSlot {
+    /// Index of the primary buffer in the output_ptrs array
+    /// For fixed-size: this is the data buffer
+    /// For variable-size: this is the offsets buffer
+    pub primary: usize,
+    /// Index of the secondary buffer (data) for variable-length types
+    /// None for fixed-size types
+    pub secondary: Option<usize>,
+    /// Element size in bytes for computing offsets
+    /// For Bytes/String: 1 (offsets are byte positions)
+    /// For List/Map: element size (offsets are element indices)
+    pub element_size: i64,
 }
 
 /// Output buffer specification with capacity for bounds checking
@@ -222,19 +241,48 @@ impl JitDecoder {
         builder.def_var(cursor_var, zero);
         builder.def_var(row_var, zero);
 
-        // Create output position variables for each column
-        let mut output_vars = Vec::with_capacity(num_columns);
-        for _i in 0..num_columns {
-            let var = builder.declare_var(types::I64);
-            builder.def_var(var, zero);
-            output_vars.push(var);
-        }
-
-        // Analyze schema to get field operations
+        // Analyze schema to get field operations FIRST (needed for buffer slot computation)
         let field_ops: Vec<FieldOp> = schema.fields()
             .iter()
             .map(|f| Self::field_to_op(f))
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Compute column types and buffer slots
+        let column_types: Vec<ColumnType> = field_ops.iter().map(Self::op_to_column_type).collect();
+
+        // Build buffer slot mapping: variable-length columns get 2 consecutive buffers (offsets, data)
+        let mut buffer_slots = Vec::with_capacity(num_columns);
+        let mut buffer_idx = 0usize;
+        for (col_type, field_op) in column_types.iter().zip(field_ops.iter()) {
+            let element_size = Self::op_to_element_size(field_op);
+            match col_type {
+                ColumnType::Fixed => {
+                    buffer_slots.push(BufferSlot {
+                        primary: buffer_idx,
+                        secondary: None,
+                        element_size,
+                    });
+                    buffer_idx += 1;
+                }
+                ColumnType::Variable => {
+                    buffer_slots.push(BufferSlot {
+                        primary: buffer_idx,     // offsets buffer
+                        secondary: Some(buffer_idx + 1), // data buffer
+                        element_size,
+                    });
+                    buffer_idx += 2;
+                }
+            }
+        }
+        let total_buffers = buffer_idx;
+
+        // Create output position variables for each BUFFER (not column)
+        let mut output_vars = Vec::with_capacity(total_buffers);
+        for _i in 0..total_buffers {
+            let var = builder.declare_var(types::I64);
+            builder.def_var(var, zero);
+            output_vars.push(var);
+        }
 
         // Create error block (returns -1 on input bounds violation)
         let error_block = builder.create_block();
@@ -261,10 +309,11 @@ impl JitDecoder {
 
         // Generate decode code for each field
         for (col_idx, op) in field_ops.iter().enumerate() {
+            let buffer_slot = &buffer_slots[col_idx];
             Self::emit_field_decode(
                 &mut builder,
                 op,
-                col_idx,
+                buffer_slot,
                 input_ptr,
                 input_len,
                 output_ptrs,
@@ -287,8 +336,45 @@ impl JitDecoder {
         // Jump back to loop header
         builder.ins().jump(loop_header, &[]);
 
-        // Loop exit: return cursor position (bytes consumed)
+        // Loop exit: write final offsets for variable-length columns, then return cursor position
         builder.switch_to_block(loop_exit);
+
+        // For each variable-length column, write the final offset (offset[row_count])
+        // For Bytes/String: offset = total_bytes (element_size = 1)
+        // For List/Map: offset = total_element_count (element_size = sizeof(element))
+        for slot in &buffer_slots {
+            if let Some(data_buf_idx) = slot.secondary {
+                // This is a variable-length column
+                let buf_idx = slot.primary; // offsets buffer index
+
+                // Load offsets buffer pointer
+                let buf_offset = builder.ins().iconst(ptr_type, (buf_idx * 8) as i64);
+                let offsets_ptr_addr = builder.ins().iadd(output_ptrs, buf_offset);
+                let offsets_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), offsets_ptr_addr, 0);
+
+                // Get current offset write position (which is row_count * 4 after the loop)
+                let offset_pos = builder.use_var(output_vars[buf_idx]);
+                let offset_write_ptr = builder.ins().iadd(offsets_ptr, offset_pos);
+
+                // Get final data position from the data buffer position tracker
+                let data_pos = builder.use_var(output_vars[data_buf_idx]);
+
+                // Convert byte position to element count if needed
+                // For Bytes: element_size=1, so final_offset = data_pos
+                // For List/Map: final_offset = data_pos / element_size
+                let final_offset = if slot.element_size == 1 {
+                    builder.ins().ireduce(types::I32, data_pos)
+                } else {
+                    let element_size_val = builder.ins().iconst(types::I64, slot.element_size);
+                    let element_count = builder.ins().udiv(data_pos, element_size_val);
+                    builder.ins().ireduce(types::I32, element_count)
+                };
+
+                // Write final offset (offset[row_count] = total_element_count)
+                builder.ins().store(MemFlags::trusted(), final_offset, offset_write_ptr, 0);
+            }
+        }
+
         let final_cursor = builder.use_var(cursor_var);
         builder.ins().return_(&[final_cursor]);
 
@@ -328,15 +414,15 @@ impl JitDecoder {
         let decode_fn: unsafe extern "C" fn(*const u8, usize, *mut *mut u8, *const usize, usize) -> i64 =
             unsafe { std::mem::transmute(code_ptr) };
 
-        // Compute column types
-        let column_types: Vec<ColumnType> = field_ops.iter().map(Self::op_to_column_type).collect();
-
+        // buffer_slots, column_types, and total_buffers were computed earlier in compile()
         Ok(JitDecoder {
             decode_fn,
             _module: SyncJitModule(ManuallyDrop::new(module)),
             schema: schema.clone(),
             num_columns,
             column_types,
+            buffer_slots,
+            total_buffers,
         })
     }
 
@@ -347,6 +433,31 @@ impl JitDecoder {
                 ColumnType::Variable
             }
             _ => ColumnType::Fixed,
+        }
+    }
+
+    /// Get element size for computing offsets
+    /// Returns 1 for Bytes/String (byte offsets), element size for List/Map (element indices)
+    fn op_to_element_size(op: &FieldOp) -> i64 {
+        match op {
+            // Bytes/String: offsets are byte positions
+            FieldOp::Bytes { .. } => 1,
+            // List: element size depends on inner type
+            FieldOp::List { element, .. } => Self::element_op_size(element),
+            // Map: value size (keys are skipped)
+            FieldOp::Map { value, .. } => Self::element_op_size(value),
+            // Fixed-size types: not used for offsets
+            _ => 1,
+        }
+    }
+
+    /// Get byte size of element type
+    fn element_op_size(op: &FieldOp) -> i64 {
+        match op {
+            FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
+            FieldOp::Int32 { .. } | FieldOp::Float32 { .. } | FieldOp::Enum { .. } => 4,
+            FieldOp::Boolean { .. } => 1,
+            _ => 8, // Default for complex types
         }
     }
 
@@ -426,7 +537,7 @@ impl JitDecoder {
     fn emit_field_decode(
         builder: &mut FunctionBuilder,
         op: &FieldOp,
-        col_idx: usize,
+        buffer_slot: &BufferSlot,
         input_ptr: Value,
         input_len: Value,
         output_ptrs: Value,
@@ -438,16 +549,20 @@ impl JitDecoder {
         error_block: Block,
         output_overflow_block: Block,
     ) {
-        // Load output pointer for this column
-        let col_offset = builder.ins().iconst(ptr_type, (col_idx * 8) as i64);
-        let output_ptr_addr = builder.ins().iadd(output_ptrs, col_offset);
+        // For fixed-size types, use primary buffer only
+        // For variable-size types (Bytes), use primary=offsets, secondary=data
+        let buf_idx = buffer_slot.primary;
+
+        // Load primary output pointer
+        let buf_offset = builder.ins().iconst(ptr_type, (buf_idx * 8) as i64);
+        let output_ptr_addr = builder.ins().iadd(output_ptrs, buf_offset);
         let output_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), output_ptr_addr, 0);
-        let output_pos = builder.use_var(output_vars[col_idx]);
+        let output_pos = builder.use_var(output_vars[buf_idx]);
         let output_write_ptr = builder.ins().iadd(output_ptr, output_pos);
 
-        // Load output capacity for this column (for variable-length bounds checking)
-        let output_cap_addr = builder.ins().iadd(output_caps, col_offset);
-        let output_capacity = builder.ins().load(types::I64, MemFlags::trusted(), output_cap_addr, 0);
+        // Load primary output capacity (for bounds checking)
+        let output_cap_addr = builder.ins().iadd(output_caps, buf_offset);
+        let _output_capacity = builder.ins().load(types::I64, MemFlags::trusted(), output_cap_addr, 0);
 
         match op {
             FieldOp::Int32 { nullable } => {
@@ -485,7 +600,7 @@ impl JitDecoder {
 
                     let four = builder.ins().iconst(types::I64, 4);
                     let new_output_pos = builder.ins().iadd(output_pos, four);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 } else {
                     let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i32(builder, value);
@@ -493,7 +608,7 @@ impl JitDecoder {
                     builder.def_var(cursor_var, new_cursor);
                     let four = builder.ins().iconst(types::I64, 4);
                     let new_output_pos = builder.ins().iadd(output_pos, four);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 }
             }
             FieldOp::Int64 { nullable } => {
@@ -535,7 +650,7 @@ impl JitDecoder {
                     // Update output position (same for both branches)
                     let eight = builder.ins().iconst(types::I64, 8);
                     let new_output_pos = builder.ins().iadd(output_pos, eight);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 } else {
                     let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i64(builder, value);
@@ -543,7 +658,7 @@ impl JitDecoder {
                     builder.def_var(cursor_var, new_cursor);
                     let eight = builder.ins().iconst(types::I64, 8);
                     let new_output_pos = builder.ins().iadd(output_pos, eight);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 }
             }
             FieldOp::Float32 { nullable } => {
@@ -583,7 +698,7 @@ impl JitDecoder {
 
                     let four = builder.ins().iconst(types::I64, 4);
                     let new_output_pos = builder.ins().iadd(output_pos, four);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 } else {
                     let cursor = builder.use_var(cursor_var);
                     Self::emit_fixed_bounds_check(builder, cursor, 4, input_len, error_block);
@@ -594,7 +709,7 @@ impl JitDecoder {
                     let new_cursor = builder.ins().iadd(cursor, four);
                     builder.def_var(cursor_var, new_cursor);
                     let new_output_pos = builder.ins().iadd(output_pos, four);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 }
             }
             FieldOp::Float64 { nullable } => {
@@ -634,7 +749,7 @@ impl JitDecoder {
 
                     let eight = builder.ins().iconst(types::I64, 8);
                     let new_output_pos = builder.ins().iadd(output_pos, eight);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 } else {
                     let cursor = builder.use_var(cursor_var);
                     Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
@@ -645,7 +760,7 @@ impl JitDecoder {
                     let new_cursor = builder.ins().iadd(cursor, eight);
                     builder.def_var(cursor_var, new_cursor);
                     let new_output_pos = builder.ins().iadd(output_pos, eight);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 }
             }
             FieldOp::Boolean { nullable } => {
@@ -685,7 +800,7 @@ impl JitDecoder {
 
                     let one = builder.ins().iconst(types::I64, 1);
                     let new_output_pos = builder.ins().iadd(output_pos, one);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 } else {
                     let cursor = builder.use_var(cursor_var);
                     Self::emit_fixed_bounds_check(builder, cursor, 1, input_len, error_block);
@@ -696,10 +811,29 @@ impl JitDecoder {
                     let new_cursor = builder.ins().iadd(cursor, one);
                     builder.def_var(cursor_var, new_cursor);
                     let new_output_pos = builder.ins().iadd(output_pos, one);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 }
             }
             FieldOp::Bytes { nullable } => {
+                // Bytes uses dual buffers:
+                // - primary (buf_idx) = offsets buffer (i32 per row)
+                // - secondary = data buffer (actual bytes)
+                let data_buf_idx = buffer_slot.secondary.expect("Bytes type must have secondary buffer");
+
+                // Load data buffer pointer and position
+                let data_buf_offset = builder.ins().iconst(ptr_type, (data_buf_idx * 8) as i64);
+                let data_ptr_addr = builder.ins().iadd(output_ptrs, data_buf_offset);
+                let data_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), data_ptr_addr, 0);
+                let data_pos = builder.use_var(output_vars[data_buf_idx]);
+                let data_write_ptr = builder.ins().iadd(data_ptr, data_pos);
+
+                // Load data buffer capacity
+                let data_cap_addr = builder.ins().iadd(output_caps, data_buf_offset);
+                let data_capacity = builder.ins().load(types::I64, MemFlags::trusted(), data_cap_addr, 0);
+
+                // output_write_ptr points to offsets buffer (already set up above)
+                // output_capacity is offsets buffer capacity
+
                 if *nullable {
                     let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
@@ -713,25 +847,64 @@ impl JitDecoder {
 
                     builder.ins().brif(is_null, null_block, &[], value_block, &[]);
 
-                    // Null block: no data written, output position unchanged
+                    // Null block: write current data_pos as offset (same as previous), increment offset pos
                     builder.switch_to_block(null_block);
+                    {
+                        // Write offset (data_pos as i32)
+                        let data_pos_null = builder.use_var(output_vars[data_buf_idx]);
+                        let offset_i32 = builder.ins().ireduce(types::I32, data_pos_null);
+                        let offset_pos_null = builder.use_var(output_vars[buf_idx]);
+                        let offset_write_ptr_null = builder.ins().iadd(output_ptr, offset_pos_null);
+                        builder.ins().store(MemFlags::trusted(), offset_i32, offset_write_ptr_null, 0);
+                        // Advance offsets position by 4 (one i32)
+                        let four = builder.ins().iconst(types::I64, 4);
+                        let offset_pos_curr = builder.use_var(output_vars[buf_idx]);
+                        let new_offset_pos = builder.ins().iadd(offset_pos_curr, four);
+                        builder.def_var(output_vars[buf_idx], new_offset_pos);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
-                    // Value block: decode bytes normally
+                    // Value block: write offset, decode bytes, update positions
                     builder.switch_to_block(value_block);
-                    let (len_raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
-                    builder.def_var(cursor_var, new_cursor);
-                    let len = Self::emit_zigzag_decode_i64(builder, len_raw);
-                    let cursor = builder.use_var(cursor_var);
-                    // Input bounds check: len >= 0 and cursor + len <= input_len
-                    Self::emit_variable_bounds_check(builder, cursor, len, input_len, error_block);
-                    // Output bounds check: output_pos + len <= output_capacity
-                    Self::emit_output_bounds_check(builder, output_pos, len, output_capacity, output_overflow_block);
-                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, len, memcpy_func_ref);
-                    let new_cursor = builder.ins().iadd(cursor, len);
-                    builder.def_var(cursor_var, new_cursor);
-                    let new_output_pos = builder.ins().iadd(output_pos, len);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    {
+                        // Write current offset (data_pos as i32) BEFORE copying data
+                        let data_pos_val = builder.use_var(output_vars[data_buf_idx]);
+                        let offset_i32 = builder.ins().ireduce(types::I32, data_pos_val);
+                        let offset_pos_val = builder.use_var(output_vars[buf_idx]);
+                        let offset_write_ptr_val = builder.ins().iadd(output_ptr, offset_pos_val);
+                        builder.ins().store(MemFlags::trusted(), offset_i32, offset_write_ptr_val, 0);
+
+                        // Advance offsets position by 4
+                        let four = builder.ins().iconst(types::I64, 4);
+                        let offset_pos_curr = builder.use_var(output_vars[buf_idx]);
+                        let new_offset_pos = builder.ins().iadd(offset_pos_curr, four);
+                        builder.def_var(output_vars[buf_idx], new_offset_pos);
+
+                        // Decode bytes length
+                        let (len_raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
+                        builder.def_var(cursor_var, new_cursor);
+                        let len = Self::emit_zigzag_decode_i64(builder, len_raw);
+                        let cursor = builder.use_var(cursor_var);
+
+                        // Input bounds check: len >= 0 and cursor + len <= input_len
+                        Self::emit_variable_bounds_check(builder, cursor, len, input_len, error_block);
+
+                        // Output bounds check for DATA buffer
+                        let cur_data_pos = builder.use_var(output_vars[data_buf_idx]);
+                        Self::emit_output_bounds_check(builder, cur_data_pos, len, data_capacity, output_overflow_block);
+
+                        // Copy data to data buffer
+                        let cur_data_write = builder.ins().iadd(data_ptr, cur_data_pos);
+                        Self::emit_memcpy(builder, input_ptr, cursor, cur_data_write, len, memcpy_func_ref);
+
+                        // Advance input cursor
+                        let new_cursor = builder.ins().iadd(cursor, len);
+                        builder.def_var(cursor_var, new_cursor);
+
+                        // Advance data position
+                        let new_data_pos = builder.ins().iadd(cur_data_pos, len);
+                        builder.def_var(output_vars[data_buf_idx], new_data_pos);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -739,32 +912,39 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    // Read length as varint (returns raw zigzag value)
+                    // Non-nullable: write offset, decode bytes, update positions
+
+                    // Write current offset (data_pos as i32) BEFORE copying data
+                    let offset_i32 = builder.ins().ireduce(types::I32, data_pos);
+                    builder.ins().store(MemFlags::trusted(), offset_i32, output_write_ptr, 0);
+
+                    // Advance offsets position by 4
+                    let four = builder.ins().iconst(types::I64, 4);
+                    let new_offset_pos = builder.ins().iadd(output_pos, four);
+                    builder.def_var(output_vars[buf_idx], new_offset_pos);
+
+                    // Decode bytes length
                     let (len_raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, new_cursor);
-
-                    // Zigzag decode the length
                     let len = Self::emit_zigzag_decode_i64(builder, len_raw);
-
-                    // Get cursor position for memcpy source offset
                     let cursor = builder.use_var(cursor_var);
 
                     // Input bounds check: len >= 0 and cursor + len <= input_len
                     Self::emit_variable_bounds_check(builder, cursor, len, input_len, error_block);
 
-                    // Output bounds check: output_pos + len <= output_capacity
-                    Self::emit_output_bounds_check(builder, output_pos, len, output_capacity, output_overflow_block);
+                    // Output bounds check for DATA buffer
+                    Self::emit_output_bounds_check(builder, data_pos, len, data_capacity, output_overflow_block);
 
-                    // Emit byte copy loop
-                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, len, memcpy_func_ref);
+                    // Copy data to data buffer
+                    Self::emit_memcpy(builder, input_ptr, cursor, data_write_ptr, len, memcpy_func_ref);
 
-                    // Advance input cursor by length
+                    // Advance input cursor
                     let new_cursor = builder.ins().iadd(cursor, len);
                     builder.def_var(cursor_var, new_cursor);
 
-                    // Update data position by length
-                    let new_output_pos = builder.ins().iadd(output_pos, len);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    // Advance data position
+                    let new_data_pos = builder.ins().iadd(data_pos, len);
+                    builder.def_var(output_vars[data_buf_idx], new_data_pos);
                 }
             }
             FieldOp::Fixed { size, nullable } => {
@@ -802,7 +982,7 @@ impl JitDecoder {
                     builder.switch_to_block(continue_block);
 
                     let new_output_pos = builder.ins().iadd(output_pos, size_val);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 } else {
                     let cursor = builder.use_var(cursor_var);
                     Self::emit_fixed_bounds_check(builder, cursor, *size as i64, input_len, error_block);
@@ -810,7 +990,7 @@ impl JitDecoder {
                     let new_cursor = builder.ins().iadd(cursor, size_val);
                     builder.def_var(cursor_var, new_cursor);
                     let new_output_pos = builder.ins().iadd(output_pos, size_val);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 }
             }
             FieldOp::Struct { fields: child_ops, nullable } => {
@@ -834,7 +1014,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_struct_decode(builder, child_ops, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_struct_decode(builder, child_ops, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, buf_idx, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -842,7 +1022,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_struct_decode(builder, child_ops, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_struct_decode(builder, child_ops, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, buf_idx, error_block);
                 }
             }
             FieldOp::Enum { nullable } => {
@@ -881,7 +1061,7 @@ impl JitDecoder {
 
                     let four = builder.ins().iconst(types::I64, 4);
                     let new_output_pos = builder.ins().iadd(output_pos, four);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 } else {
                     let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     // Enum indices are stored directly (no zigzag)
@@ -890,7 +1070,7 @@ impl JitDecoder {
                     builder.def_var(cursor_var, new_cursor);
                     let four = builder.ins().iconst(types::I64, 4);
                     let new_output_pos = builder.ins().iadd(output_pos, four);
-                    builder.def_var(output_vars[col_idx], new_output_pos);
+                    builder.def_var(output_vars[buf_idx], new_output_pos);
                 }
             }
             FieldOp::List { element, nullable } => {
@@ -924,7 +1104,7 @@ impl JitDecoder {
 
                     // Value block: decode list
                     builder.switch_to_block(value_block);
-                    Self::emit_list_decode(builder, element, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_list_decode(builder, element, buffer_slot, input_ptr, input_len, output_ptrs, output_caps, cursor_var, output_vars, ptr_type, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -932,7 +1112,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_list_decode(builder, element, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_list_decode(builder, element, buffer_slot, input_ptr, input_len, output_ptrs, output_caps, cursor_var, output_vars, ptr_type, error_block);
                 }
             }
             FieldOp::Map { value, nullable } => {
@@ -958,7 +1138,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_map_decode(builder, value, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_map_decode(builder, value, buffer_slot, input_ptr, input_len, output_ptrs, output_caps, cursor_var, output_vars, ptr_type, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -966,7 +1146,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_map_decode(builder, value, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_map_decode(builder, value, buffer_slot, input_ptr, input_len, output_ptrs, output_caps, cursor_var, output_vars, ptr_type, error_block);
                 }
             }
             FieldOp::Union { variants, type_ids, nullable } => {
@@ -991,7 +1171,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, buf_idx, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -999,7 +1179,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, buf_idx, error_block);
                 }
             }
             FieldOp::FixedSizeList { element, size, nullable } => {
@@ -1021,7 +1201,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, buf_idx, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1029,7 +1209,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
+                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, buf_idx, error_block);
                 }
             }
             FieldOp::Decimal128 { nullable, .. } => {
@@ -1070,7 +1250,7 @@ impl JitDecoder {
 
                 let size_const = builder.ins().iconst(types::I64, byte_size);
                 let new_output_pos = builder.ins().iadd(output_pos, size_const);
-                builder.def_var(output_vars[col_idx], new_output_pos);
+                builder.def_var(output_vars[buf_idx], new_output_pos);
             }
             FieldOp::Decimal256 { nullable, .. } => {
                 // Avro decimal: read as fixed 32 bytes (big-endian), convert to little-endian for Arrow
@@ -1112,7 +1292,7 @@ impl JitDecoder {
 
                 let size_const = builder.ins().iconst(types::I64, byte_size);
                 let new_output_pos = builder.ins().iadd(output_pos, size_const);
-                builder.def_var(output_vars[col_idx], new_output_pos);
+                builder.def_var(output_vars[buf_idx], new_output_pos);
             }
             FieldOp::Duration { nullable } => {
                 // Duration: read as i64 (same as Int64)
@@ -1154,7 +1334,7 @@ impl JitDecoder {
 
                 let eight = builder.ins().iconst(types::I64, 8);
                 let new_output_pos = builder.ins().iadd(output_pos, eight);
-                builder.def_var(output_vars[col_idx], new_output_pos);
+                builder.def_var(output_vars[buf_idx], new_output_pos);
             }
             FieldOp::Interval { unit, nullable } => {
                 // Interval: depends on unit type
@@ -1197,7 +1377,7 @@ impl JitDecoder {
 
                 let size_const = builder.ins().iconst(types::I64, byte_size);
                 let new_output_pos = builder.ins().iadd(output_pos, size_const);
-                builder.def_var(output_vars[col_idx], new_output_pos);
+                builder.def_var(output_vars[buf_idx], new_output_pos);
             }
         }
     }
@@ -1215,7 +1395,7 @@ impl JitDecoder {
         output_write_ptr: Value,
         output_pos: Value,
         output_vars: &[Variable],
-        col_idx: usize,
+        buf_idx: usize,
         error_block: Block,
     ) {
         // Track bytes written across all child fields
@@ -1294,7 +1474,7 @@ impl JitDecoder {
         // Update final output position
         let final_bytes = builder.use_var(struct_bytes_var);
         let new_output_pos = builder.ins().iadd(output_pos, final_bytes);
-        builder.def_var(output_vars[col_idx], new_output_pos);
+        builder.def_var(output_vars[buf_idx], new_output_pos);
     }
 
     /// Emit Cranelift IR for Avro map decoding
@@ -1305,19 +1485,31 @@ impl JitDecoder {
     /// 3. For each entry: read string key, then read value
     /// 4. Repeat until count = 0
     ///
-    /// This implementation stores only the values (keys are skipped)
+    /// Emit Cranelift IR for Avro map decoding with dual buffer output
+    ///
+    /// Arrow MapArray format requires:
+    /// - offsets buffer (i32): [0, count_of_map_0, count_of_map_0 + count_of_map_1, ...]
+    /// - data buffer: concatenated values (keys are skipped in this simplified impl)
+    ///
+    /// buffer_slot.primary = offsets buffer index
+    /// buffer_slot.secondary = data buffer index
     fn emit_map_decode(
         builder: &mut FunctionBuilder,
         value_op: &FieldOp,
+        buffer_slot: &BufferSlot,
         input_ptr: Value,
         input_len: Value,
+        output_ptrs: Value,
+        _output_caps: Value,
         cursor_var: Variable,
-        output_write_ptr: Value,
-        output_pos: Value,
         output_vars: &[Variable],
-        col_idx: usize,
+        ptr_type: Type,
         error_block: Block,
     ) {
+        // Get buffer indices
+        let offsets_buf_idx = buffer_slot.primary;
+        let data_buf_idx = buffer_slot.secondary.expect("Map type must have secondary buffer for data");
+
         // Get value size based on type
         let value_size: i64 = match value_op {
             FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
@@ -1326,10 +1518,31 @@ impl JitDecoder {
             _ => 8,
         };
 
-        // Create variable to track bytes written
-        let map_bytes_var = builder.declare_var(types::I64);
-        let zero = builder.ins().iconst(types::I64, 0);
-        builder.def_var(map_bytes_var, zero);
+        // Load data buffer pointer
+        let data_buf_offset = builder.ins().iconst(ptr_type, (data_buf_idx * 8) as i64);
+        let data_ptr_addr = builder.ins().iadd(output_ptrs, data_buf_offset);
+        let data_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), data_ptr_addr, 0);
+
+        // Load offsets buffer pointer
+        let offsets_buf_offset = builder.ins().iconst(ptr_type, (offsets_buf_idx * 8) as i64);
+        let offsets_ptr_addr = builder.ins().iadd(output_ptrs, offsets_buf_offset);
+        let offsets_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), offsets_ptr_addr, 0);
+
+        // Write initial offset (current element count, not byte position)
+        // Arrow offsets are element indices: offset[row_idx] = element_count so far
+        let offset_pos = builder.use_var(output_vars[offsets_buf_idx]);
+        let offset_write_ptr = builder.ins().iadd(offsets_ptr, offset_pos);
+        let data_pos = builder.use_var(output_vars[data_buf_idx]);
+        // Convert byte position to element count: element_count = data_pos / value_size
+        let value_size_val = builder.ins().iconst(types::I64, value_size);
+        let element_count = builder.ins().udiv(data_pos, value_size_val);
+        let offset_i32 = builder.ins().ireduce(types::I32, element_count);
+        builder.ins().store(MemFlags::trusted(), offset_i32, offset_write_ptr, 0);
+
+        // Advance offsets position by 4 (one i32)
+        let four = builder.ins().iconst(types::I64, 4);
+        let new_offset_pos = builder.ins().iadd(offset_pos, four);
+        builder.def_var(output_vars[offsets_buf_idx], new_offset_pos);
 
         // Block loop
         let block_header = builder.create_block();
@@ -1398,9 +1611,9 @@ impl JitDecoder {
         let new_cursor_after_key = builder.ins().iadd(cursor_after_key, key_len);
         builder.def_var(cursor_var, new_cursor_after_key);
 
-        // Decode value
-        let map_bytes_written = builder.use_var(map_bytes_var);
-        let value_write_ptr = builder.ins().iadd(output_write_ptr, map_bytes_written);
+        // Decode value to data buffer
+        let current_data_pos = builder.use_var(output_vars[data_buf_idx]);
+        let value_write_ptr = builder.ins().iadd(data_ptr, current_data_pos);
 
         match value_op {
             FieldOp::Int64 { nullable: false } => {
@@ -1450,10 +1663,11 @@ impl JitDecoder {
             }
         }
 
-        // Update bytes written
+        // Update data position
         let value_size_val = builder.ins().iconst(types::I64, value_size);
-        let new_bytes_written = builder.ins().iadd(map_bytes_written, value_size_val);
-        builder.def_var(map_bytes_var, new_bytes_written);
+        let current_data_pos_update = builder.use_var(output_vars[data_buf_idx]);
+        let new_data_pos = builder.ins().iadd(current_data_pos_update, value_size_val);
+        builder.def_var(output_vars[data_buf_idx], new_data_pos);
 
         // Increment entry index
         let one = builder.ins().iconst(types::I64, 1);
@@ -1466,11 +1680,9 @@ impl JitDecoder {
         builder.switch_to_block(entry_loop_exit);
         builder.ins().jump(block_header, &[]);
 
-        // Block exit
+        // Block exit: done decoding this map
+        // Note: final offset (offset[row_count]) is written in the main loop_exit block
         builder.switch_to_block(block_exit);
-        let final_bytes_written = builder.use_var(map_bytes_var);
-        let new_output_pos = builder.ins().iadd(output_pos, final_bytes_written);
-        builder.def_var(output_vars[col_idx], new_output_pos);
 
         // Seal all blocks
         builder.seal_block(skip_block);
@@ -1501,28 +1713,31 @@ impl JitDecoder {
         // Note: memcpy returns dest pointer which we don't need
     }
 
-    /// Emit Cranelift IR for Avro array/list decoding
+    /// Emit Cranelift IR for Avro list/array decoding with dual buffer output
     ///
-    /// Avro arrays use block encoding:
-    /// 1. Read block count (zigzag encoded)
-    /// 2. If count < 0, abs(count) is element count, skip byte size
-    /// 3. Decode elements
-    /// 4. Repeat until count = 0
+    /// Arrow ListArray format requires:
+    /// - offsets buffer (i32): [0, count_of_list_0, count_of_list_0 + count_of_list_1, ...]
+    /// - data buffer: concatenated element values
     ///
-    /// For simplicity, this implementation handles primitive element types
-    /// and stores just the flattened element data (not full Arrow ListArray format)
+    /// buffer_slot.primary = offsets buffer index
+    /// buffer_slot.secondary = data buffer index
     fn emit_list_decode(
         builder: &mut FunctionBuilder,
         element_op: &FieldOp,
+        buffer_slot: &BufferSlot,
         input_ptr: Value,
         input_len: Value,
+        output_ptrs: Value,
+        _output_caps: Value,
         cursor_var: Variable,
-        output_write_ptr: Value,  // Base + output_pos
-        output_pos: Value,
         output_vars: &[Variable],
-        col_idx: usize,
+        ptr_type: Type,
         error_block: Block,
     ) {
+        // Get buffer indices
+        let offsets_buf_idx = buffer_slot.primary;
+        let data_buf_idx = buffer_slot.secondary.expect("List type must have secondary buffer for data");
+
         // Get element size based on type
         let element_size: i64 = match element_op {
             FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
@@ -1531,10 +1746,31 @@ impl JitDecoder {
             _ => 8, // Default for complex types
         };
 
-        // Create variable to track bytes written (relative offset from output_write_ptr)
-        let list_bytes_var = builder.declare_var(types::I64);
-        let zero = builder.ins().iconst(types::I64, 0);
-        builder.def_var(list_bytes_var, zero);
+        // Load data buffer pointer
+        let data_buf_offset = builder.ins().iconst(ptr_type, (data_buf_idx * 8) as i64);
+        let data_ptr_addr = builder.ins().iadd(output_ptrs, data_buf_offset);
+        let data_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), data_ptr_addr, 0);
+
+        // Load offsets buffer pointer
+        let offsets_buf_offset = builder.ins().iconst(ptr_type, (offsets_buf_idx * 8) as i64);
+        let offsets_ptr_addr = builder.ins().iadd(output_ptrs, offsets_buf_offset);
+        let offsets_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), offsets_ptr_addr, 0);
+
+        // Write initial offset (current element count, not byte position)
+        // Arrow offsets are element indices: offset[row_idx] = element_count so far
+        let offset_pos = builder.use_var(output_vars[offsets_buf_idx]);
+        let offset_write_ptr = builder.ins().iadd(offsets_ptr, offset_pos);
+        let data_pos = builder.use_var(output_vars[data_buf_idx]);
+        // Convert byte position to element count: element_count = data_pos / element_size
+        let element_size_val = builder.ins().iconst(types::I64, element_size);
+        let element_count = builder.ins().udiv(data_pos, element_size_val);
+        let offset_i32 = builder.ins().ireduce(types::I32, element_count);
+        builder.ins().store(MemFlags::trusted(), offset_i32, offset_write_ptr, 0);
+
+        // Advance offsets position by 4 (one i32)
+        let four = builder.ins().iconst(types::I64, 4);
+        let new_offset_pos = builder.ins().iadd(offset_pos, four);
+        builder.def_var(output_vars[offsets_buf_idx], new_offset_pos);
 
         // Block loop: read count, decode elements, repeat until count=0
         let block_header = builder.create_block();
@@ -1601,10 +1837,9 @@ impl JitDecoder {
         // Element loop body: decode one element
         builder.switch_to_block(elem_loop_body);
 
-        // Calculate output pointer for this element
-        // output_write_ptr is base + output_pos, list_bytes_written is offset from there
-        let list_bytes_written = builder.use_var(list_bytes_var);
-        let elem_write_ptr = builder.ins().iadd(output_write_ptr, list_bytes_written);
+        // Calculate output pointer for this element in data buffer
+        let current_data_pos = builder.use_var(output_vars[data_buf_idx]);
+        let elem_write_ptr = builder.ins().iadd(data_ptr, current_data_pos);
 
         // Decode based on element type
         match element_op {
@@ -1655,10 +1890,11 @@ impl JitDecoder {
             }
         }
 
-        // Update list bytes written
+        // Update data position
         let elem_size_val = builder.ins().iconst(types::I64, element_size);
-        let new_bytes_written = builder.ins().iadd(list_bytes_written, elem_size_val);
-        builder.def_var(list_bytes_var, new_bytes_written);
+        let current_data_pos_update = builder.use_var(output_vars[data_buf_idx]);
+        let new_data_pos = builder.ins().iadd(current_data_pos_update, elem_size_val);
+        builder.def_var(output_vars[data_buf_idx], new_data_pos);
 
         // Increment element index
         let one = builder.ins().iconst(types::I64, 1);
@@ -1671,12 +1907,9 @@ impl JitDecoder {
         builder.switch_to_block(elem_loop_exit);
         builder.ins().jump(block_header, &[]);
 
-        // Block exit: update final output position
-        // output_pos + list_bytes_written = new output position
+        // Block exit: done decoding this list
+        // Note: final offset (offset[row_count]) is written in the main loop_exit block
         builder.switch_to_block(block_exit);
-        let final_bytes_written = builder.use_var(list_bytes_var);
-        let new_output_pos = builder.ins().iadd(output_pos, final_bytes_written);
-        builder.def_var(output_vars[col_idx], new_output_pos);
 
         // Seal all blocks
         builder.seal_block(skip_block);
@@ -1704,7 +1937,7 @@ impl JitDecoder {
         output_write_ptr: Value,
         output_pos: Value,
         output_vars: &[Variable],
-        col_idx: usize,
+        buf_idx: usize,
         error_block: Block,
     ) {
         // Read type index (varint, not zigzag encoded for union)
@@ -1720,7 +1953,7 @@ impl JitDecoder {
         // For now, we handle the common case of small unions
         if variants.is_empty() {
             // Empty union - shouldn't happen but handle gracefully
-            builder.def_var(output_vars[col_idx], output_pos);
+            builder.def_var(output_vars[buf_idx], output_pos);
             return;
         }
 
@@ -1850,7 +2083,7 @@ impl JitDecoder {
 
         let final_bytes = builder.use_var(union_bytes_var);
         let new_output_pos = builder.ins().iadd(output_pos, final_bytes);
-        builder.def_var(output_vars[col_idx], new_output_pos);
+        builder.def_var(output_vars[buf_idx], new_output_pos);
     }
 
     /// Emit Cranelift IR for fixed-size list decoding
@@ -1867,7 +2100,7 @@ impl JitDecoder {
         output_write_ptr: Value,
         output_pos: Value,
         output_vars: &[Variable],
-        col_idx: usize,
+        buf_idx: usize,
         error_block: Block,
     ) {
         // Get element size based on type
@@ -1969,7 +2202,7 @@ impl JitDecoder {
         builder.switch_to_block(loop_exit);
         let final_bytes = builder.use_var(list_bytes_var);
         let new_output_pos = builder.ins().iadd(output_pos, final_bytes);
-        builder.def_var(output_vars[col_idx], new_output_pos);
+        builder.def_var(output_vars[buf_idx], new_output_pos);
 
         // Seal blocks
         builder.seal_block(loop_header);
@@ -2281,7 +2514,9 @@ impl JitDecoder {
     ///
     /// # Arguments
     /// * `input` - Raw Avro bytes
-    /// * `output_buffers` - Mutable slice of output buffer pointers (one per column)
+    /// * `output_buffers` - Mutable slice of output buffer pointers
+    ///   For schemas with variable-length columns (Utf8, Binary), this needs
+    ///   `total_buffers()` buffers (2 per variable-length column: offsets + data)
     /// * `row_count` - Number of rows to decode
     ///
     /// # Returns
@@ -2298,17 +2533,37 @@ impl JitDecoder {
         output_buffers: &mut [*mut u8],
         row_count: usize,
     ) -> Result<usize, String> {
-        if output_buffers.len() != self.num_columns {
+        if output_buffers.len() != self.total_buffers {
             return Err(format!(
                 "Expected {} output buffers, got {}",
-                self.num_columns,
+                self.total_buffers,
                 output_buffers.len()
             ));
         }
 
         // Use maximum capacity for backward compatibility (essentially unlimited)
-        let output_capacities: Vec<usize> = vec![usize::MAX; self.num_columns];
+        let output_capacities: Vec<usize> = vec![usize::MAX; self.total_buffers];
 
+        self.decode_with_caps(input, output_buffers, &output_capacities, row_count)
+    }
+
+    /// Decode rows with explicit buffer capacities
+    ///
+    /// # Arguments
+    /// * `input` - Raw Avro bytes
+    /// * `output_buffers` - Mutable slice of output buffer pointers
+    /// * `output_capacities` - Capacity of each output buffer in bytes
+    /// * `row_count` - Number of rows to decode
+    ///
+    /// # Returns
+    /// Number of bytes consumed from input, or error
+    fn decode_with_caps(
+        &self,
+        input: &[u8],
+        output_buffers: &mut [*mut u8],
+        output_capacities: &[usize],
+        row_count: usize,
+    ) -> Result<usize, String> {
         // Use catch_unwind as additional safety net against any potential panics
         let decode_fn = self.decode_fn;
         let input_ptr = input.as_ptr();
@@ -2391,6 +2646,23 @@ impl JitDecoder {
         self.column_types.iter().any(|ct| *ct == ColumnType::Variable)
     }
 
+    /// Get the total number of output buffers needed
+    ///
+    /// This accounts for variable-length columns needing 2 buffers (offsets + data)
+    pub fn total_buffers(&self) -> usize {
+        self.total_buffers
+    }
+
+    /// Get the buffer slot for a column
+    pub fn buffer_slot(&self, col_idx: usize) -> Option<&BufferSlot> {
+        self.buffer_slots.get(col_idx)
+    }
+
+    /// Get the column type for a column
+    pub fn column_type(&self, col_idx: usize) -> Option<ColumnType> {
+        self.column_types.get(col_idx).copied()
+    }
+
     /// Decode Avro data with output buffer capacity validation
     ///
     /// This method validates that fixed-size columns have sufficient capacity
@@ -2400,6 +2672,7 @@ impl JitDecoder {
     /// # Arguments
     /// * `input` - Raw Avro bytes (without header/sync markers)
     /// * `output_buffers` - Output buffer specifications with pointers and capacities
+    ///   For variable-length columns (Utf8, Binary), provide 2 buffers: [offsets, data]
     /// * `row_count` - Number of rows to decode
     ///
     /// # Returns
@@ -2414,19 +2687,20 @@ impl JitDecoder {
         output_buffers: &[OutputBuffer],
         row_count: usize,
     ) -> Result<usize, String> {
-        if output_buffers.len() != self.num_columns {
+        if output_buffers.len() != self.total_buffers {
             return Err(format!(
                 "Expected {} output buffers, got {}",
-                self.num_columns,
+                self.total_buffers,
                 output_buffers.len()
             ));
         }
 
-        // Validate fixed-size column capacities
+        // Validate buffer capacities
         for (col_idx, field) in self.schema.fields().iter().enumerate() {
+            let slot = &self.buffer_slots[col_idx];
             if let Some(required) = Self::fixed_size_for_type(field.data_type()) {
                 let required_capacity = required * row_count;
-                let actual_capacity = output_buffers[col_idx].capacity;
+                let actual_capacity = output_buffers[slot.primary].capacity;
                 if actual_capacity < required_capacity {
                     return Err(format!(
                         "Column '{}' requires {} bytes ({} rows × {} bytes/row) but buffer has {} bytes capacity",
@@ -2434,15 +2708,69 @@ impl JitDecoder {
                     ));
                 }
             }
-            // For variable-length columns, caller is responsible for ensuring adequate capacity
-            // A future enhancement could add JIT-level bounds checking for these
+            // Validate variable-length column offsets buffer capacity
+            if slot.secondary.is_some() {
+                // Offsets buffer needs (row_count + 1) * 4 bytes for i32 offsets
+                let offsets_required = (row_count + 1) * 4;
+                let offsets_actual = output_buffers[slot.primary].capacity;
+                if offsets_actual < offsets_required {
+                    return Err(format!(
+                        "Column '{}' offsets buffer requires {} bytes ({} offsets × 4 bytes) but buffer has {} bytes capacity",
+                        field.name(), offsets_required, row_count + 1, offsets_actual
+                    ));
+                }
+            }
         }
 
-        // Extract pointers for the JIT function
+        // Extract pointers and capacities for the JIT function
         let mut ptrs: Vec<*mut u8> = output_buffers.iter().map(|b| b.ptr).collect();
+        let caps: Vec<usize> = output_buffers.iter().map(|b| b.capacity).collect();
 
-        // Call the underlying decode function
-        self.decode(input, &mut ptrs, row_count)
+        // Call the underlying decode function with capacities
+        let result = self.decode_with_caps(input, &mut ptrs, &caps, row_count)?;
+
+        // Write final offset for variable-length columns (total data length)
+        // The JIT writes offsets at positions [0, 4, 8, ...] up to row_count offsets
+        // We need to write one more offset at position row_count * 4
+        for (col_idx, slot) in self.buffer_slots.iter().enumerate() {
+            if let Some(data_buf_idx) = slot.secondary {
+                // Get the data buffer's final position (= total data length)
+                // This was tracked in output_vars[data_buf_idx] during decode
+                // We need to read it back from the offsets buffer's final written position
+                // Actually, we can compute it from the data buffer usage
+                // For now, we'll use a simpler approach: read the current offset position
+                // and write the final offset
+
+                // The offsets buffer has row_count offsets written at byte positions 0..row_count*4
+                // We need to write offset[row_count] = total_data_len
+                // The total_data_len is the current value of the data buffer position
+                // But we don't have direct access to that here...
+
+                // Alternative approach: the caller must write the final offset
+                // or we compute it from the offset buffer's current write position
+
+                // For proper Arrow StringArray, offsets[row_count] must be set
+                // Since we track data_pos in JIT, the final data_pos is total_data_len
+                // We can read the last written offset to see where it ended
+
+                // Actually, the JIT code writes offset BEFORE each string
+                // So for N rows, we have offsets at [0, 4, 8, ..., (N-1)*4]
+                // offset[i] = position where string i starts
+                // We need offset[N] = total_data_len (end of last string)
+
+                // The data buffer's current position after decode = total_data_len
+                // But we can't easily get that from here...
+
+                // Let's add a note that caller must handle final offset
+                // OR we change the JIT to write final offset after loop
+
+                // For now, skip - this is handled by the JIT writing offset before each copy
+                // The final offset will be computed based on the data buffer usage
+                let _ = (col_idx, data_buf_idx); // Suppress unused warning
+            }
+        }
+
+        Ok(result)
     }
 
     /// Decode Avro data directly to an Arrow RecordBatch
@@ -2461,15 +2789,32 @@ impl JitDecoder {
         input: &[u8],
         row_count: usize,
     ) -> Result<RecordBatch, ArrowError> {
-        // Estimate buffer sizes and allocate
-        let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(self.num_columns);
-        let mut buffer_ptrs: Vec<*mut u8> = Vec::with_capacity(self.num_columns);
+        // Allocate buffers based on column types (variable-length types need 2 buffers)
+        let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(self.total_buffers);
+        let mut buffer_ptrs: Vec<*mut u8> = Vec::with_capacity(self.total_buffers);
 
-        for field in self.schema.fields() {
-            let buffer_size = Self::estimate_buffer_size(field.data_type(), row_count);
-            let mut buffer = vec![0u8; buffer_size];
-            buffer_ptrs.push(buffer.as_mut_ptr());
-            buffers.push(buffer);
+        for (col_idx, (field, col_type)) in self.schema.fields().iter().zip(self.column_types.iter()).enumerate() {
+            match col_type {
+                ColumnType::Fixed => {
+                    let buffer_size = Self::estimate_buffer_size(field.data_type(), row_count);
+                    let mut buffer = vec![0u8; buffer_size];
+                    buffer_ptrs.push(buffer.as_mut_ptr());
+                    buffers.push(buffer);
+                }
+                ColumnType::Variable => {
+                    // First buffer: offsets (row_count + 1 i32 values)
+                    let offsets_size = (row_count + 1) * 4;
+                    let mut offsets_buffer = vec![0u8; offsets_size];
+                    buffer_ptrs.push(offsets_buffer.as_mut_ptr());
+                    buffers.push(offsets_buffer);
+
+                    // Second buffer: data (estimate based on type)
+                    let data_size = Self::estimate_variable_data_size(field.data_type(), row_count, col_idx);
+                    let mut data_buffer = vec![0u8; data_size];
+                    buffer_ptrs.push(data_buffer.as_mut_ptr());
+                    buffers.push(data_buffer);
+                }
+            }
         }
 
         // Run the JIT decoder
@@ -2482,9 +2827,21 @@ impl JitDecoder {
         // Convert raw buffers to Arrow arrays
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_columns);
 
-        for (i, field) in self.schema.fields().iter().enumerate() {
-            let buffer = std::mem::take(&mut buffers[i]);
-            let array = Self::buffer_to_array(field.data_type(), buffer, row_count)?;
+        for (col_idx, field) in self.schema.fields().iter().enumerate() {
+            let slot = &self.buffer_slots[col_idx];
+            let array = match slot.secondary {
+                None => {
+                    // Fixed-size type: single buffer
+                    let buffer = std::mem::take(&mut buffers[slot.primary]);
+                    Self::buffer_to_array(field.data_type(), buffer, row_count)?
+                }
+                Some(data_idx) => {
+                    // Variable-length type: offsets + data buffers
+                    let offsets_buffer = std::mem::take(&mut buffers[slot.primary]);
+                    let data_buffer = std::mem::take(&mut buffers[data_idx]);
+                    Self::variable_buffer_to_array(field.data_type(), offsets_buffer, data_buffer, row_count)?
+                }
+            };
             arrays.push(array);
         }
 
@@ -2508,6 +2865,98 @@ impl JitDecoder {
                 5 * row_count * Self::estimate_buffer_size(entries_field.data_type(), 1)
             }
             _ => row_count * 8, // Default
+        }
+    }
+
+    /// Estimate data buffer size for variable-length types
+    #[allow(unused_variables)]
+    fn estimate_variable_data_size(data_type: &DataType, row_count: usize, col_idx: usize) -> usize {
+        match data_type {
+            DataType::Utf8 | DataType::Binary => row_count * 128, // avg 128 bytes per string
+            DataType::List(elem_field) => {
+                // Estimate avg 10 elements per list
+                let elem_size = Self::estimate_element_size(elem_field.data_type());
+                row_count * 10 * elem_size
+            }
+            DataType::Map(entries_field, _) => {
+                // Estimate avg 5 entries per map
+                let entry_size = Self::estimate_buffer_size(entries_field.data_type(), 1);
+                row_count * 5 * entry_size
+            }
+            _ => row_count * 64, // Default for unknown variable types
+        }
+    }
+
+    /// Estimate element size for array types
+    fn estimate_element_size(data_type: &DataType) -> usize {
+        match data_type {
+            DataType::Boolean => 1,
+            DataType::Int32 | DataType::Float32 => 4,
+            DataType::Int64 | DataType::Float64 => 8,
+            _ => 8,
+        }
+    }
+
+    /// Convert variable-length buffers (offsets + data) to an Arrow array
+    fn variable_buffer_to_array(
+        data_type: &DataType,
+        offsets_buffer: Vec<u8>,
+        data_buffer: Vec<u8>,
+        row_count: usize,
+    ) -> Result<ArrayRef, ArrowError> {
+        match data_type {
+            DataType::Utf8 => {
+                // Build StringArray from offsets and data buffers
+                // Offsets are i32 values, data is UTF-8 bytes
+                let offsets_bytes = &offsets_buffer[..(row_count + 1) * 4];
+                let offsets_i32: Vec<i32> = offsets_bytes
+                    .chunks_exact(4)
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+
+                // Get actual data length from the last offset
+                let data_len = offsets_i32.last().copied().unwrap_or(0) as usize;
+                let data_slice = &data_buffer[..data_len];
+
+                // Safety: Validate UTF-8 and construct StringArray
+                // Use the safe constructor that validates UTF-8
+                let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets_i32));
+                let values = Buffer::from_slice_ref(data_slice);
+
+                // Validate UTF-8 by constructing through try_new
+                StringArray::try_new(offsets, values, None)
+                    .map(|arr| Arc::new(arr) as ArrayRef)
+            }
+            DataType::Binary => {
+                // Build BinaryArray from offsets and data buffers
+                let offsets_bytes = &offsets_buffer[..(row_count + 1) * 4];
+                let offsets_i32: Vec<i32> = offsets_bytes
+                    .chunks_exact(4)
+                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+
+                // Get actual data length from the last offset
+                let data_len = offsets_i32.last().copied().unwrap_or(0) as usize;
+                let data_slice = &data_buffer[..data_len];
+
+                let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets_i32));
+                let values = Buffer::from_slice_ref(data_slice);
+
+                BinaryArray::try_new(offsets, values, None)
+                    .map(|arr| Arc::new(arr) as ArrayRef)
+            }
+            DataType::List(_) | DataType::Map(_, _) => {
+                // TODO: Implement List and Map array construction
+                // For now, return error as these need more complex handling
+                Err(ArrowError::NotYetImplemented(format!(
+                    "JIT decode_to_batch does not yet support {:?} - use decode_checked with manual buffer handling",
+                    data_type
+                )))
+            }
+            _ => Err(ArrowError::NotYetImplemented(format!(
+                "JIT variable_buffer_to_array does not support {:?}",
+                data_type
+            ))),
         }
     }
 
@@ -2539,16 +2988,12 @@ impl JitDecoder {
                 let bools: Vec<bool> = buffer.iter().take(row_count).map(|&b| b != 0).collect();
                 Ok(Arc::new(BooleanArray::from(bools)))
             }
-            DataType::Utf8 => {
-                // For now, this is a placeholder - proper string handling needs offsets
-                // Return empty string array since we don't track offsets yet
-                let strings: Vec<&str> = vec![""; row_count];
-                Ok(Arc::new(StringArray::from(strings)))
-            }
-            DataType::Binary => {
-                // Similar placeholder for binary
-                let binaries: Vec<&[u8]> = vec![&[]; row_count];
-                Ok(Arc::new(BinaryArray::from_vec(binaries)))
+            DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Map(_, _) => {
+                // These variable-length types should be handled by variable_buffer_to_array
+                Err(ArrowError::InvalidArgumentError(format!(
+                    "Variable-length type {:?} should use variable_buffer_to_array",
+                    data_type
+                )))
             }
             _ => Err(ArrowError::NotYetImplemented(format!(
                 "JIT decoder does not yet support {:?}",
@@ -3078,18 +3523,35 @@ mod tests {
 
         let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
 
+        // Verify we need 2 buffers for Bytes type
+        assert_eq!(decoder.total_buffers(), 2);
+        let slot = decoder.buffer_slot(0).expect("buffer slot");
+        assert_eq!(slot.primary, 0);  // offsets buffer
+        assert_eq!(slot.secondary, Some(1));  // data buffer
+
         // Test a single bytes value
         let test_data = b"Hello, World!";
         let input = encode_avro_bytes(test_data);
+        let row_count = 1;
 
-        let mut output = vec![0u8; test_data.len() + 100]; // Extra space
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        // Buffer 0: offsets (row_count + 1 i32 values = 8 bytes for 1 row)
+        let mut offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 1: data
+        let mut data = vec![0u8; test_data.len() + 100];
 
-        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
 
-        // Verify the bytes were copied correctly
-        assert_eq!(&output[..test_data.len()], test_data);
+        // Verify offsets: [0, len]
+        let offset_0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset_1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        assert_eq!(offset_0, 0);
+        assert_eq!(offset_1, test_data.len() as i32);
+
+        // Verify the bytes were copied correctly to data buffer
+        assert_eq!(&data[..test_data.len()], test_data);
     }
 
     #[test]
@@ -3110,18 +3572,33 @@ mod tests {
         }
 
         let row_count = test_strings.len();
-        let mut output = vec![0u8; total_data_len + 100]; // Extra space
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        // Buffer 0: offsets (row_count + 1 i32 values)
+        let mut offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 1: data
+        let mut data = vec![0u8; total_data_len + 100];
+
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
 
         let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
 
-        // Verify the strings were copied in sequence
-        let mut offset = 0;
+        // Verify offsets are correct: [0, 5, 8, 15, 19] for ["Alice", "Bob", "Charlie", "Dave"]
+        let mut expected_offset = 0;
+        for (i, s) in test_strings.iter().enumerate() {
+            let offset_i = i32::from_le_bytes(offsets[i * 4..(i + 1) * 4].try_into().unwrap());
+            assert_eq!(offset_i, expected_offset as i32, "Offset {} mismatch", i);
+            expected_offset += s.len();
+        }
+        // Final offset
+        let offset_n = i32::from_le_bytes(offsets[row_count * 4..(row_count + 1) * 4].try_into().unwrap());
+        assert_eq!(offset_n, total_data_len as i32, "Final offset mismatch");
+
+        // Verify the strings were copied in sequence to data buffer
+        let mut data_offset = 0;
         for s in &test_strings {
-            let actual = &output[offset..offset + s.len()];
+            let actual = &data[data_offset..data_offset + s.len()];
             assert_eq!(actual, s.as_bytes(), "String mismatch: expected '{}', got '{:?}'", s, actual);
-            offset += s.len();
+            data_offset += s.len();
         }
     }
 
@@ -3135,20 +3612,32 @@ mod tests {
 
         // Empty bytes: length = 0
         let input = encode_avro_bytes(b"");
+        let row_count = 1;
 
-        let mut output = vec![0xFFu8; 100]; // Fill with sentinel
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        // Buffer 0: offsets (row_count + 1 i32 values)
+        let mut offsets = vec![0xFFu8; (row_count + 1) * 4];
+        // Buffer 1: data
+        let mut data = vec![0xFFu8; 100];
 
-        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, 1); // Just the length varint (0x00)
 
-        // Output should not have been modified
-        assert_eq!(output[0], 0xFF, "Output was modified for empty bytes");
+        // Verify offsets: [0, 0] for empty bytes
+        let offset_0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset_1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        assert_eq!(offset_0, 0);
+        assert_eq!(offset_1, 0);
+
+        // Data buffer should not have been written to
+        assert_eq!(data[0], 0xFF, "Data was modified for empty bytes");
     }
 
     #[test]
     fn test_roundtrip_bytes_with_int_column() {
         // Test mixed schema: Int64 + Bytes + Int32
+        // Buffer layout: [id (buf 0), name_offsets (buf 1), name_data (buf 2), count (buf 3)]
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
@@ -3156,6 +3645,18 @@ mod tests {
         ]));
 
         let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Verify buffer slots
+        assert_eq!(decoder.total_buffers(), 4);
+        let slot_id = decoder.buffer_slot(0).expect("id slot");
+        assert_eq!(slot_id.primary, 0);
+        assert!(slot_id.secondary.is_none());
+        let slot_name = decoder.buffer_slot(1).expect("name slot");
+        assert_eq!(slot_name.primary, 1);
+        assert_eq!(slot_name.secondary, Some(2));
+        let slot_count = decoder.buffer_slot(2).expect("count slot");
+        assert_eq!(slot_count.primary, 3);
+        assert!(slot_count.secondary.is_none());
 
         let row_count = 5;
         let names = ["Alice", "Bob", "Charlie", "Dave", "Eve"];
@@ -3170,12 +3671,14 @@ mod tests {
         }
 
         let mut output_id = vec![0u8; row_count * 8];
-        let mut output_name = vec![0u8; total_name_len + 100];
+        let mut output_name_offsets = vec![0u8; (row_count + 1) * 4];
+        let mut output_name_data = vec![0u8; total_name_len + 100];
         let mut output_count = vec![0u8; row_count * 4];
 
         let mut output_ptrs = vec![
             output_id.as_mut_ptr(),
-            output_name.as_mut_ptr(),
+            output_name_offsets.as_mut_ptr(),
+            output_name_data.as_mut_ptr(),
             output_count.as_mut_ptr(),
         ];
 
@@ -3188,12 +3691,23 @@ mod tests {
             assert_eq!(id, i as i64 * 100, "id mismatch at row {}", i);
         }
 
-        // Verify strings
-        let mut offset = 0;
+        // Verify name offsets
+        let mut expected_offset = 0;
         for (i, name) in names.iter().enumerate() {
-            let actual = &output_name[offset..offset + name.len()];
-            assert_eq!(actual, name.as_bytes(), "name mismatch at row {}", i);
-            offset += name.len();
+            let offset_i = i32::from_le_bytes(output_name_offsets[i * 4..(i + 1) * 4].try_into().unwrap());
+            assert_eq!(offset_i, expected_offset as i32, "name offset {} mismatch", i);
+            expected_offset += name.len();
+        }
+        // Final offset
+        let offset_n = i32::from_le_bytes(output_name_offsets[row_count * 4..(row_count + 1) * 4].try_into().unwrap());
+        assert_eq!(offset_n, total_name_len as i32, "name final offset mismatch");
+
+        // Verify name data
+        let mut data_offset = 0;
+        for (i, name) in names.iter().enumerate() {
+            let actual = &output_name_data[data_offset..data_offset + name.len()];
+            assert_eq!(actual, name.as_bytes(), "name data mismatch at row {}", i);
+            data_offset += name.len();
         }
 
         // Verify Int32 values
@@ -3214,15 +3728,26 @@ mod tests {
         // Test a longer string that requires multi-byte varint length
         let test_data: Vec<u8> = (0..500).map(|i| (i % 256) as u8).collect();
         let input = encode_avro_bytes(&test_data);
+        let row_count = 1;
 
-        let mut output = vec![0u8; test_data.len() + 100];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        // Buffer 0: offsets
+        let mut offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 1: data
+        let mut data = vec![0u8; test_data.len() + 100];
 
-        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
 
-        // Verify all 500 bytes were copied correctly
-        assert_eq!(&output[..test_data.len()], &test_data[..], "Long bytes mismatch");
+        // Verify offsets
+        let offset_0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset_1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        assert_eq!(offset_0, 0);
+        assert_eq!(offset_1, test_data.len() as i32);
+
+        // Verify all 500 bytes were copied correctly to data buffer
+        assert_eq!(&data[..test_data.len()], &test_data[..], "Long bytes mismatch");
     }
 
     /// Encode union tag for nullable field
@@ -3547,14 +4072,28 @@ mod tests {
 
         let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
 
+        // Verify we need 2 buffers for List type (offsets + data)
+        assert_eq!(decoder.total_buffers(), 2);
+
         // Empty array: single 0 byte
         let input = encode_avro_array_i64(&[]);
+        let row_count = 1;
 
-        let mut output = vec![0xFFu8; 100];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        // Buffer 0: offsets (row_count + 1 i32 values = 8 bytes for 1 row)
+        let mut offsets = vec![0xFFu8; (row_count + 1) * 4];
+        // Buffer 1: data
+        let mut data = vec![0xFFu8; 100];
 
-        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, 1); // Just the 0 terminator
+
+        // Verify offsets: [0, 0] for empty list
+        let offset_0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset_1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        assert_eq!(offset_0, 0);
+        assert_eq!(offset_1, 0); // No elements
     }
 
     #[test]
@@ -3572,16 +4111,27 @@ mod tests {
         // Array with elements: [10, 20, 30]
         let elements: Vec<i64> = vec![10, 20, 30];
         let input = encode_avro_array_i64(&elements);
+        let row_count = 1;
 
-        let mut output = vec![0u8; elements.len() * 8 + 100];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        // Buffer 0: offsets (row_count + 1 i32 values)
+        let mut offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 1: data (element_count * 8 bytes for i64)
+        let mut data = vec![0u8; elements.len() * 8 + 100];
 
-        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
 
-        // Verify elements
+        // Verify offsets: [0, 3] for a list with 3 elements (element count, not bytes)
+        let offset_0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset_1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        assert_eq!(offset_0, 0, "First offset should be 0");
+        assert_eq!(offset_1, elements.len() as i32, "Second offset should be element count");
+
+        // Verify elements in data buffer
         for (i, &expected) in elements.iter().enumerate() {
-            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            let actual = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(actual, expected, "Element mismatch at index {}", i);
         }
     }
@@ -3600,15 +4150,27 @@ mod tests {
 
         let elements: Vec<i32> = vec![1, 2, 3, 4, 5];
         let input = encode_avro_array_i32(&elements);
+        let row_count = 1;
 
-        let mut output = vec![0u8; elements.len() * 4 + 100];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        // Buffer 0: offsets (row_count + 1 i32 values)
+        let mut offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 1: data (element_count * 4 bytes for i32)
+        let mut data = vec![0u8; elements.len() * 4 + 100];
 
-        let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
 
+        // Verify offsets: [0, 5*4] for a list with 5 i32 elements
+        let offset_0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset_1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        assert_eq!(offset_0, 0, "First offset should be 0");
+        assert_eq!(offset_1, elements.len() as i32, "Second offset should be element count");
+
+        // Verify elements in data buffer
         for (i, &expected) in elements.iter().enumerate() {
-            let actual = i32::from_le_bytes(output[i * 4..(i + 1) * 4].try_into().unwrap());
+            let actual = i32::from_le_bytes(data[i * 4..(i + 1) * 4].try_into().unwrap());
             assert_eq!(actual, expected, "Element mismatch at index {}", i);
         }
     }
@@ -3629,6 +4191,7 @@ mod tests {
         let row1: Vec<i64> = vec![1, 2];
         let row2: Vec<i64> = vec![10, 20, 30];
         let row3: Vec<i64> = vec![100];
+        let row_count = 3;
 
         let mut input = Vec::new();
         input.extend(encode_avro_array_i64(&row1));
@@ -3636,16 +4199,31 @@ mod tests {
         input.extend(encode_avro_array_i64(&row3));
 
         let total_elements = row1.len() + row2.len() + row3.len();
-        let mut output = vec![0u8; total_elements * 8 + 100];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
 
-        let consumed = decoder.decode(&input, &mut output_ptrs, 3).expect("Decode failed");
+        // Buffer 0: offsets (row_count + 1 i32 values)
+        let mut offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 1: data
+        let mut data = vec![0u8; total_elements * 8 + 100];
+
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
 
-        // Verify all elements in order
+        // Verify offsets: [0, 16, 40, 48] for rows with 2, 3, 1 elements (all i64 = 8 bytes each)
+        let offset_0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset_1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        let offset_2 = i32::from_le_bytes(offsets[8..12].try_into().unwrap());
+        let offset_3 = i32::from_le_bytes(offsets[12..16].try_into().unwrap());
+        assert_eq!(offset_0, 0, "Offset 0 should be 0");
+        assert_eq!(offset_1, row1.len() as i32, "Offset 1 should be element count of row1");
+        assert_eq!(offset_2, (row1.len() + row2.len()) as i32, "Offset 2 should be cumulative element count");
+        assert_eq!(offset_3, total_elements as i32, "Offset 3 should be total element count");
+
+        // Verify all elements in order in data buffer
         let all_elements: Vec<i64> = [row1, row2, row3].concat();
         for (i, &expected) in all_elements.iter().enumerate() {
-            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            let actual = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(actual, expected, "Element mismatch at index {}", i);
         }
     }
@@ -3653,6 +4231,7 @@ mod tests {
     #[test]
     fn test_roundtrip_list_with_int_column() {
         // Mixed schema: Int64 + List<Int64>
+        // Buffer layout: [Int64 data] [List offsets] [List data]
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new(
@@ -3663,6 +4242,9 @@ mod tests {
         ]));
 
         let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Verify buffer count: 1 for Int64 + 2 for List = 3
+        assert_eq!(decoder.total_buffers(), 3);
 
         let row_count = 3;
         let ids: Vec<i64> = vec![100, 200, 300];
@@ -3679,12 +4261,18 @@ mod tests {
         }
 
         let total_elements: usize = lists.iter().map(|l| l.len()).sum();
+
+        // Buffer 0: Int64 data
         let mut output_id = vec![0u8; row_count * 8];
-        let mut output_list = vec![0u8; total_elements * 8 + 100];
+        // Buffer 1: List offsets (row_count + 1 i32 values)
+        let mut list_offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 2: List data
+        let mut list_data = vec![0u8; total_elements * 8 + 100];
 
         let mut output_ptrs = vec![
             output_id.as_mut_ptr(),
-            output_list.as_mut_ptr(),
+            list_offsets.as_mut_ptr(),
+            list_data.as_mut_ptr(),
         ];
 
         let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
@@ -3696,10 +4284,20 @@ mod tests {
             assert_eq!(actual, expected, "Id mismatch at row {}", i);
         }
 
-        // Verify list elements
+        // Verify list offsets
+        let offset_0 = i32::from_le_bytes(list_offsets[0..4].try_into().unwrap());
+        let offset_1 = i32::from_le_bytes(list_offsets[4..8].try_into().unwrap());
+        let offset_2 = i32::from_le_bytes(list_offsets[8..12].try_into().unwrap());
+        let offset_3 = i32::from_le_bytes(list_offsets[12..16].try_into().unwrap());
+        assert_eq!(offset_0, 0, "Offset 0 should be 0");
+        assert_eq!(offset_1, lists[0].len() as i32, "Offset 1 should be element count of list 0");
+        assert_eq!(offset_2, (lists[0].len() + lists[1].len()) as i32, "Offset 2 should be cumulative element count");
+        assert_eq!(offset_3, total_elements as i32, "Offset 3 should be total element count");
+
+        // Verify list elements in data buffer
         let all_elements: Vec<i64> = lists.into_iter().flatten().collect();
         for (i, &expected) in all_elements.iter().enumerate() {
-            let actual = i64::from_le_bytes(output_list[i * 8..(i + 1) * 8].try_into().unwrap());
+            let actual = i64::from_le_bytes(list_data[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(actual, expected, "List element mismatch at index {}", i);
         }
     }
@@ -3746,11 +4344,21 @@ mod tests {
         // Empty map
         let input = encode_avro_map_i64(&[]);
 
-        let mut output = vec![0xFFu8; 100];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        let row_count = 1;
+        // Buffer 0: offsets (row_count + 1 i32 values)
+        let mut offsets = vec![0xFFu8; (row_count + 1) * 4];
+        // Buffer 1: data (value_count * 8 bytes for i64)
+        let mut data = vec![0xFFu8; 100];
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
 
         let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
         assert_eq!(consumed, 1); // Just the 0 terminator
+
+        // Verify offsets: [0, 0] for empty map
+        let offset0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        assert_eq!(offset0, 0, "First offset should be 0");
+        assert_eq!(offset1, 0, "Second offset should be 0 for empty map");
     }
 
     #[test]
@@ -3776,16 +4384,25 @@ mod tests {
         let entries: Vec<(&str, i64)> = vec![("a", 100), ("bb", 200), ("ccc", 300)];
         let input = encode_avro_map_i64(&entries);
 
-        // Output buffer for values only
-        let mut output = vec![0u8; entries.len() * 8 + 100];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        let row_count = 1;
+        // Buffer 0: offsets (row_count + 1 i32 values)
+        let mut offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 1: data (value_count * 8 bytes for i64)
+        let mut data = vec![0u8; entries.len() * 8 + 100];
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
 
         let consumed = decoder.decode(&input, &mut output_ptrs, 1).expect("Decode failed");
         assert_eq!(consumed, input.len());
 
+        // Verify offsets: [0, 3] for 3 entries
+        let offset0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        assert_eq!(offset0, 0, "First offset should be 0");
+        assert_eq!(offset1, entries.len() as i32, "Second offset should be entry count");
+
         // Verify values (keys are skipped)
         for (i, &(_, expected_value)) in entries.iter().enumerate() {
-            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            let actual = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(actual, expected_value, "Value mismatch at index {}", i);
         }
     }
@@ -3819,19 +4436,33 @@ mod tests {
         input.extend(encode_avro_map_i64(&row2));
         input.extend(encode_avro_map_i64(&row3));
 
+        let row_count = 3;
         let total_entries = row1.len() + row2.len() + row3.len();
-        let mut output = vec![0u8; total_entries * 8 + 100];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        // Buffer 0: offsets (row_count + 1 i32 values)
+        let mut offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 1: data (value_count * 8 bytes for i64)
+        let mut data = vec![0u8; total_entries * 8 + 100];
+        let mut output_ptrs = vec![offsets.as_mut_ptr(), data.as_mut_ptr()];
 
-        let consumed = decoder.decode(&input, &mut output_ptrs, 3).expect("Decode failed");
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
+
+        // Verify offsets: [0, 1, 3, 3] for rows with 1, 2, 0 entries
+        let offset0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        let offset2 = i32::from_le_bytes(offsets[8..12].try_into().unwrap());
+        let offset3 = i32::from_le_bytes(offsets[12..16].try_into().unwrap());
+        assert_eq!(offset0, 0, "Offset 0 should be 0");
+        assert_eq!(offset1, 1, "Offset 1 should be 1");
+        assert_eq!(offset2, 3, "Offset 2 should be 3");
+        assert_eq!(offset3, 3, "Offset 3 should be 3 (empty row)");
 
         // Verify all values in order
         let all_values: Vec<i64> = [row1, row2, row3].iter()
             .flat_map(|entries| entries.iter().map(|(_, v)| *v))
             .collect();
         for (i, &expected) in all_values.iter().enumerate() {
-            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            let actual = i64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(actual, expected, "Value mismatch at index {}", i);
         }
     }
@@ -3870,12 +4501,17 @@ mod tests {
         }
 
         let total_entries: usize = maps.iter().map(|m| m.len()).sum();
+        // Buffer 0: Int64 data
         let mut output_id = vec![0u8; row_count * 8];
-        let mut output_map = vec![0u8; total_entries * 8 + 100];
+        // Buffer 1: Map offsets (row_count + 1 i32 values)
+        let mut map_offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 2: Map data (value_count * 8 bytes for i64)
+        let mut map_data = vec![0u8; total_entries * 8 + 100];
 
         let mut output_ptrs = vec![
             output_id.as_mut_ptr(),
-            output_map.as_mut_ptr(),
+            map_offsets.as_mut_ptr(),
+            map_data.as_mut_ptr(),
         ];
 
         let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
@@ -3887,12 +4523,20 @@ mod tests {
             assert_eq!(actual, expected, "Id mismatch at row {}", i);
         }
 
+        // Verify map offsets: [0, 2, 3] for rows with 2 and 1 entries
+        let offset0 = i32::from_le_bytes(map_offsets[0..4].try_into().unwrap());
+        let offset1 = i32::from_le_bytes(map_offsets[4..8].try_into().unwrap());
+        let offset2 = i32::from_le_bytes(map_offsets[8..12].try_into().unwrap());
+        assert_eq!(offset0, 0, "Offset 0 should be 0");
+        assert_eq!(offset1, 2, "Offset 1 should be 2");
+        assert_eq!(offset2, 3, "Offset 2 should be 3");
+
         // Verify map values
         let all_values: Vec<i64> = maps.iter()
             .flat_map(|entries| entries.iter().map(|(_, v)| *v))
             .collect();
         for (i, &expected) in all_values.iter().enumerate() {
-            let actual = i64::from_le_bytes(output_map[i * 8..(i + 1) * 8].try_into().unwrap());
+            let actual = i64::from_le_bytes(map_data[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(actual, expected, "Map value mismatch at index {}", i);
         }
     }
@@ -4506,7 +5150,7 @@ mod tests {
 
     #[test]
     fn test_decode_checked_bytes_variable_length_no_validation() {
-        // Variable-length columns (Bytes) are NOT validated at caller level
+        // Variable-length columns (Bytes) require 2 buffers (offsets + data)
         // They rely on JIT-level bounds checking
         let schema = Arc::new(Schema::new(vec![
             Field::new("v", DataType::Binary, false),
@@ -4514,17 +5158,31 @@ mod tests {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         let row_count = 1;
-        let mut output = vec![0u8; 100]; // Plenty of space
-        let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+        // Buffer 0: offsets (row_count + 1 i32 values)
+        let mut offsets = vec![0u8; (row_count + 1) * 4];
+        // Buffer 1: data
+        let mut data_buf = vec![0u8; 100];
+
+        let buffers = vec![
+            OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+        ];
 
         // Encode bytes: length (varint) + data
         let mut input = Vec::new();
-        let data = b"hello";
-        input.extend(encode_varint_i64(data.len() as i64));
-        input.extend_from_slice(data);
+        let test_data = b"hello";
+        input.extend(encode_varint_i64(test_data.len() as i64));
+        input.extend_from_slice(test_data);
 
         let result = decoder.decode_checked(&input, &buffers, row_count);
-        assert!(result.is_ok(), "Should succeed - variable length not validated at caller");
+        assert!(result.is_ok(), "Should succeed with dual buffers");
+
+        // Verify offsets and data
+        let offset_0 = i32::from_le_bytes(offsets[0..4].try_into().unwrap());
+        let offset_1 = i32::from_le_bytes(offsets[4..8].try_into().unwrap());
+        assert_eq!(offset_0, 0);
+        assert_eq!(offset_1, test_data.len() as i32);
+        assert_eq!(&data_buf[..test_data.len()], test_data);
     }
 
     #[test]
@@ -4620,5 +5278,112 @@ mod tests {
         assert_eq!(decoder.required_capacity(1, row_count), Some(40)); // 10 * 4
         // Variable column returns None
         assert_eq!(decoder.required_capacity(2, row_count), None);
+    }
+
+    // ============== decode_to_batch with Utf8/Binary ==============
+
+    #[test]
+    fn test_decode_to_batch_utf8() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        let test_strings = ["hello", "world", "rust", "avro"];
+        let row_count = test_strings.len();
+
+        // Encode strings as Avro bytes: length varint + UTF-8 bytes
+        let mut input = Vec::new();
+        for s in &test_strings {
+            input.extend(encode_varint_i64(s.len() as i64));
+            input.extend(s.as_bytes());
+        }
+
+        let batch = decoder.decode_to_batch(&input, row_count).expect("Decode to batch failed");
+
+        assert_eq!(batch.num_rows(), row_count);
+        assert_eq!(batch.num_columns(), 1);
+
+        let name_array = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        for (i, expected) in test_strings.iter().enumerate() {
+            assert_eq!(name_array.value(i), *expected, "String mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_decode_to_batch_binary() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data", DataType::Binary, false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        let test_binaries: Vec<&[u8]> = vec![
+            b"\x00\x01\x02",
+            b"\xff\xfe\xfd",
+            b"binary data",
+            b"",  // empty
+        ];
+        let row_count = test_binaries.len();
+
+        // Encode binaries as Avro bytes: length varint + raw bytes
+        let mut input = Vec::new();
+        for b in &test_binaries {
+            input.extend(encode_varint_i64(b.len() as i64));
+            input.extend(*b);
+        }
+
+        let batch = decoder.decode_to_batch(&input, row_count).expect("Decode to batch failed");
+
+        assert_eq!(batch.num_rows(), row_count);
+        assert_eq!(batch.num_columns(), 1);
+
+        let data_array = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
+        for (i, expected) in test_binaries.iter().enumerate() {
+            assert_eq!(data_array.value(i), *expected, "Binary mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_decode_to_batch_mixed_with_utf8() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("value", DataType::Float64, false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        let row_count = 3;
+        let ids = [100i64, 200, 300];
+        let names = ["alice", "bob", "charlie"];
+        let values = [1.5f64, 2.5, 3.5];
+
+        let mut input = Vec::new();
+        for i in 0..row_count {
+            // Int64 (varint encoded)
+            input.extend(encode_varint_i64(ids[i]));
+            // String (length varint + UTF-8 bytes)
+            input.extend(encode_varint_i64(names[i].len() as i64));
+            input.extend(names[i].as_bytes());
+            // Float64 (8 bytes little-endian)
+            input.extend(values[i].to_le_bytes());
+        }
+
+        let batch = decoder.decode_to_batch(&input, row_count).expect("Decode to batch failed");
+
+        assert_eq!(batch.num_rows(), row_count);
+        assert_eq!(batch.num_columns(), 3);
+
+        let id_array = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let name_array = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        let value_array = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
+
+        for i in 0..row_count {
+            assert_eq!(id_array.value(i), ids[i], "Id mismatch at row {}", i);
+            assert_eq!(name_array.value(i), names[i], "Name mismatch at row {}", i);
+            assert!((value_array.value(i) - values[i]).abs() < 1e-10, "Value mismatch at row {}", i);
+        }
     }
 }

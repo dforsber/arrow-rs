@@ -435,8 +435,10 @@ fn test_valid_bytes() {
     let mut data = Vec::new();
     encode_avro_bytes(&mut data, b"hello world");
 
+    // Variable-length types require 2 buffers: offsets + data
+    let mut offsets = vec![0u8; 8]; // 2 offsets (row_count + 1) * 4
     let mut output = vec![0u8; 128];
-    let mut ptrs = vec![output.as_mut_ptr()];
+    let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
 
     let result = decoder.decode(&data, &mut ptrs, 1);
     assert!(result.is_ok(), "Expected success for valid Binary");
@@ -959,8 +961,10 @@ fn test_list_empty_valid() {
     let mut data = Vec::new();
     encode_varint(&mut data, 0); // 0 elements (end of list)
 
+    // Variable-length types require 2 buffers: offsets + data
+    let mut offsets = vec![0u8; 8]; // 2 offsets (row_count + 1) * 4
     let mut output = vec![0u8; 128];
-    let mut ptrs = vec![output.as_mut_ptr()];
+    let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
 
     let result = decoder.decode(&data, &mut ptrs, 1);
     assert!(result.is_ok(), "Expected success for empty list");
@@ -1047,8 +1051,10 @@ fn test_map_empty_valid() {
     let mut data = Vec::new();
     encode_varint(&mut data, 0); // 0 entries
 
+    // Variable-length types require 2 buffers: offsets + data
+    let mut offsets = vec![0u8; 8]; // 2 offsets (row_count + 1) * 4
     let mut output = vec![0u8; 256];
-    let mut ptrs = vec![output.as_mut_ptr()];
+    let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
 
     let result = decoder.decode(&data, &mut ptrs, 1);
     assert!(result.is_ok(), "Expected success for empty map");
@@ -1125,8 +1131,10 @@ fn test_zero_length_string() {
     let mut data = Vec::new();
     encode_varint(&mut data, 0);
 
+    // Variable-length types require 2 buffers: offsets + data
+    let mut offsets = vec![0u8; 8]; // 2 offsets (row_count + 1) * 4
     let mut output = vec![0u8; 64];
-    let mut ptrs = vec![output.as_mut_ptr()];
+    let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
 
     let result = decoder.decode(&data, &mut ptrs, 1);
     assert!(result.is_ok(), "Expected success for zero-length string");
@@ -1141,8 +1149,10 @@ fn test_zero_length_bytes() {
     let mut data = Vec::new();
     encode_varint(&mut data, 0);
 
+    // Variable-length types require 2 buffers: offsets + data
+    let mut offsets = vec![0u8; 8]; // 2 offsets (row_count + 1) * 4
     let mut output = vec![0u8; 64];
-    let mut ptrs = vec![output.as_mut_ptr()];
+    let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
 
     let result = decoder.decode(&data, &mut ptrs, 1);
     assert!(result.is_ok(), "Expected success for zero-length bytes");

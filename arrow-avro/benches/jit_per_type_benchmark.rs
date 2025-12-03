@@ -109,7 +109,7 @@ fn bench_all_simple_types(c: &mut Criterion) {
             let mut out1 = vec![0u8; ROW_COUNT * 8];     // int64
             let mut out2 = vec![0u8; ROW_COUNT * 4];     // float32
             let mut out3 = vec![0u8; ROW_COUNT * 8];     // float64
-            let mut out4 = vec![0u8; (ROW_COUNT + 7) / 8]; // boolean
+            let mut out4 = vec![0u8; ROW_COUNT]; // boolean (1 byte per row)
             let mut out5 = vec![0u8; ROW_COUNT * 16];    // fixed
             let mut out6 = vec![0u8; ROW_COUNT * 4];     // enum
             let mut out7 = vec![0u8; ROW_COUNT * 16];    // decimal128

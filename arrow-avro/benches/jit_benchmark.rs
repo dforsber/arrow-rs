@@ -11,24 +11,17 @@ use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_avro::reader::pooled_decoder::PooledRecordDecoder;
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+#[allow(unused_imports)]
 use std::alloc::{alloc, Layout};
 use std::hint::black_box;
 use std::sync::Arc;
 
-/// Allocate aligned buffer for Arrow (8-byte alignment for i64/f64)
+/// Allocate buffer for Arrow (standard allocator has proper alignment)
+#[allow(dead_code)]
 fn alloc_aligned(size: usize) -> Vec<u8> {
-    if size == 0 {
-        return Vec::new();
-    }
-    let layout = Layout::from_size_align(size, 8).expect("valid layout");
-    unsafe {
-        let ptr = alloc(layout);
-        if ptr.is_null() {
-            panic!("allocation failed");
-        }
-        std::ptr::write_bytes(ptr, 0, size);
-        Vec::from_raw_parts(ptr, size, size)
-    }
+    // Standard allocator provides proper alignment for Vec<u8>
+    // Arrow's Buffer::from_vec requires this standard allocation
+    vec![0u8; size]
 }
 
 /// Encode a varint (zig-zag + variable length)
