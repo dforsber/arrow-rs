@@ -187,6 +187,7 @@ struct EnumResolution {
 
 /// Internal decoder enum for Avro types - made pub(crate) for use in pooled_decoder
 #[derive(Debug, AsRefStr)]
+#[allow(private_interfaces)]
 pub(crate) enum Decoder {
     Null(usize),
     Boolean(BooleanBufferBuilder),

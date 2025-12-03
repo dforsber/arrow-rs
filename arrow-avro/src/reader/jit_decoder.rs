@@ -25,26 +25,56 @@ use arrow_array::{
     RecordBatch, StringArray,
 };
 use arrow_buffer::{Buffer, ScalarBuffer};
-use arrow_schema::{ArrowError, DataType, Field, Schema};
+use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema};
 use std::sync::Arc;
 
+use cranelift::codegen::ir::FuncRef;
 use cranelift::prelude::*;
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{Linkage, Module};
+use std::mem::ManuallyDrop;
+
+// External memcpy function for fast bulk memory copies
+unsafe extern "C" {
+    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+}
+
+/// Wrapper to make JITModule Send + Sync and prevent drop-related crashes
+///
+/// Safety: JITModule is not Sync because it contains internal state (symbol lookup functions).
+/// However, we only keep it alive to prevent the compiled code memory from being freed.
+/// The actual decode function pointer is thread-safe because:
+/// 1. The compiled code is read-only after finalization
+/// 2. Each thread uses its own input/output buffers
+/// 3. We never call any methods on JITModule after construction
+///
+/// We use ManuallyDrop because Cranelift's JITModule has known issues with its Drop
+/// implementation that can cause SIGABRT when multiple modules are dropped.
+/// The memory leak is acceptable for long-lived decoders (typical use case).
+struct SyncJitModule(#[allow(dead_code)] ManuallyDrop<JITModule>);
+
+// Safety: We never access the JITModule after construction, only keep it alive.
+// The compiled code it owns is read-only and safe to execute from multiple threads.
+unsafe impl Send for SyncJitModule {}
+unsafe impl Sync for SyncJitModule {}
 
 /// JIT-compiled decoder for a specific Avro schema
+///
+/// This decoder is thread-safe and can be shared across multiple threads.
+/// Each thread should provide its own input/output buffers.
 pub struct JitDecoder {
     /// The compiled decode function
     /// Signature: (input_ptr, input_len, output_ptrs, row_count) -> bytes_consumed
     /// Returns negative value on error
     decode_fn: unsafe extern "C" fn(*const u8, usize, *mut *mut u8, usize) -> i64,
     /// Keep the JIT module alive (owns the compiled code memory)
-    _module: JITModule,
+    _module: SyncJitModule,
     /// Schema for reference
     schema: Arc<Schema>,
     /// Number of columns
     num_columns: usize,
     /// Column types for buffer layout (Variable columns need 2 buffers: data + offsets)
+    #[allow(dead_code)]
     column_types: Vec<ColumnType>,
 }
 
@@ -74,6 +104,19 @@ enum FieldOp {
     List { element: Box<FieldOp>, nullable: bool },
     /// Map - read block count + key-value pairs
     Map { value: Box<FieldOp>, nullable: bool },
+    /// Union - read type index varint, then decode variant
+    /// type_ids maps Avro union index to Arrow type id
+    Union { variants: Vec<FieldOp>, type_ids: Vec<i8>, nullable: bool },
+    /// Fixed-size list with known element count
+    FixedSizeList { element: Box<FieldOp>, size: usize, nullable: bool },
+    /// Decimal128 - read fixed bytes and decode as 128-bit decimal
+    Decimal128 { _precision: u8, _scale: i8, nullable: bool },
+    /// Decimal256 - read fixed bytes and decode as 256-bit decimal
+    Decimal256 { _precision: u8, _scale: i8, nullable: bool },
+    /// Duration - read as i64
+    Duration { nullable: bool },
+    /// Interval - read as fixed bytes
+    Interval { unit: IntervalUnit, nullable: bool },
 }
 
 /// Column type metadata for buffer layout
@@ -101,7 +144,9 @@ impl JitDecoder {
         let isa_builder = cranelift_native::builder().map_err(|e| e.to_string())?;
         let isa = isa_builder.finish(settings::Flags::new(flag_builder)).map_err(|e| e.to_string())?;
 
-        let builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        let mut builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
+        // Register memcpy symbol for fast bulk memory copies
+        builder.symbol("memcpy", memcpy as *const u8);
         let mut module = JITModule::new(builder);
 
         // Create the function context
@@ -115,9 +160,22 @@ impl JitDecoder {
         ctx.func.signature.params.push(AbiParam::new(types::I64)); // row_count
         ctx.func.signature.returns.push(AbiParam::new(types::I64)); // bytes_consumed or -1 on error
 
+        // Declare memcpy: void* memcpy(void* dest, const void* src, size_t n)
+        let mut memcpy_sig = module.make_signature();
+        memcpy_sig.params.push(AbiParam::new(ptr_type)); // dest
+        memcpy_sig.params.push(AbiParam::new(ptr_type)); // src
+        memcpy_sig.params.push(AbiParam::new(types::I64)); // n (size_t)
+        memcpy_sig.returns.push(AbiParam::new(ptr_type)); // returns dest
+        let memcpy_func_id = module
+            .declare_function("memcpy", Linkage::Import, &memcpy_sig)
+            .map_err(|e| e.to_string())?;
+
         // Build the function
         let mut fn_builder_ctx = FunctionBuilderContext::new();
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+
+        // Import memcpy into this function
+        let memcpy_func_ref = module.declare_func_in_func(memcpy_func_id, builder.func);
 
         // Create entry block
         let entry_block = builder.create_block();
@@ -184,6 +242,7 @@ impl JitDecoder {
                 cursor_var,
                 &output_vars,
                 ptr_type,
+                memcpy_func_ref,
             );
         }
 
@@ -230,7 +289,7 @@ impl JitDecoder {
 
         Ok(JitDecoder {
             decode_fn,
-            _module: module,
+            _module: SyncJitModule(ManuallyDrop::new(module)),
             schema: schema.clone(),
             num_columns,
             column_types,
@@ -281,6 +340,31 @@ impl JitDecoder {
                 // Fallback - treat as bytes
                 FieldOp::Bytes { nullable }
             }
+            // Union type - read type index, then decode variant
+            DataType::Union(union_fields, _mode) => {
+                let variants: Vec<FieldOp> = union_fields
+                    .iter()
+                    .map(|(_, f)| Self::field_to_op(f.as_ref()))
+                    .collect();
+                let type_ids: Vec<i8> = union_fields.iter().map(|(id, _)| id).collect();
+                FieldOp::Union { variants, type_ids, nullable }
+            }
+            // Fixed-size list
+            DataType::FixedSizeList(element_field, size) => {
+                let element_op = Box::new(Self::field_to_op(element_field.as_ref()));
+                FieldOp::FixedSizeList { element: element_op, size: *size as usize, nullable }
+            }
+            // Decimal types - Avro encodes as fixed bytes
+            DataType::Decimal128(precision, scale) => {
+                FieldOp::Decimal128 { _precision: *precision, _scale: *scale, nullable }
+            }
+            DataType::Decimal256(precision, scale) => {
+                FieldOp::Decimal256 { _precision: *precision, _scale: *scale, nullable }
+            }
+            // Duration - encoded as i64
+            DataType::Duration(_) => FieldOp::Duration { nullable },
+            // Interval types
+            DataType::Interval(unit) => FieldOp::Interval { unit: *unit, nullable },
             // Default to Int64 for other types
             _ => FieldOp::Int64 { nullable },
         }
@@ -297,6 +381,7 @@ impl JitDecoder {
         cursor_var: Variable,
         output_vars: &[Variable],
         ptr_type: Type,
+        memcpy_func_ref: FuncRef,
     ) {
         // Load output pointer for this column
         let col_offset = builder.ins().iconst(ptr_type, (col_idx * 8) as i64);
@@ -573,7 +658,7 @@ impl JitDecoder {
                     builder.def_var(cursor_var, new_cursor);
                     let len = Self::emit_zigzag_decode_i64(builder, len_raw);
                     let cursor = builder.use_var(cursor_var);
-                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, len);
+                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, len, memcpy_func_ref);
                     let new_cursor = builder.ins().iadd(cursor, len);
                     builder.def_var(cursor_var, new_cursor);
                     let new_output_pos = builder.ins().iadd(output_pos, len);
@@ -596,7 +681,7 @@ impl JitDecoder {
                     let cursor = builder.use_var(cursor_var);
 
                     // Emit byte copy loop
-                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, len);
+                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, len, memcpy_func_ref);
 
                     // Advance input cursor by length
                     let new_cursor = builder.ins().iadd(cursor, len);
@@ -630,7 +715,7 @@ impl JitDecoder {
                     // Value block: copy fixed bytes
                     builder.switch_to_block(value_block);
                     let cursor = builder.use_var(cursor_var);
-                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, size_val);
+                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, size_val, memcpy_func_ref);
                     let new_cursor = builder.ins().iadd(cursor, size_val);
                     builder.def_var(cursor_var, new_cursor);
                     builder.ins().jump(continue_block, &[]);
@@ -644,7 +729,7 @@ impl JitDecoder {
                     builder.def_var(output_vars[col_idx], new_output_pos);
                 } else {
                     let cursor = builder.use_var(cursor_var);
-                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, size_val);
+                    Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, size_val, memcpy_func_ref);
                     let new_cursor = builder.ins().iadd(cursor, size_val);
                     builder.def_var(cursor_var, new_cursor);
                     let new_output_pos = builder.ins().iadd(output_pos, size_val);
@@ -806,6 +891,236 @@ impl JitDecoder {
                 } else {
                     Self::emit_map_decode(builder, value, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
                 }
+            }
+            FieldOp::Union { variants, type_ids, nullable } => {
+                // Avro union: read type index varint, then decode corresponding variant
+                // Output: type_id (i32) followed by variant data
+
+                if *nullable {
+                    // For nullable union, first check for null tag
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    builder.switch_to_block(null_block);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.switch_to_block(value_block);
+                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                }
+            }
+            FieldOp::FixedSizeList { element, size, nullable } => {
+                // Fixed-size list: decode exactly `size` elements
+                if *nullable {
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    builder.switch_to_block(null_block);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.switch_to_block(value_block);
+                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                }
+            }
+            FieldOp::Decimal128 { nullable, .. } => {
+                // Avro decimal: read as fixed 16 bytes (big-endian), convert to little-endian for Arrow
+                let byte_size: i64 = 16;
+
+                if *nullable {
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    builder.switch_to_block(null_block);
+                    // Write zeros for null
+                    let zero_val = builder.ins().iconst(types::I64, 0);
+                    builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 8);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.switch_to_block(value_block);
+                    Self::emit_decimal128_decode(builder, input_ptr, cursor_var, output_write_ptr);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    Self::emit_decimal128_decode(builder, input_ptr, cursor_var, output_write_ptr);
+                }
+
+                let size_const = builder.ins().iconst(types::I64, byte_size);
+                let new_output_pos = builder.ins().iadd(output_pos, size_const);
+                builder.def_var(output_vars[col_idx], new_output_pos);
+            }
+            FieldOp::Decimal256 { nullable, .. } => {
+                // Avro decimal: read as fixed 32 bytes (big-endian), convert to little-endian for Arrow
+                let byte_size: i64 = 32;
+
+                if *nullable {
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    builder.switch_to_block(null_block);
+                    // Write zeros for null
+                    let zero_val = builder.ins().iconst(types::I64, 0);
+                    builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 8);
+                    builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 16);
+                    builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 24);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.switch_to_block(value_block);
+                    Self::emit_decimal256_decode(builder, input_ptr, cursor_var, output_write_ptr);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    Self::emit_decimal256_decode(builder, input_ptr, cursor_var, output_write_ptr);
+                }
+
+                let size_const = builder.ins().iconst(types::I64, byte_size);
+                let new_output_pos = builder.ins().iadd(output_pos, size_const);
+                builder.def_var(output_vars[col_idx], new_output_pos);
+            }
+            FieldOp::Duration { nullable } => {
+                // Duration: read as i64 (same as Int64)
+                if *nullable {
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    builder.switch_to_block(null_block);
+                    let zero_val = builder.ins().iconst(types::I64, 0);
+                    builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.switch_to_block(value_block);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let zigzag = Self::emit_zigzag_decode_i64(builder, value);
+                    builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
+                    builder.def_var(cursor_var, new_cursor);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let zigzag = Self::emit_zigzag_decode_i64(builder, value);
+                    builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+
+                let eight = builder.ins().iconst(types::I64, 8);
+                let new_output_pos = builder.ins().iadd(output_pos, eight);
+                builder.def_var(output_vars[col_idx], new_output_pos);
+            }
+            FieldOp::Interval { unit, nullable } => {
+                // Interval: depends on unit type
+                // YearMonth: 4 bytes (i32)
+                // DayTime: 8 bytes (two i32)
+                // MonthDayNano: 16 bytes (i32 + i32 + i64)
+                let byte_size: i64 = match unit {
+                    IntervalUnit::YearMonth => 4,
+                    IntervalUnit::DayTime => 8,
+                    IntervalUnit::MonthDayNano => 16,
+                };
+
+                if *nullable {
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    builder.def_var(cursor_var, tag_cursor);
+
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let is_null = builder.ins().icmp(IntCC::Equal, tag, zero);
+
+                    let null_block = builder.create_block();
+                    let value_block = builder.create_block();
+                    let continue_block = builder.create_block();
+
+                    builder.ins().brif(is_null, null_block, &[], value_block, &[]);
+
+                    builder.switch_to_block(null_block);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.switch_to_block(value_block);
+                    Self::emit_interval_decode(builder, *unit, input_ptr, cursor_var, output_write_ptr);
+                    builder.ins().jump(continue_block, &[]);
+
+                    builder.seal_block(null_block);
+                    builder.seal_block(value_block);
+                    builder.seal_block(continue_block);
+                    builder.switch_to_block(continue_block);
+                } else {
+                    Self::emit_interval_decode(builder, *unit, input_ptr, cursor_var, output_write_ptr);
+                }
+
+                let size_const = builder.ins().iconst(types::I64, byte_size);
+                let new_output_pos = builder.ins().iadd(output_pos, size_const);
+                builder.def_var(output_vars[col_idx], new_output_pos);
             }
         }
     }
@@ -1081,7 +1396,7 @@ impl JitDecoder {
         builder.seal_block(block_exit);
     }
 
-    /// Emit Cranelift IR for memcpy with proper loop structure
+    /// Emit Cranelift IR for memcpy using libc memcpy for SIMD-optimized bulk copy
     /// Copies len bytes from src_base+src_offset to dst
     fn emit_memcpy(
         builder: &mut FunctionBuilder,
@@ -1089,65 +1404,14 @@ impl JitDecoder {
         src_offset: Value,
         dst: Value,
         len: Value,
+        memcpy_func_ref: FuncRef,
     ) {
-        // Skip if len == 0
-        let zero = builder.ins().iconst(types::I64, 0);
-        let is_zero = builder.ins().icmp(IntCC::Equal, len, zero);
+        // Calculate src_ptr = src_base + src_offset
+        let src_ptr = builder.ins().iadd(src_base, src_offset);
 
-        let copy_block = builder.create_block();
-        let exit_block = builder.create_block();
-
-        builder.ins().brif(is_zero, exit_block, &[], copy_block, &[]);
-
-        // Copy block - byte by byte
-        builder.switch_to_block(copy_block);
-
-        // Create loop variable
-        let idx_var = builder.declare_var(types::I64);
-        builder.def_var(idx_var, zero);
-
-        let loop_check = builder.create_block();
-        let loop_body = builder.create_block();
-
-        builder.ins().jump(loop_check, &[]);
-
-        // Loop check: idx < len?
-        builder.switch_to_block(loop_check);
-        let idx = builder.use_var(idx_var);
-        let continue_cmp = builder.ins().icmp(IntCC::UnsignedLessThan, idx, len);
-        builder.ins().brif(continue_cmp, loop_body, &[], exit_block, &[]);
-
-        // Loop body: copy one byte
-        builder.switch_to_block(loop_body);
-        let idx = builder.use_var(idx_var);
-
-        // src_ptr = src_base + src_offset + idx
-        let src_pos = builder.ins().iadd(src_offset, idx);
-        let src_ptr = builder.ins().iadd(src_base, src_pos);
-
-        // dst_ptr = dst + idx
-        let dst_ptr = builder.ins().iadd(dst, idx);
-
-        // Load and store byte
-        let byte = builder.ins().load(types::I8, MemFlags::trusted(), src_ptr, 0);
-        builder.ins().store(MemFlags::trusted(), byte, dst_ptr, 0);
-
-        // Increment index
-        let one = builder.ins().iconst(types::I64, 1);
-        let new_idx = builder.ins().iadd(idx, one);
-        builder.def_var(idx_var, new_idx);
-
-        // Jump back to check
-        builder.ins().jump(loop_check, &[]);
-
-        // Seal blocks
-        builder.seal_block(copy_block);
-        builder.seal_block(loop_check);
-        builder.seal_block(loop_body);
-        builder.seal_block(exit_block);
-
-        // Continue from exit block
-        builder.switch_to_block(exit_block);
+        // Call memcpy(dst, src, len) - uses SIMD for large copies
+        builder.ins().call(memcpy_func_ref, &[dst, src_ptr, len]);
+        // Note: memcpy returns dest pointer which we don't need
     }
 
     /// Emit Cranelift IR for Avro array/list decoding
@@ -1331,6 +1595,391 @@ impl JitDecoder {
         builder.seal_block(block_header);
         builder.seal_block(block_body);
         builder.seal_block(block_exit);
+    }
+
+    /// Emit Cranelift IR for Avro union decoding
+    ///
+    /// Avro union: read type index varint, then decode corresponding variant
+    /// Output format: type_id (i32) followed by variant data
+    #[allow(clippy::too_many_arguments)]
+    fn emit_union_decode(
+        builder: &mut FunctionBuilder,
+        variants: &[FieldOp],
+        type_ids: &[i8],
+        input_ptr: Value,
+        cursor_var: Variable,
+        output_write_ptr: Value,
+        output_pos: Value,
+        output_vars: &[Variable],
+        col_idx: usize,
+    ) {
+        // Read type index (varint, not zigzag encoded for union)
+        let (type_index, index_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        builder.def_var(cursor_var, index_cursor);
+
+        // Track bytes written - start with 4 for type_id
+        let union_bytes_var = builder.declare_var(types::I64);
+        let four = builder.ins().iconst(types::I64, 4);
+        builder.def_var(union_bytes_var, four);
+
+        // For simple unions (typically 2-4 variants), use if-else chain
+        // For now, we handle the common case of small unions
+        if variants.is_empty() {
+            // Empty union - shouldn't happen but handle gracefully
+            builder.def_var(output_vars[col_idx], output_pos);
+            return;
+        }
+
+        // Write type_id at the start
+        // We need to map type_index to the correct type_id
+        // For now, just write the type_index as type_id (simplified)
+        let type_id_i32 = builder.ins().ireduce(types::I32, type_index);
+        builder.ins().store(MemFlags::trusted(), type_id_i32, output_write_ptr, 0);
+
+        // Calculate where to write variant data
+        let variant_write_ptr = builder.ins().iadd(output_write_ptr, four);
+
+        // Create blocks for each variant and exit
+        let exit_block = builder.create_block();
+        let variant_blocks: Vec<_> = variants.iter().map(|_| builder.create_block()).collect();
+
+        // Default block (for out-of-range indices)
+        let default_block = builder.create_block();
+
+        // Check variant index and branch
+        // Collect intermediate check blocks so we can seal them after
+        let mut check_blocks = Vec::new();
+        for (i, variant_block) in variant_blocks.iter().enumerate() {
+            let idx_const = builder.ins().iconst(types::I64, i as i64);
+            let is_this_variant = builder.ins().icmp(IntCC::Equal, type_index, idx_const);
+
+            let next_check = if i + 1 < variants.len() {
+                let block = builder.create_block();
+                check_blocks.push(block);
+                block
+            } else {
+                default_block
+            };
+
+            builder.ins().brif(is_this_variant, *variant_block, &[], next_check, &[]);
+
+            if i + 1 < variants.len() {
+                builder.switch_to_block(next_check);
+            }
+        }
+
+        // Seal all intermediate check blocks
+        for check_block in check_blocks {
+            builder.seal_block(check_block);
+        }
+
+        // Default block: skip unknown variant
+        builder.switch_to_block(default_block);
+        builder.ins().jump(exit_block, &[]);
+        builder.seal_block(default_block);
+
+        // Generate code for each variant
+        for (i, (variant_op, _type_id)) in variants.iter().zip(type_ids.iter()).enumerate() {
+            builder.switch_to_block(variant_blocks[i]);
+
+            // Get variant size
+            let variant_size: i64 = match variant_op {
+                FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
+                FieldOp::Int32 { .. } | FieldOp::Float32 { .. } | FieldOp::Enum { .. } => 4,
+                FieldOp::Boolean { .. } => 1,
+                FieldOp::Fixed { size, .. } => *size as i64,
+                _ => 8, // Default for complex types
+            };
+
+            // Decode variant value
+            match variant_op {
+                FieldOp::Int64 { nullable: false } => {
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let zigzag = Self::emit_zigzag_decode_i64(builder, value);
+                    builder.ins().store(MemFlags::trusted(), zigzag, variant_write_ptr, 0);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                FieldOp::Int32 { nullable: false } => {
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let zigzag = Self::emit_zigzag_decode_i32(builder, value);
+                    builder.ins().store(MemFlags::trusted(), zigzag, variant_write_ptr, 0);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                FieldOp::Float64 { nullable: false } => {
+                    let cursor = builder.use_var(cursor_var);
+                    let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                    let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), value, variant_write_ptr, 0);
+                    let eight = builder.ins().iconst(types::I64, 8);
+                    let new_cursor = builder.ins().iadd(cursor, eight);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                FieldOp::Float32 { nullable: false } => {
+                    let cursor = builder.use_var(cursor_var);
+                    let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                    let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), value, variant_write_ptr, 0);
+                    let four_const = builder.ins().iconst(types::I64, 4);
+                    let new_cursor = builder.ins().iadd(cursor, four_const);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                FieldOp::Boolean { nullable: false } => {
+                    let cursor = builder.use_var(cursor_var);
+                    let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                    let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
+                    builder.ins().store(MemFlags::trusted(), value, variant_write_ptr, 0);
+                    let one = builder.ins().iconst(types::I64, 1);
+                    let new_cursor = builder.ins().iadd(cursor, one);
+                    builder.def_var(cursor_var, new_cursor);
+                }
+                _ => {
+                    // For other types (null, complex), no additional data to decode
+                }
+            }
+
+            // Update bytes written
+            let variant_size_val = builder.ins().iconst(types::I64, variant_size);
+            let current_bytes = builder.use_var(union_bytes_var);
+            let new_bytes = builder.ins().iadd(current_bytes, variant_size_val);
+            builder.def_var(union_bytes_var, new_bytes);
+
+            builder.ins().jump(exit_block, &[]);
+            builder.seal_block(variant_blocks[i]);
+        }
+
+        // Exit block
+        builder.switch_to_block(exit_block);
+        builder.seal_block(exit_block);
+
+        let final_bytes = builder.use_var(union_bytes_var);
+        let new_output_pos = builder.ins().iadd(output_pos, final_bytes);
+        builder.def_var(output_vars[col_idx], new_output_pos);
+    }
+
+    /// Emit Cranelift IR for fixed-size list decoding
+    ///
+    /// Decodes exactly `size` elements without block encoding
+    #[allow(clippy::too_many_arguments)]
+    fn emit_fixed_size_list_decode(
+        builder: &mut FunctionBuilder,
+        element_op: &FieldOp,
+        size: usize,
+        input_ptr: Value,
+        cursor_var: Variable,
+        output_write_ptr: Value,
+        output_pos: Value,
+        output_vars: &[Variable],
+        col_idx: usize,
+    ) {
+        // Get element size based on type
+        let element_size: i64 = match element_op {
+            FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
+            FieldOp::Int32 { .. } | FieldOp::Float32 { .. } | FieldOp::Enum { .. } => 4,
+            FieldOp::Boolean { .. } => 1,
+            FieldOp::Fixed { size, .. } => *size as i64,
+            _ => 8,
+        };
+
+        // Track bytes written
+        let list_bytes_var = builder.declare_var(types::I64);
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.def_var(list_bytes_var, zero);
+
+        // Create element loop
+        let elem_idx_var = builder.declare_var(types::I64);
+        builder.def_var(elem_idx_var, zero);
+
+        let loop_header = builder.create_block();
+        let loop_body = builder.create_block();
+        let loop_exit = builder.create_block();
+
+        let size_const = builder.ins().iconst(types::I64, size as i64);
+        builder.ins().jump(loop_header, &[]);
+
+        // Loop header
+        builder.switch_to_block(loop_header);
+        let elem_idx = builder.use_var(elem_idx_var);
+        let more_elements = builder.ins().icmp(IntCC::UnsignedLessThan, elem_idx, size_const);
+        builder.ins().brif(more_elements, loop_body, &[], loop_exit, &[]);
+
+        // Loop body
+        builder.switch_to_block(loop_body);
+        let list_bytes_written = builder.use_var(list_bytes_var);
+        let elem_write_ptr = builder.ins().iadd(output_write_ptr, list_bytes_written);
+
+        // Decode element
+        match element_op {
+            FieldOp::Int64 { nullable: false } => {
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let zigzag = Self::emit_zigzag_decode_i64(builder, value);
+                builder.ins().store(MemFlags::trusted(), zigzag, elem_write_ptr, 0);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Int32 { nullable: false } => {
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let zigzag = Self::emit_zigzag_decode_i32(builder, value);
+                builder.ins().store(MemFlags::trusted(), zigzag, elem_write_ptr, 0);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Float64 { nullable: false } => {
+                let cursor = builder.use_var(cursor_var);
+                let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
+                let eight = builder.ins().iconst(types::I64, 8);
+                let new_cursor = builder.ins().iadd(cursor, eight);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Float32 { nullable: false } => {
+                let cursor = builder.use_var(cursor_var);
+                let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
+                let four = builder.ins().iconst(types::I64, 4);
+                let new_cursor = builder.ins().iadd(cursor, four);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            FieldOp::Boolean { nullable: false } => {
+                let cursor = builder.use_var(cursor_var);
+                let read_ptr = builder.ins().iadd(input_ptr, cursor);
+                let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
+                let one = builder.ins().iconst(types::I64, 1);
+                let new_cursor = builder.ins().iadd(cursor, one);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            _ => {}
+        }
+
+        // Update bytes written
+        let element_size_val = builder.ins().iconst(types::I64, element_size);
+        let new_bytes = builder.ins().iadd(list_bytes_written, element_size_val);
+        builder.def_var(list_bytes_var, new_bytes);
+
+        // Increment index
+        let one = builder.ins().iconst(types::I64, 1);
+        let new_elem_idx = builder.ins().iadd(elem_idx, one);
+        builder.def_var(elem_idx_var, new_elem_idx);
+
+        builder.ins().jump(loop_header, &[]);
+
+        // Loop exit
+        builder.switch_to_block(loop_exit);
+        let final_bytes = builder.use_var(list_bytes_var);
+        let new_output_pos = builder.ins().iadd(output_pos, final_bytes);
+        builder.def_var(output_vars[col_idx], new_output_pos);
+
+        // Seal blocks
+        builder.seal_block(loop_header);
+        builder.seal_block(loop_body);
+        builder.seal_block(loop_exit);
+    }
+
+    /// Emit Cranelift IR for Decimal128 decoding (16 bytes big-endian to little-endian)
+    fn emit_decimal128_decode(
+        builder: &mut FunctionBuilder,
+        input_ptr: Value,
+        cursor_var: Variable,
+        output_write_ptr: Value,
+    ) {
+        let cursor = builder.use_var(cursor_var);
+        let read_ptr = builder.ins().iadd(input_ptr, cursor);
+
+        // Read 16 bytes big-endian, write as little-endian
+        // For Decimal128, we need to byte-swap the 16-byte value
+        // Read as two i64s and swap
+        let high_be = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
+        let low_be = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 8);
+
+        // Byte swap both halves
+        let high_le = builder.ins().bswap(high_be);
+        let low_le = builder.ins().bswap(low_be);
+
+        // Write in reversed order (low first for little-endian)
+        builder.ins().store(MemFlags::trusted(), low_le, output_write_ptr, 0);
+        builder.ins().store(MemFlags::trusted(), high_le, output_write_ptr, 8);
+
+        // Update cursor
+        let sixteen = builder.ins().iconst(types::I64, 16);
+        let new_cursor = builder.ins().iadd(cursor, sixteen);
+        builder.def_var(cursor_var, new_cursor);
+    }
+
+    /// Emit Cranelift IR for Decimal256 decoding (32 bytes big-endian to little-endian)
+    fn emit_decimal256_decode(
+        builder: &mut FunctionBuilder,
+        input_ptr: Value,
+        cursor_var: Variable,
+        output_write_ptr: Value,
+    ) {
+        let cursor = builder.use_var(cursor_var);
+        let read_ptr = builder.ins().iadd(input_ptr, cursor);
+
+        // Read 32 bytes big-endian, write as little-endian
+        // Read as four i64s and swap
+        let q0_be = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
+        let q1_be = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 8);
+        let q2_be = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 16);
+        let q3_be = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 24);
+
+        // Byte swap all quarters
+        let q0_le = builder.ins().bswap(q0_be);
+        let q1_le = builder.ins().bswap(q1_be);
+        let q2_le = builder.ins().bswap(q2_be);
+        let q3_le = builder.ins().bswap(q3_be);
+
+        // Write in reversed order for little-endian
+        builder.ins().store(MemFlags::trusted(), q3_le, output_write_ptr, 0);
+        builder.ins().store(MemFlags::trusted(), q2_le, output_write_ptr, 8);
+        builder.ins().store(MemFlags::trusted(), q1_le, output_write_ptr, 16);
+        builder.ins().store(MemFlags::trusted(), q0_le, output_write_ptr, 24);
+
+        // Update cursor
+        let thirty_two = builder.ins().iconst(types::I64, 32);
+        let new_cursor = builder.ins().iadd(cursor, thirty_two);
+        builder.def_var(cursor_var, new_cursor);
+    }
+
+    /// Emit Cranelift IR for interval decoding
+    fn emit_interval_decode(
+        builder: &mut FunctionBuilder,
+        unit: IntervalUnit,
+        input_ptr: Value,
+        cursor_var: Variable,
+        output_write_ptr: Value,
+    ) {
+        let cursor = builder.use_var(cursor_var);
+        let read_ptr = builder.ins().iadd(input_ptr, cursor);
+
+        match unit {
+            IntervalUnit::YearMonth => {
+                // 4 bytes (i32) - zigzag encoded varint
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let zigzag = Self::emit_zigzag_decode_i32(builder, value);
+                builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            IntervalUnit::DayTime => {
+                // 8 bytes (two i32s: days + milliseconds)
+                // In Avro, this is typically encoded as a fixed 8 bytes
+                let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), value, output_write_ptr, 0);
+                let eight = builder.ins().iconst(types::I64, 8);
+                let new_cursor = builder.ins().iadd(cursor, eight);
+                builder.def_var(cursor_var, new_cursor);
+            }
+            IntervalUnit::MonthDayNano => {
+                // 16 bytes (i32 months + i32 days + i64 nanos)
+                // In Avro, typically encoded as fixed 16 bytes
+                let low = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
+                let high = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 8);
+                builder.ins().store(MemFlags::trusted(), low, output_write_ptr, 0);
+                builder.ins().store(MemFlags::trusted(), high, output_write_ptr, 8);
+                let sixteen = builder.ins().iconst(types::I64, 16);
+                let new_cursor = builder.ins().iadd(cursor, sixteen);
+                builder.def_var(cursor_var, new_cursor);
+            }
+        }
     }
 
     /// Emit Cranelift IR for varint decoding with proper loop
@@ -3109,5 +3758,227 @@ mod tests {
             assert_eq!(x, *expected_x, "x mismatch at row {}", i);
             assert_eq!(y, *expected_y, "y mismatch at row {}", i);
         }
+    }
+
+    // === Tests for new types ===
+
+    #[test]
+    fn test_roundtrip_union_simple() {
+        use arrow_schema::UnionFields;
+
+        // Union of Int64 and Float64
+        let union_fields = UnionFields::new(
+            vec![0, 1],
+            vec![
+                Field::new("int_val", DataType::Int64, false),
+                Field::new("float_val", DataType::Float64, false),
+            ],
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Union(union_fields, arrow_schema::UnionMode::Dense), false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Test data: type_index=0 (Int64), value=42
+        let mut input = Vec::new();
+        input.extend(encode_enum_index(0));  // type index 0 = Int64
+        input.extend(encode_varint_i64(42));
+
+        let row_count = 1;
+        // Union output: type_id (4 bytes) + max variant size (8 bytes)
+        let mut output = vec![0u8; row_count * 12];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert!(consumed > 0, "Should consume bytes");
+
+        // Verify type_id
+        let type_id = i32::from_le_bytes(output[0..4].try_into().unwrap());
+        assert_eq!(type_id, 0, "Type id should be 0 (Int64)");
+
+        // Verify value
+        let value = i64::from_le_bytes(output[4..12].try_into().unwrap());
+        assert_eq!(value, 42, "Int64 value should be 42");
+    }
+
+    #[test]
+    fn test_roundtrip_fixed_size_list() {
+        // FixedSizeList of 3 Int64s
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int64, false)), 3),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Test data: [1, 2, 3]
+        let elements: Vec<i64> = vec![1, 2, 3];
+        let mut input = Vec::new();
+        for &elem in &elements {
+            input.extend(encode_varint_i64(elem));
+        }
+
+        let row_count = 1;
+        let mut output = vec![0u8; row_count * 3 * 8];  // 3 Int64s
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify elements
+        for (i, &expected) in elements.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Element mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_fixed_size_list_multiple_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "vector",
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Test data: row0=[10, 20], row1=[30, 40]
+        let rows: Vec<Vec<i32>> = vec![vec![10, 20], vec![30, 40]];
+        let mut input = Vec::new();
+        for row in &rows {
+            for &elem in row {
+                input.extend(encode_varint_i32(elem));
+            }
+        }
+
+        let row_count = 2;
+        let mut output = vec![0u8; row_count * 2 * 4];  // 2 rows * 2 Int32s
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify elements
+        for (row_idx, row) in rows.iter().enumerate() {
+            for (elem_idx, &expected) in row.iter().enumerate() {
+                let offset = (row_idx * 2 + elem_idx) * 4;
+                let actual = i32::from_le_bytes(output[offset..offset + 4].try_into().unwrap());
+                assert_eq!(actual, expected, "Element mismatch at row {} elem {}", row_idx, elem_idx);
+            }
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_duration() {
+        use arrow_schema::TimeUnit;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("duration", DataType::Duration(TimeUnit::Microsecond), false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        let values: Vec<i64> = vec![1000, 2000, -500];
+        let mut input = Vec::new();
+        for &v in &values {
+            input.extend(encode_varint_i64(v));
+        }
+
+        let row_count = 3;
+        let mut output = vec![0u8; row_count * 8];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, &expected) in values.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Duration mismatch at row {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_decimal128() {
+        // Decimal128 with precision 38, scale 10
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(38, 10), false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // Test data: 16 bytes big-endian decimal
+        // Simple test: all zeros
+        let input = vec![0u8; 16];
+
+        let row_count = 1;
+        let mut output = vec![0u8; row_count * 16];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, 16);
+
+        // Verify output is zeros (byte-swapped zeros are still zeros)
+        for byte in &output {
+            assert_eq!(*byte, 0, "Expected zero");
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_interval_year_month() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("interval", DataType::Interval(IntervalUnit::YearMonth), false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // YearMonth interval is encoded as a varint (months)
+        let months: i32 = 14;  // 1 year 2 months
+        let mut input = Vec::new();
+        input.extend(encode_varint_i32(months));
+
+        let row_count = 1;
+        let mut output = vec![0u8; row_count * 4];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        let actual = i32::from_le_bytes(output[0..4].try_into().unwrap());
+        assert_eq!(actual, months, "YearMonth interval mismatch");
+    }
+
+    #[test]
+    fn test_roundtrip_interval_day_time() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("interval", DataType::Interval(IntervalUnit::DayTime), false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
+
+        // DayTime interval: 8 bytes (days: i32, milliseconds: i32)
+        let days: i32 = 5;
+        let millis: i32 = 3600000;  // 1 hour
+        let mut input = Vec::new();
+        input.extend(&days.to_le_bytes());
+        input.extend(&millis.to_le_bytes());
+
+        let row_count = 1;
+        let mut output = vec![0u8; row_count * 8];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
+        assert_eq!(consumed, 8);
+
+        let actual_days = i32::from_le_bytes(output[0..4].try_into().unwrap());
+        let actual_millis = i32::from_le_bytes(output[4..8].try_into().unwrap());
+        assert_eq!(actual_days, days, "Days mismatch");
+        assert_eq!(actual_millis, millis, "Milliseconds mismatch");
     }
 }

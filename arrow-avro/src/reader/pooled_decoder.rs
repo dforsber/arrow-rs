@@ -237,6 +237,7 @@ impl StructFieldSpec {
 /// typed decoders at construction time. Each variant knows exactly how to
 /// decode its type, eliminating the overhead of runtime type dispatch.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum FieldDecoder {
     // Primitives - each knows exact read/write size
     Null,
@@ -304,6 +305,7 @@ enum TypedStorage {
     Bytes(Vec<u8>),
 }
 
+#[allow(dead_code)]
 impl TypedStorage {
     fn from_data_type(data_type: &DataType, capacity: usize) -> Self {
         match data_type {
@@ -556,6 +558,7 @@ impl TypedStorage {
     }
 }
 
+#[allow(dead_code)]
 impl FieldDecoder {
     /// Build decoder tree from Arrow DataType (pre-compile at construction time)
     fn from_data_type(data_type: &DataType) -> Self {
@@ -2246,7 +2249,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
             List { child_type: DataType, fixed_elem_size: Option<usize>, use_preallocated: bool },
             Map { value_type: DataType },
             Union { num_variants: usize, field_type_ids: Vec<i8>, child_types: Vec<DataType> },
-            Struct { field_types: Vec<DataType>, use_preallocated: bool },
+            Struct { _field_types: Vec<DataType>, use_preallocated: bool },
         }
 
         // Pre-extract type info from nested state to avoid repeated pattern matching
@@ -3702,6 +3705,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
     }
 
     /// Append null placeholder to TypedStorage
+    #[allow(dead_code)]
     fn append_null_to_typed_storage(storage: &mut TypedStorage) {
         match storage {
             TypedStorage::Null(count) => *count += 1,
@@ -3727,6 +3731,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
 
     /// Append null placeholder data for a given type
     /// This ensures fixed-size arrays have consistent element counts
+    #[allow(dead_code)]
     fn append_null_placeholder(data_type: &DataType, output: &mut Vec<u8>) {
         match data_type {
             DataType::Boolean => output.push(0),

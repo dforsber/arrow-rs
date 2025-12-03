@@ -128,3 +128,33 @@ harness = false
 name = "jit_benchmark"
 harness = false
 required-features = ["jit"]
+
+[[bench]]
+name = "jit_vs_apache_benchmark"
+harness = false
+required-features = ["jit"]
+
+[[bench]]
+name = "jit_per_type_benchmark"
+harness = false
+required-features = ["jit"]
+
+[[bench]]
+name = "jit_primitives_bench"
+harness = false
+required-features = ["jit"]
+
+[[bench]]
+name = "jit_binary_bench"
+harness = false
+required-features = ["jit"]
+
+[[bench]]
+name = "jit_complex_bench"
+harness = false
+required-features = ["jit"]
+
+[[bench]]
+name = "jit_numeric_bench"
+harness = false
+required-features = ["jit"]
