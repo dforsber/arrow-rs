@@ -1,6 +1,6 @@
 //! Test creating many JIT decoders and using them concurrently across threads
 
-use arrow_avro::reader::jit_decoder::JitDecoder;
+use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use std::sync::Arc;
 use std::thread;
@@ -42,8 +42,8 @@ fn test_sequential_creation() {
     for (i, decoder) in decoders.iter().enumerate() {
         let data: Vec<u8> = vec![0]; // Single varint-encoded 0
         let mut output = vec![0u8; 8];
-        let mut ptrs = vec![output.as_mut_ptr()];
-        if let Err(e) = decoder.decode(&data, &mut ptrs, 1) {
+        let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+        if let Err(e) = decoder.decode_checked(&data, &buffers, 1) {
             panic!("Decoder {} failed to decode: {}", i, e);
         }
     }
@@ -100,8 +100,8 @@ fn test_concurrent_decode_single_decoder() {
                     encode_varint(&mut data, value);
 
                     let mut output = vec![0u8; 8];
-                    let mut ptrs = vec![output.as_mut_ptr()];
-                    decoder.decode(&data, &mut ptrs, 1).expect("decode");
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    decoder.decode_checked(&data, &buffers, 1).expect("decode");
 
                     // Verify the result
                     let result = i64::from_le_bytes(output[..8].try_into().unwrap());
@@ -170,8 +170,8 @@ fn test_concurrent_decode_multiple_decoders() {
                     };
 
                     let mut output = vec![0u8; output_size];
-                    let mut ptrs = vec![output.as_mut_ptr()];
-                    decoder.decode(&data, &mut ptrs, 1).expect("decode");
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    decoder.decode_checked(&data, &buffers, 1).expect("decode");
                 }
                 println!("Thread {} completed {} iterations across {} decoders",
                          thread_id, iterations_per_thread, decoders.len());

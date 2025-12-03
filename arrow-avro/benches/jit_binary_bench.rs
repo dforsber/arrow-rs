@@ -23,7 +23,7 @@
 //!
 //! Run with: cargo bench --features jit --bench jit_binary_bench
 
-use arrow_avro::reader::jit_decoder::JitDecoder;
+use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
@@ -98,8 +98,8 @@ fn bench_boolean(c: &mut Criterion) {
             b.iter(|| {
                 // JIT decoder stores booleans as 1 byte per value (not bit-packed)
                 let mut output = vec![0u8; n];
-                let mut ptrs = vec![output.as_mut_ptr()];
-                let result = decoder.decode(&data, &mut ptrs, n).expect("decode");
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
         });
@@ -121,8 +121,8 @@ fn bench_bytes(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new(&id, row_count), &row_count, |b, &n| {
             b.iter(|| {
                 let mut output = vec![0u8; n * (avg_len + 20)]; // Extra space for varying lengths
-                let mut ptrs = vec![output.as_mut_ptr()];
-                let result = decoder.decode(&data, &mut ptrs, n).expect("decode");
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
         });
@@ -147,8 +147,8 @@ fn bench_fixed(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new(&id, row_count), &row_count, |b, &n| {
             b.iter(|| {
                 let mut output = vec![0u8; n * fixed_size as usize];
-                let mut ptrs = vec![output.as_mut_ptr()];
-                let result = decoder.decode(&data, &mut ptrs, n).expect("decode");
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
         });
@@ -175,8 +175,8 @@ fn bench_enum(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new(&id, row_count), &row_count, |b, &n| {
             b.iter(|| {
                 let mut output = vec![0u8; n * 4];
-                let mut ptrs = vec![output.as_mut_ptr()];
-                let result = decoder.decode(&data, &mut ptrs, n).expect("decode");
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
         });

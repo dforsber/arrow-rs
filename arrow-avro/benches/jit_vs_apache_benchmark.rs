@@ -30,7 +30,7 @@
 
 use apache_avro::types::Value;
 use apache_avro::{to_avro_datum, Schema as ApacheSchema, Writer};
-use arrow_avro::reader::jit_decoder::JitDecoder;
+use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_avro::reader::ReaderBuilder;
 use arrow_schema::{DataType, Field, Fields, Schema, UnionFields, UnionMode};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -580,14 +580,14 @@ fn bench_flat_schema(c: &mut Criterion) {
                 let mut output1 = vec![0u8; row_count * 8];
                 let mut output2 = vec![0u8; row_count * 4];
                 let mut output3 = vec![0u8; row_count * 4];
-                let mut output_ptrs = vec![
-                    output0.as_mut_ptr(),
-                    output1.as_mut_ptr(),
-                    output2.as_mut_ptr(),
-                    output3.as_mut_ptr(),
+                let buffers = vec![
+                    OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
+                    OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
+                    OutputBuffer::new(output2.as_mut_ptr(), output2.len()),
+                    OutputBuffer::new(output3.as_mut_ptr(), output3.len()),
                 ];
                 let result = jit_decoder
-                    .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
                     .expect("decode");
                 black_box(result);
             });
@@ -616,9 +616,9 @@ fn bench_boolean(c: &mut Criterion) {
             b.iter(|| {
                 // JIT stores booleans as 1 byte per value
                 let mut output = vec![0u8; row_count];
-                let mut output_ptrs = vec![output.as_mut_ptr()];
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
                 let result = jit_decoder
-                    .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
                     .expect("decode");
                 black_box(result);
             });
@@ -645,9 +645,9 @@ fn bench_string(c: &mut Criterion) {
     group.bench_function("jit", |b| {
         b.iter(|| {
             let mut output = vec![0u8; row_count * (avg_len + 20)];
-            let mut output_ptrs = vec![output.as_mut_ptr()];
+            let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
             let result = jit_decoder
-                .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                .decode_checked(&test_data.raw_datum, &buffers, row_count)
                 .expect("decode");
             black_box(result);
         });
@@ -673,9 +673,9 @@ fn bench_bytes(c: &mut Criterion) {
     group.bench_function("jit", |b| {
         b.iter(|| {
             let mut output = vec![0u8; row_count * (avg_len + 20)];
-            let mut output_ptrs = vec![output.as_mut_ptr()];
+            let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
             let result = jit_decoder
-                .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                .decode_checked(&test_data.raw_datum, &buffers, row_count)
                 .expect("decode");
             black_box(result);
         });
@@ -702,9 +702,9 @@ fn bench_fixed(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
             b.iter(|| {
                 let mut output = vec![0u8; row_count * 16];
-                let mut output_ptrs = vec![output.as_mut_ptr()];
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
                 let result = jit_decoder
-                    .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
                     .expect("decode");
                 black_box(result);
             });
@@ -732,9 +732,9 @@ fn bench_enum(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
             b.iter(|| {
                 let mut output = vec![0u8; row_count * 4]; // i32 indices
-                let mut output_ptrs = vec![output.as_mut_ptr()];
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
                 let result = jit_decoder
-                    .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
                     .expect("decode");
                 black_box(result);
             });
@@ -762,9 +762,9 @@ fn bench_array(c: &mut Criterion) {
         b.iter(|| {
             // List needs data buffer (elements * 8 bytes for i64) + extra for offsets
             let mut output = vec![0u8; row_count * avg_len * 8 + row_count * 8];
-            let mut output_ptrs = vec![output.as_mut_ptr()];
+            let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
             let result = jit_decoder
-                .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                .decode_checked(&test_data.raw_datum, &buffers, row_count)
                 .expect("decode");
             black_box(result);
         });
@@ -791,9 +791,9 @@ fn bench_map(c: &mut Criterion) {
         b.iter(|| {
             // Map needs space for keys (strings) + values (i64) + offsets
             let mut output = vec![0u8; row_count * avg_entries * 50];
-            let mut output_ptrs = vec![output.as_mut_ptr()];
+            let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
             let result = jit_decoder
-                .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                .decode_checked(&test_data.raw_datum, &buffers, row_count)
                 .expect("decode");
             black_box(result);
         });
@@ -823,12 +823,12 @@ fn bench_struct(c: &mut Criterion) {
                 // nested contains x (i32) + y (i32) = 8 bytes per row
                 let mut output0 = vec![0u8; row_count * 8]; // id
                 let mut output1 = vec![0u8; row_count * 8]; // nested (x + y concatenated)
-                let mut output_ptrs = vec![
-                    output0.as_mut_ptr(),
-                    output1.as_mut_ptr(),
+                let buffers = vec![
+                    OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
+                    OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
                 ];
                 let result = jit_decoder
-                    .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
                     .expect("decode");
                 black_box(result);
             });
@@ -857,9 +857,9 @@ fn bench_union(c: &mut Criterion) {
             b.iter(|| {
                 // Union needs type_ids (i8) + values for each variant
                 let mut output = vec![0u8; row_count * 16];
-                let mut output_ptrs = vec![output.as_mut_ptr()];
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
                 let result = jit_decoder
-                    .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
                     .expect("decode");
                 black_box(result);
             });
@@ -890,14 +890,14 @@ fn bench_multi_int(c: &mut Criterion) {
                 let mut output1 = vec![0u8; row_count * 8];
                 let mut output2 = vec![0u8; row_count * 8];
                 let mut output3 = vec![0u8; row_count * 8];
-                let mut output_ptrs = vec![
-                    output0.as_mut_ptr(),
-                    output1.as_mut_ptr(),
-                    output2.as_mut_ptr(),
-                    output3.as_mut_ptr(),
+                let buffers = vec![
+                    OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
+                    OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
+                    OutputBuffer::new(output2.as_mut_ptr(), output2.len()),
+                    OutputBuffer::new(output3.as_mut_ptr(), output3.len()),
                 ];
                 let result = jit_decoder
-                    .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
                     .expect("decode");
                 black_box(result);
             });
@@ -928,14 +928,14 @@ fn bench_throughput_1m(c: &mut Criterion) {
             let mut output1 = vec![0u8; row_count * 8];
             let mut output2 = vec![0u8; row_count * 8];
             let mut output3 = vec![0u8; row_count * 8];
-            let mut output_ptrs = vec![
-                output0.as_mut_ptr(),
-                output1.as_mut_ptr(),
-                output2.as_mut_ptr(),
-                output3.as_mut_ptr(),
+            let buffers = vec![
+                OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
+                OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
+                OutputBuffer::new(output2.as_mut_ptr(), output2.len()),
+                OutputBuffer::new(output3.as_mut_ptr(), output3.len()),
             ];
             let result = jit_decoder
-                .decode(&test_data.raw_datum, &mut output_ptrs, row_count)
+                .decode_checked(&test_data.raw_datum, &buffers, row_count)
                 .expect("decode");
             black_box(result);
         });

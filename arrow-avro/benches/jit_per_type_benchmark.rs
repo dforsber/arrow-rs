@@ -28,7 +28,7 @@
 //!
 //! Run with: cargo bench --features jit --bench jit_per_type_benchmark
 
-use arrow_avro::reader::jit_decoder::JitDecoder;
+use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::hint::black_box;
@@ -116,19 +116,19 @@ fn bench_all_simple_types(c: &mut Criterion) {
             let mut out8 = vec![0u8; ROW_COUNT * 8];     // duration
             let mut out9 = vec![0u8; ROW_COUNT * 4];     // interval
 
-            let mut ptrs = vec![
-                out0.as_mut_ptr(),
-                out1.as_mut_ptr(),
-                out2.as_mut_ptr(),
-                out3.as_mut_ptr(),
-                out4.as_mut_ptr(),
-                out5.as_mut_ptr(),
-                out6.as_mut_ptr(),
-                out7.as_mut_ptr(),
-                out8.as_mut_ptr(),
-                out9.as_mut_ptr(),
+            let buffers = vec![
+                OutputBuffer::new(out0.as_mut_ptr(), out0.len()),
+                OutputBuffer::new(out1.as_mut_ptr(), out1.len()),
+                OutputBuffer::new(out2.as_mut_ptr(), out2.len()),
+                OutputBuffer::new(out3.as_mut_ptr(), out3.len()),
+                OutputBuffer::new(out4.as_mut_ptr(), out4.len()),
+                OutputBuffer::new(out5.as_mut_ptr(), out5.len()),
+                OutputBuffer::new(out6.as_mut_ptr(), out6.len()),
+                OutputBuffer::new(out7.as_mut_ptr(), out7.len()),
+                OutputBuffer::new(out8.as_mut_ptr(), out8.len()),
+                OutputBuffer::new(out9.as_mut_ptr(), out9.len()),
             ];
-            let result = decoder.decode(&data, &mut ptrs, ROW_COUNT).expect("decode");
+            let result = decoder.decode_checked(&data, &buffers, ROW_COUNT).expect("decode");
             black_box(result);
         });
     });

@@ -23,7 +23,7 @@
 //!
 //! Run with: cargo bench --features jit --bench jit_numeric_bench
 
-use arrow_avro::reader::jit_decoder::JitDecoder;
+use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
@@ -109,8 +109,8 @@ fn bench_decimal128(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
             b.iter(|| {
                 let mut output = vec![0u8; n * 16];
-                let mut ptrs = vec![output.as_mut_ptr()];
-                let result = decoder.decode(&data, &mut ptrs, n).expect("decode");
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
         });
@@ -141,8 +141,8 @@ fn bench_duration(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("decode", unit_name), &row_count, |b, &n| {
             b.iter(|| {
                 let mut output = vec![0u8; n * 8];
-                let mut ptrs = vec![output.as_mut_ptr()];
-                let result = decoder.decode(&data, &mut ptrs, n).expect("decode");
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
         });
@@ -167,8 +167,8 @@ fn bench_interval_year_month(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
             b.iter(|| {
                 let mut output = vec![0u8; n * 4];
-                let mut ptrs = vec![output.as_mut_ptr()];
-                let result = decoder.decode(&data, &mut ptrs, n).expect("decode");
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
         });
@@ -193,8 +193,8 @@ fn bench_interval_day_time(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
             b.iter(|| {
                 let mut output = vec![0u8; n * 8];
-                let mut ptrs = vec![output.as_mut_ptr()];
-                let result = decoder.decode(&data, &mut ptrs, n).expect("decode");
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
         });
@@ -219,8 +219,8 @@ fn bench_interval_month_day_nano(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
             b.iter(|| {
                 let mut output = vec![0u8; n * 16];
-                let mut ptrs = vec![output.as_mut_ptr()];
-                let result = decoder.decode(&data, &mut ptrs, n).expect("decode");
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
                 black_box(result);
             });
         });

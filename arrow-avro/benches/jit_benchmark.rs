@@ -7,7 +7,7 @@
 //! Run with: cargo bench --features jit --bench jit_benchmark
 
 use arrow_avro::buffer_provider::{BufferLayout, ColumnRegion, PooledBufferProvider};
-use arrow_avro::reader::jit_decoder::JitDecoder;
+use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_avro::reader::pooled_decoder::PooledRecordDecoder;
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
@@ -138,9 +138,9 @@ fn bench_simple_int64_schema(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
             b.iter(|| {
                 let mut output = vec![0u8; row_count * 8];
-                let mut output_ptrs = vec![output.as_mut_ptr()];
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
                 let result = jit_decoder
-                    .decode(&test_data, &mut output_ptrs, row_count)
+                    .decode_checked(&test_data, &buffers, row_count)
                     .expect("decode");
                 black_box(result);
             });
@@ -205,13 +205,13 @@ fn bench_multi_column_schema(c: &mut Criterion) {
             let mut output0 = vec![0u8; row_count * 8]; // Int64
             let mut output1 = vec![0u8; row_count * 4]; // Int32
             let mut output2 = vec![0u8; row_count * 8]; // Float64
-            let mut output_ptrs = vec![
-                output0.as_mut_ptr(),
-                output1.as_mut_ptr(),
-                output2.as_mut_ptr(),
+            let buffers = vec![
+                OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
+                OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
+                OutputBuffer::new(output2.as_mut_ptr(), output2.len()),
             ];
             let result = jit_decoder
-                .decode(&test_data, &mut output_ptrs, row_count)
+                .decode_checked(&test_data, &buffers, row_count)
                 .expect("decode");
             black_box(result);
         });
