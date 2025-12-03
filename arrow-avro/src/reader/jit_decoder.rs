@@ -213,6 +213,9 @@ impl JitDecoder {
             .map(|f| Self::field_to_op(f))
             .collect();
 
+        // Create error block (returns -1 on bounds violation)
+        let error_block = builder.create_block();
+
         // Create loop blocks
         let loop_header = builder.create_block();
         let loop_body = builder.create_block();
@@ -243,6 +246,7 @@ impl JitDecoder {
                 &output_vars,
                 ptr_type,
                 memcpy_func_ref,
+                error_block,
             );
         }
 
@@ -260,7 +264,13 @@ impl JitDecoder {
         let final_cursor = builder.use_var(cursor_var);
         builder.ins().return_(&[final_cursor]);
 
+        // Error block: return -1 on bounds violation
+        builder.switch_to_block(error_block);
+        let error_code = builder.ins().iconst(types::I64, -1);
+        builder.ins().return_(&[error_code]);
+
         // Seal all blocks
+        builder.seal_block(error_block);
         builder.seal_block(loop_header);
         builder.seal_block(loop_body);
         builder.seal_block(loop_exit);
@@ -376,12 +386,13 @@ impl JitDecoder {
         op: &FieldOp,
         col_idx: usize,
         input_ptr: Value,
-        _input_len: Value,
+        input_len: Value,
         output_ptrs: Value,
         cursor_var: Variable,
         output_vars: &[Variable],
         ptr_type: Type,
         memcpy_func_ref: FuncRef,
+        error_block: Block,
     ) {
         // Load output pointer for this column
         let col_offset = builder.ins().iconst(ptr_type, (col_idx * 8) as i64);
@@ -393,7 +404,7 @@ impl JitDecoder {
         match op {
             FieldOp::Int32 { nullable } => {
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -413,7 +424,7 @@ impl JitDecoder {
 
                     // Value block: decode the value
                     builder.switch_to_block(value_block);
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i32(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
@@ -428,7 +439,7 @@ impl JitDecoder {
                     let new_output_pos = builder.ins().iadd(output_pos, four);
                     builder.def_var(output_vars[col_idx], new_output_pos);
                 } else {
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i32(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
@@ -440,7 +451,7 @@ impl JitDecoder {
             FieldOp::Int64 { nullable } => {
                 if *nullable {
                     // Read union tag
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     // Check if null (tag == 0)
@@ -461,7 +472,7 @@ impl JitDecoder {
 
                     // Value block: decode the value
                     builder.switch_to_block(value_block);
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
@@ -478,7 +489,7 @@ impl JitDecoder {
                     let new_output_pos = builder.ins().iadd(output_pos, eight);
                     builder.def_var(output_vars[col_idx], new_output_pos);
                 } else {
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
@@ -489,7 +500,7 @@ impl JitDecoder {
             }
             FieldOp::Float32 { nullable } => {
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -508,6 +519,7 @@ impl JitDecoder {
 
                     builder.switch_to_block(value_block);
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 4, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, output_write_ptr, 0);
@@ -526,6 +538,7 @@ impl JitDecoder {
                     builder.def_var(output_vars[col_idx], new_output_pos);
                 } else {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 4, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, output_write_ptr, 0);
@@ -538,7 +551,7 @@ impl JitDecoder {
             }
             FieldOp::Float64 { nullable } => {
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -557,6 +570,7 @@ impl JitDecoder {
 
                     builder.switch_to_block(value_block);
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, output_write_ptr, 0);
@@ -575,6 +589,7 @@ impl JitDecoder {
                     builder.def_var(output_vars[col_idx], new_output_pos);
                 } else {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, output_write_ptr, 0);
@@ -587,7 +602,7 @@ impl JitDecoder {
             }
             FieldOp::Boolean { nullable } => {
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -606,6 +621,7 @@ impl JitDecoder {
 
                     builder.switch_to_block(value_block);
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 1, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, output_write_ptr, 0);
@@ -624,6 +640,7 @@ impl JitDecoder {
                     builder.def_var(output_vars[col_idx], new_output_pos);
                 } else {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 1, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, output_write_ptr, 0);
@@ -636,7 +653,7 @@ impl JitDecoder {
             }
             FieldOp::Bytes { nullable } => {
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -654,10 +671,12 @@ impl JitDecoder {
 
                     // Value block: decode bytes normally
                     builder.switch_to_block(value_block);
-                    let (len_raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (len_raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, new_cursor);
                     let len = Self::emit_zigzag_decode_i64(builder, len_raw);
                     let cursor = builder.use_var(cursor_var);
+                    // Bounds check: len >= 0 and cursor + len <= input_len
+                    Self::emit_variable_bounds_check(builder, cursor, len, input_len, error_block);
                     Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, len, memcpy_func_ref);
                     let new_cursor = builder.ins().iadd(cursor, len);
                     builder.def_var(cursor_var, new_cursor);
@@ -671,7 +690,7 @@ impl JitDecoder {
                     builder.switch_to_block(continue_block);
                 } else {
                     // Read length as varint (returns raw zigzag value)
-                    let (len_raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (len_raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, new_cursor);
 
                     // Zigzag decode the length
@@ -679,6 +698,9 @@ impl JitDecoder {
 
                     // Get cursor position for memcpy source offset
                     let cursor = builder.use_var(cursor_var);
+
+                    // Bounds check: len >= 0 and cursor + len <= input_len
+                    Self::emit_variable_bounds_check(builder, cursor, len, input_len, error_block);
 
                     // Emit byte copy loop
                     Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, len, memcpy_func_ref);
@@ -695,7 +717,7 @@ impl JitDecoder {
             FieldOp::Fixed { size, nullable } => {
                 let size_val = builder.ins().iconst(types::I64, *size as i64);
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -715,6 +737,7 @@ impl JitDecoder {
                     // Value block: copy fixed bytes
                     builder.switch_to_block(value_block);
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, *size as i64, input_len, error_block);
                     Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, size_val, memcpy_func_ref);
                     let new_cursor = builder.ins().iadd(cursor, size_val);
                     builder.def_var(cursor_var, new_cursor);
@@ -729,6 +752,7 @@ impl JitDecoder {
                     builder.def_var(output_vars[col_idx], new_output_pos);
                 } else {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, *size as i64, input_len, error_block);
                     Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, size_val, memcpy_func_ref);
                     let new_cursor = builder.ins().iadd(cursor, size_val);
                     builder.def_var(cursor_var, new_cursor);
@@ -741,7 +765,7 @@ impl JitDecoder {
                 // Output is flattened: all field data concatenated together
 
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -757,7 +781,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_struct_decode(builder, child_ops, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_struct_decode(builder, child_ops, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -765,14 +789,14 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_struct_decode(builder, child_ops, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_struct_decode(builder, child_ops, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                 }
             }
             FieldOp::Enum { nullable } => {
                 // Enum is stored as a varint index (NOT zigzag encoded)
                 // We read it as zigzag and decode, same as other ints
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -790,7 +814,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     // Enum indices are stored directly (no zigzag)
                     let value_i32 = builder.ins().ireduce(types::I32, value);
                     builder.ins().store(MemFlags::trusted(), value_i32, output_write_ptr, 0);
@@ -806,7 +830,7 @@ impl JitDecoder {
                     let new_output_pos = builder.ins().iadd(output_pos, four);
                     builder.def_var(output_vars[col_idx], new_output_pos);
                 } else {
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     // Enum indices are stored directly (no zigzag)
                     let value_i32 = builder.ins().ireduce(types::I32, value);
                     builder.ins().store(MemFlags::trusted(), value_i32, output_write_ptr, 0);
@@ -829,7 +853,7 @@ impl JitDecoder {
                 // Note: This implementation handles non-nullable lists with primitive elements
 
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -847,7 +871,7 @@ impl JitDecoder {
 
                     // Value block: decode list
                     builder.switch_to_block(value_block);
-                    Self::emit_list_decode(builder, element, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_list_decode(builder, element, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -855,7 +879,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_list_decode(builder, element, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_list_decode(builder, element, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                 }
             }
             FieldOp::Map { value, nullable } => {
@@ -865,7 +889,7 @@ impl JitDecoder {
                 // (keys are read and skipped for now - full map support would need separate buffers)
 
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -881,7 +905,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_map_decode(builder, value, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_map_decode(builder, value, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -889,7 +913,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_map_decode(builder, value, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_map_decode(builder, value, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                 }
             }
             FieldOp::Union { variants, type_ids, nullable } => {
@@ -898,7 +922,7 @@ impl JitDecoder {
 
                 if *nullable {
                     // For nullable union, first check for null tag
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -914,7 +938,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -922,13 +946,13 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_union_decode(builder, variants, type_ids, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                 }
             }
             FieldOp::FixedSizeList { element, size, nullable } => {
                 // Fixed-size list: decode exactly `size` elements
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -944,7 +968,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -952,7 +976,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, cursor_var, output_write_ptr, output_pos, output_vars, col_idx);
+                    Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, col_idx, error_block);
                 }
             }
             FieldOp::Decimal128 { nullable, .. } => {
@@ -960,7 +984,7 @@ impl JitDecoder {
                 let byte_size: i64 = 16;
 
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -980,7 +1004,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_decimal128_decode(builder, input_ptr, cursor_var, output_write_ptr);
+                    Self::emit_decimal128_decode(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -988,7 +1012,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_decimal128_decode(builder, input_ptr, cursor_var, output_write_ptr);
+                    Self::emit_decimal128_decode(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
                 }
 
                 let size_const = builder.ins().iconst(types::I64, byte_size);
@@ -1000,7 +1024,7 @@ impl JitDecoder {
                 let byte_size: i64 = 32;
 
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -1022,7 +1046,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_decimal256_decode(builder, input_ptr, cursor_var, output_write_ptr);
+                    Self::emit_decimal256_decode(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1030,7 +1054,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_decimal256_decode(builder, input_ptr, cursor_var, output_write_ptr);
+                    Self::emit_decimal256_decode(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
                 }
 
                 let size_const = builder.ins().iconst(types::I64, byte_size);
@@ -1040,7 +1064,7 @@ impl JitDecoder {
             FieldOp::Duration { nullable } => {
                 // Duration: read as i64 (same as Int64)
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -1058,7 +1082,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
@@ -1069,7 +1093,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
@@ -1091,7 +1115,7 @@ impl JitDecoder {
                 };
 
                 if *nullable {
-                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
 
                     let zero = builder.ins().iconst(types::I64, 0);
@@ -1107,7 +1131,7 @@ impl JitDecoder {
                     builder.ins().jump(continue_block, &[]);
 
                     builder.switch_to_block(value_block);
-                    Self::emit_interval_decode(builder, *unit, input_ptr, cursor_var, output_write_ptr);
+                    Self::emit_interval_decode(builder, *unit, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1115,7 +1139,7 @@ impl JitDecoder {
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
                 } else {
-                    Self::emit_interval_decode(builder, *unit, input_ptr, cursor_var, output_write_ptr);
+                    Self::emit_interval_decode(builder, *unit, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
                 }
 
                 let size_const = builder.ins().iconst(types::I64, byte_size);
@@ -1133,11 +1157,13 @@ impl JitDecoder {
         builder: &mut FunctionBuilder,
         child_ops: &[FieldOp],
         input_ptr: Value,
+        input_len: Value,
         cursor_var: Variable,
         output_write_ptr: Value,
         output_pos: Value,
         output_vars: &[Variable],
         col_idx: usize,
+        error_block: Block,
     ) {
         // Track bytes written across all child fields
         let struct_bytes_var = builder.declare_var(types::I64);
@@ -1160,19 +1186,20 @@ impl JitDecoder {
             // Decode based on child type
             match child_op {
                 FieldOp::Int64 { nullable: false } => {
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, field_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
                 }
                 FieldOp::Int32 { nullable: false } => {
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i32(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, field_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
                 }
                 FieldOp::Float64 { nullable: false } => {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, field_write_ptr, 0);
@@ -1182,6 +1209,7 @@ impl JitDecoder {
                 }
                 FieldOp::Float32 { nullable: false } => {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 4, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, field_write_ptr, 0);
@@ -1191,6 +1219,7 @@ impl JitDecoder {
                 }
                 FieldOp::Boolean { nullable: false } => {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 1, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, field_write_ptr, 0);
@@ -1228,11 +1257,13 @@ impl JitDecoder {
         builder: &mut FunctionBuilder,
         value_op: &FieldOp,
         input_ptr: Value,
+        input_len: Value,
         cursor_var: Variable,
         output_write_ptr: Value,
         output_pos: Value,
         output_vars: &[Variable],
         col_idx: usize,
+        error_block: Block,
     ) {
         // Get value size based on type
         let value_size: i64 = match value_op {
@@ -1256,7 +1287,7 @@ impl JitDecoder {
 
         // Block header: read block count
         builder.switch_to_block(block_header);
-        let (count_raw, count_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        let (count_raw, count_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
         builder.def_var(cursor_var, count_cursor);
 
         let count = Self::emit_zigzag_decode_i64(builder, count_raw);
@@ -1280,7 +1311,7 @@ impl JitDecoder {
 
         // Skip block: read byte size and discard
         builder.switch_to_block(skip_block);
-        let (_byte_size, skip_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        let (_byte_size, skip_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
         builder.def_var(cursor_var, skip_cursor);
         builder.ins().jump(decode_block, &[]);
 
@@ -1307,7 +1338,7 @@ impl JitDecoder {
         builder.switch_to_block(entry_loop_body);
 
         // Skip string key: read length, skip bytes
-        let (key_len_raw, key_len_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        let (key_len_raw, key_len_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
         builder.def_var(cursor_var, key_len_cursor);
         let key_len = Self::emit_zigzag_decode_i64(builder, key_len_raw);
         let cursor_after_key = builder.use_var(cursor_var);
@@ -1320,19 +1351,20 @@ impl JitDecoder {
 
         match value_op {
             FieldOp::Int64 { nullable: false } => {
-                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                 let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                 builder.ins().store(MemFlags::trusted(), zigzag, value_write_ptr, 0);
                 builder.def_var(cursor_var, new_cursor);
             }
             FieldOp::Int32 { nullable: false } => {
-                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                 let zigzag = Self::emit_zigzag_decode_i32(builder, value);
                 builder.ins().store(MemFlags::trusted(), zigzag, value_write_ptr, 0);
                 builder.def_var(cursor_var, new_cursor);
             }
             FieldOp::Float64 { nullable: false } => {
                 let cursor = builder.use_var(cursor_var);
+                Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
                 let read_ptr = builder.ins().iadd(input_ptr, cursor);
                 let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, value_write_ptr, 0);
@@ -1342,6 +1374,7 @@ impl JitDecoder {
             }
             FieldOp::Float32 { nullable: false } => {
                 let cursor = builder.use_var(cursor_var);
+                Self::emit_fixed_bounds_check(builder, cursor, 4, input_len, error_block);
                 let read_ptr = builder.ins().iadd(input_ptr, cursor);
                 let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, value_write_ptr, 0);
@@ -1351,6 +1384,7 @@ impl JitDecoder {
             }
             FieldOp::Boolean { nullable: false } => {
                 let cursor = builder.use_var(cursor_var);
+                Self::emit_fixed_bounds_check(builder, cursor, 1, input_len, error_block);
                 let read_ptr = builder.ins().iadd(input_ptr, cursor);
                 let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, value_write_ptr, 0);
@@ -1428,11 +1462,13 @@ impl JitDecoder {
         builder: &mut FunctionBuilder,
         element_op: &FieldOp,
         input_ptr: Value,
+        input_len: Value,
         cursor_var: Variable,
         output_write_ptr: Value,  // Base + output_pos
         output_pos: Value,
         output_vars: &[Variable],
         col_idx: usize,
+        error_block: Block,
     ) {
         // Get element size based on type
         let element_size: i64 = match element_op {
@@ -1456,7 +1492,7 @@ impl JitDecoder {
 
         // Block header: read block count
         builder.switch_to_block(block_header);
-        let (count_raw, count_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        let (count_raw, count_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
         builder.def_var(cursor_var, count_cursor);
 
         // Zigzag decode the count
@@ -1485,7 +1521,7 @@ impl JitDecoder {
 
         // Skip block: read byte size and discard
         builder.switch_to_block(skip_block);
-        let (_byte_size, skip_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        let (_byte_size, skip_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
         builder.def_var(cursor_var, skip_cursor);
         builder.ins().jump(decode_block, &[]);
 
@@ -1520,19 +1556,20 @@ impl JitDecoder {
         // Decode based on element type
         match element_op {
             FieldOp::Int64 { nullable: false } => {
-                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                 let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                 builder.ins().store(MemFlags::trusted(), zigzag, elem_write_ptr, 0);
                 builder.def_var(cursor_var, new_cursor);
             }
             FieldOp::Int32 { nullable: false } => {
-                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                 let zigzag = Self::emit_zigzag_decode_i32(builder, value);
                 builder.ins().store(MemFlags::trusted(), zigzag, elem_write_ptr, 0);
                 builder.def_var(cursor_var, new_cursor);
             }
             FieldOp::Float64 { nullable: false } => {
                 let cursor = builder.use_var(cursor_var);
+                Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
                 let read_ptr = builder.ins().iadd(input_ptr, cursor);
                 let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
@@ -1542,6 +1579,7 @@ impl JitDecoder {
             }
             FieldOp::Float32 { nullable: false } => {
                 let cursor = builder.use_var(cursor_var);
+                Self::emit_fixed_bounds_check(builder, cursor, 4, input_len, error_block);
                 let read_ptr = builder.ins().iadd(input_ptr, cursor);
                 let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
@@ -1551,6 +1589,7 @@ impl JitDecoder {
             }
             FieldOp::Boolean { nullable: false } => {
                 let cursor = builder.use_var(cursor_var);
+                Self::emit_fixed_bounds_check(builder, cursor, 1, input_len, error_block);
                 let read_ptr = builder.ins().iadd(input_ptr, cursor);
                 let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
@@ -1607,14 +1646,16 @@ impl JitDecoder {
         variants: &[FieldOp],
         type_ids: &[i8],
         input_ptr: Value,
+        input_len: Value,
         cursor_var: Variable,
         output_write_ptr: Value,
         output_pos: Value,
         output_vars: &[Variable],
         col_idx: usize,
+        error_block: Block,
     ) {
         // Read type index (varint, not zigzag encoded for union)
-        let (type_index, index_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+        let (type_index, index_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
         builder.def_var(cursor_var, index_cursor);
 
         // Track bytes written - start with 4 for type_id
@@ -1694,19 +1735,20 @@ impl JitDecoder {
             // Decode variant value
             match variant_op {
                 FieldOp::Int64 { nullable: false } => {
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, variant_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
                 }
                 FieldOp::Int32 { nullable: false } => {
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i32(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, variant_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
                 }
                 FieldOp::Float64 { nullable: false } => {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, variant_write_ptr, 0);
@@ -1716,6 +1758,7 @@ impl JitDecoder {
                 }
                 FieldOp::Float32 { nullable: false } => {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 4, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, variant_write_ptr, 0);
@@ -1725,6 +1768,7 @@ impl JitDecoder {
                 }
                 FieldOp::Boolean { nullable: false } => {
                     let cursor = builder.use_var(cursor_var);
+                    Self::emit_fixed_bounds_check(builder, cursor, 1, input_len, error_block);
                     let read_ptr = builder.ins().iadd(input_ptr, cursor);
                     let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
                     builder.ins().store(MemFlags::trusted(), value, variant_write_ptr, 0);
@@ -1765,11 +1809,13 @@ impl JitDecoder {
         element_op: &FieldOp,
         size: usize,
         input_ptr: Value,
+        input_len: Value,
         cursor_var: Variable,
         output_write_ptr: Value,
         output_pos: Value,
         output_vars: &[Variable],
         col_idx: usize,
+        error_block: Block,
     ) {
         // Get element size based on type
         let element_size: i64 = match element_op {
@@ -1810,19 +1856,20 @@ impl JitDecoder {
         // Decode element
         match element_op {
             FieldOp::Int64 { nullable: false } => {
-                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                 let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                 builder.ins().store(MemFlags::trusted(), zigzag, elem_write_ptr, 0);
                 builder.def_var(cursor_var, new_cursor);
             }
             FieldOp::Int32 { nullable: false } => {
-                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                 let zigzag = Self::emit_zigzag_decode_i32(builder, value);
                 builder.ins().store(MemFlags::trusted(), zigzag, elem_write_ptr, 0);
                 builder.def_var(cursor_var, new_cursor);
             }
             FieldOp::Float64 { nullable: false } => {
                 let cursor = builder.use_var(cursor_var);
+                Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
                 let read_ptr = builder.ins().iadd(input_ptr, cursor);
                 let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
@@ -1832,6 +1879,7 @@ impl JitDecoder {
             }
             FieldOp::Float32 { nullable: false } => {
                 let cursor = builder.use_var(cursor_var);
+                Self::emit_fixed_bounds_check(builder, cursor, 4, input_len, error_block);
                 let read_ptr = builder.ins().iadd(input_ptr, cursor);
                 let value = builder.ins().load(types::I32, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
@@ -1841,6 +1889,7 @@ impl JitDecoder {
             }
             FieldOp::Boolean { nullable: false } => {
                 let cursor = builder.use_var(cursor_var);
+                Self::emit_fixed_bounds_check(builder, cursor, 1, input_len, error_block);
                 let read_ptr = builder.ins().iadd(input_ptr, cursor);
                 let value = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, elem_write_ptr, 0);
@@ -1879,10 +1928,16 @@ impl JitDecoder {
     fn emit_decimal128_decode(
         builder: &mut FunctionBuilder,
         input_ptr: Value,
+        input_len: Value,
         cursor_var: Variable,
         output_write_ptr: Value,
+        error_block: Block,
     ) {
         let cursor = builder.use_var(cursor_var);
+
+        // Bounds check: need 16 bytes
+        Self::emit_fixed_bounds_check(builder, cursor, 16, input_len, error_block);
+
         let read_ptr = builder.ins().iadd(input_ptr, cursor);
 
         // Read 16 bytes big-endian, write as little-endian
@@ -1909,10 +1964,16 @@ impl JitDecoder {
     fn emit_decimal256_decode(
         builder: &mut FunctionBuilder,
         input_ptr: Value,
+        input_len: Value,
         cursor_var: Variable,
         output_write_ptr: Value,
+        error_block: Block,
     ) {
         let cursor = builder.use_var(cursor_var);
+
+        // Bounds check: need 32 bytes
+        Self::emit_fixed_bounds_check(builder, cursor, 32, input_len, error_block);
+
         let read_ptr = builder.ins().iadd(input_ptr, cursor);
 
         // Read 32 bytes big-endian, write as little-endian
@@ -1945,8 +2006,10 @@ impl JitDecoder {
         builder: &mut FunctionBuilder,
         unit: IntervalUnit,
         input_ptr: Value,
+        input_len: Value,
         cursor_var: Variable,
         output_write_ptr: Value,
+        error_block: Block,
     ) {
         let cursor = builder.use_var(cursor_var);
         let read_ptr = builder.ins().iadd(input_ptr, cursor);
@@ -1954,7 +2017,7 @@ impl JitDecoder {
         match unit {
             IntervalUnit::YearMonth => {
                 // 4 bytes (i32) - zigzag encoded varint
-                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, cursor_var);
+                let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                 let zigzag = Self::emit_zigzag_decode_i32(builder, value);
                 builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                 builder.def_var(cursor_var, new_cursor);
@@ -1962,6 +2025,7 @@ impl JitDecoder {
             IntervalUnit::DayTime => {
                 // 8 bytes (two i32s: days + milliseconds)
                 // In Avro, this is typically encoded as a fixed 8 bytes
+                Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
                 let value = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
                 builder.ins().store(MemFlags::trusted(), value, output_write_ptr, 0);
                 let eight = builder.ins().iconst(types::I64, 8);
@@ -1971,6 +2035,7 @@ impl JitDecoder {
             IntervalUnit::MonthDayNano => {
                 // 16 bytes (i32 months + i32 days + i64 nanos)
                 // In Avro, typically encoded as fixed 16 bytes
+                Self::emit_fixed_bounds_check(builder, cursor, 16, input_len, error_block);
                 let low = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 0);
                 let high = builder.ins().load(types::I64, MemFlags::trusted(), read_ptr, 8);
                 builder.ins().store(MemFlags::trusted(), low, output_write_ptr, 0);
@@ -1982,13 +2047,16 @@ impl JitDecoder {
         }
     }
 
-    /// Emit Cranelift IR for varint decoding with proper loop
+    /// Emit Cranelift IR for varint decoding with bounds checking
     /// Handles up to 10 bytes (full i64 range)
     /// Returns (decoded_value, new_cursor_position)
+    /// Jumps to error_block if reading past input_len
     fn emit_varint_decode(
         builder: &mut FunctionBuilder,
         input_ptr: Value,
+        input_len: Value,
         cursor_var: Variable,
+        error_block: Block,
     ) -> (Value, Value) {
         let cursor = builder.use_var(cursor_var);
 
@@ -2005,15 +2073,22 @@ impl JitDecoder {
 
         // Create loop blocks
         let loop_header = builder.create_block();
+        let bounds_ok_block = builder.create_block();
         let loop_exit = builder.create_block();
 
         // Jump to loop header
         builder.ins().jump(loop_header, &[]);
 
-        // Loop header - process one byte
+        // Loop header - check bounds then process one byte
         builder.switch_to_block(loop_header);
 
-        // Read byte at current position
+        // Bounds check: pos < input_len
+        let pos = builder.use_var(pos_var);
+        let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, pos, input_len);
+        builder.ins().brif(in_bounds, bounds_ok_block, &[], error_block, &[]);
+
+        // Bounds OK block - read and process byte
+        builder.switch_to_block(bounds_ok_block);
         let pos = builder.use_var(pos_var);
         let read_ptr = builder.ins().iadd(input_ptr, pos);
         let byte = builder.ins().load(types::I8, MemFlags::trusted(), read_ptr, 0);
@@ -2055,6 +2130,7 @@ impl JitDecoder {
 
         // Seal blocks
         builder.seal_block(loop_header);
+        builder.seal_block(bounds_ok_block);
         builder.seal_block(loop_exit);
 
         (final_value, final_pos)
@@ -2077,6 +2153,56 @@ impl JitDecoder {
         let masked = builder.ins().band(value, one);
         let negated = builder.ins().ineg(masked);
         builder.ins().bxor(shifted, negated)
+    }
+
+    /// Emit bounds check for fixed-size read.
+    /// Checks that cursor + size <= input_len, jumps to error_block if out of bounds.
+    /// Does NOT create a new block - caller should already be in the block where load will happen.
+    /// This is an inline check that branches to error_block on failure.
+    fn emit_fixed_bounds_check(
+        builder: &mut FunctionBuilder,
+        cursor: Value,
+        size: i64,
+        input_len: Value,
+        error_block: Block,
+    ) {
+        let size_val = builder.ins().iconst(types::I64, size);
+        let end_pos = builder.ins().iadd(cursor, size_val);
+        let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, end_pos, input_len);
+
+        // Create continuation block for the successful case
+        let continue_block = builder.create_block();
+        builder.ins().brif(in_bounds, continue_block, &[], error_block, &[]);
+        builder.seal_block(continue_block);
+        builder.switch_to_block(continue_block);
+    }
+
+    /// Emit bounds check for variable-size read (e.g., bytes/string after length is decoded).
+    /// Checks that cursor + len <= input_len and len >= 0, jumps to error_block if invalid.
+    fn emit_variable_bounds_check(
+        builder: &mut FunctionBuilder,
+        cursor: Value,
+        len: Value,
+        input_len: Value,
+        error_block: Block,
+    ) {
+        // First check: len >= 0 (signed comparison)
+        let zero = builder.ins().iconst(types::I64, 0);
+        let len_valid = builder.ins().icmp(IntCC::SignedGreaterThanOrEqual, len, zero);
+
+        let len_ok_block = builder.create_block();
+        builder.ins().brif(len_valid, len_ok_block, &[], error_block, &[]);
+        builder.seal_block(len_ok_block);
+        builder.switch_to_block(len_ok_block);
+
+        // Second check: cursor + len <= input_len
+        let end_pos = builder.ins().iadd(cursor, len);
+        let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThanOrEqual, end_pos, input_len);
+
+        let continue_block = builder.create_block();
+        builder.ins().brif(in_bounds, continue_block, &[], error_block, &[]);
+        builder.seal_block(continue_block);
+        builder.switch_to_block(continue_block);
     }
 
     /// Decode rows using the JIT-compiled function
@@ -2106,19 +2232,25 @@ impl JitDecoder {
             ));
         }
 
-        let result = unsafe {
-            (self.decode_fn)(
-                input.as_ptr(),
-                input.len(),
-                output_buffers.as_mut_ptr(),
-                row_count,
-            )
-        };
+        // Use catch_unwind as additional safety net against any potential panics
+        let decode_fn = self.decode_fn;
+        let input_ptr = input.as_ptr();
+        let input_len = input.len();
+        let output_ptr = output_buffers.as_mut_ptr();
 
-        if result < 0 {
-            Err("Decode error".to_string())
-        } else {
-            Ok(result as usize)
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            decode_fn(input_ptr, input_len, output_ptr, row_count)
+        }));
+
+        match result {
+            Ok(bytes_consumed) => {
+                if bytes_consumed < 0 {
+                    Err("Malformed input: bounds violation during Avro decoding".to_string())
+                } else {
+                    Ok(bytes_consumed as usize)
+                }
+            }
+            Err(_) => Err("Decode panic: corrupted or malicious input data".to_string()),
         }
     }
 

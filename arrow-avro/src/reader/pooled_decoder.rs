@@ -2268,7 +2268,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                     let child_types: Vec<DataType> = fields.iter().map(|(_, f)| f.data_type().clone()).collect();
                     ColKind::Union { num_variants: fields.len(), field_type_ids, child_types }
                 }
-                NestedState::Struct { field_types, use_preallocated, .. } => ColKind::Struct { field_types: field_types.clone(), use_preallocated: *use_preallocated },
+                NestedState::Struct { field_types, use_preallocated, .. } => ColKind::Struct { _field_types: field_types.clone(), use_preallocated: *use_preallocated },
                 NestedState::None => match &col.data_type {
                     DataType::Null => ColKind::Null,
                     DataType::Boolean => ColKind::Boolean,
@@ -2770,7 +2770,7 @@ impl<P: BufferProvider> PooledRecordDecoder<P> {
                             }
                             self.columns[col_idx].row_count += 1;
                         }
-                        ColKind::Struct { field_types: _, use_preallocated } => {
+                        ColKind::Struct { _field_types: _, use_preallocated } => {
                             // Fast path: use record_decoder which handles nullable fields internally
                             // This skips all per-row overhead from field_nullable extraction
                             if !*use_preallocated {
