@@ -211,7 +211,7 @@ impl JitDecoder {
         let field_ops: Vec<FieldOp> = schema.fields()
             .iter()
             .map(|f| Self::field_to_op(f))
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Create error block (returns -1 on bounds violation)
         let error_block = builder.create_block();
@@ -317,66 +317,74 @@ impl JitDecoder {
     }
 
     /// Convert an Arrow field to a decode operation
-    fn field_to_op(field: &Field) -> FieldOp {
+    ///
+    /// Returns an error for unsupported data types to fail fast rather than
+    /// silently produce incorrect results.
+    fn field_to_op(field: &Field) -> Result<FieldOp, String> {
         let nullable = field.is_nullable();
         match field.data_type() {
-            DataType::Int32 | DataType::Date32 | DataType::Time32(_) => FieldOp::Int32 { nullable },
-            DataType::Int64 | DataType::Date64 | DataType::Time64(_) | DataType::Timestamp(_, _) => FieldOp::Int64 { nullable },
-            DataType::Float32 => FieldOp::Float32 { nullable },
-            DataType::Float64 => FieldOp::Float64 { nullable },
-            DataType::Boolean => FieldOp::Boolean { nullable },
-            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => FieldOp::Bytes { nullable },
-            DataType::FixedSizeBinary(size) => FieldOp::Fixed { size: *size as usize, nullable },
+            DataType::Int32 | DataType::Date32 | DataType::Time32(_) => Ok(FieldOp::Int32 { nullable }),
+            DataType::Int64 | DataType::Date64 | DataType::Time64(_) | DataType::Timestamp(_, _) => Ok(FieldOp::Int64 { nullable }),
+            DataType::Float32 => Ok(FieldOp::Float32 { nullable }),
+            DataType::Float64 => Ok(FieldOp::Float64 { nullable }),
+            DataType::Boolean => Ok(FieldOp::Boolean { nullable }),
+            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => Ok(FieldOp::Bytes { nullable }),
+            DataType::FixedSizeBinary(size) => Ok(FieldOp::Fixed { size: *size as usize, nullable }),
             DataType::Struct(fields) => {
-                let child_ops = fields.iter().map(|f| Self::field_to_op(f.as_ref())).collect();
-                FieldOp::Struct { fields: child_ops, nullable }
+                let child_ops: Result<Vec<FieldOp>, String> = fields
+                    .iter()
+                    .map(|f| Self::field_to_op(f.as_ref()))
+                    .collect();
+                Ok(FieldOp::Struct { fields: child_ops?, nullable })
             }
             // Dictionary/Enum - store indices as i32
-            DataType::Dictionary(_, _) => FieldOp::Enum { nullable },
+            DataType::Dictionary(_, _) => Ok(FieldOp::Enum { nullable }),
             // List types - decode element type recursively
             DataType::List(element_field) | DataType::LargeList(element_field) => {
-                let element_op = Box::new(Self::field_to_op(element_field.as_ref()));
-                FieldOp::List { element: element_op, nullable }
+                let element_op = Box::new(Self::field_to_op(element_field.as_ref())?);
+                Ok(FieldOp::List { element: element_op, nullable })
             }
             // Map type - keys are always strings in Avro, values are recursive
             DataType::Map(entries_field, _) => {
                 // Map entries are a struct with key and value fields
                 if let DataType::Struct(fields) = entries_field.data_type() {
                     if fields.len() >= 2 {
-                        let value_op = Box::new(Self::field_to_op(fields[1].as_ref()));
-                        return FieldOp::Map { value: value_op, nullable };
+                        let value_op = Box::new(Self::field_to_op(fields[1].as_ref())?);
+                        return Ok(FieldOp::Map { value: value_op, nullable });
                     }
                 }
-                // Fallback - treat as bytes
-                FieldOp::Bytes { nullable }
+                Err(format!("Unsupported Map structure for field '{}': expected Struct with key/value fields", field.name()))
             }
             // Union type - read type index, then decode variant
             DataType::Union(union_fields, _mode) => {
-                let variants: Vec<FieldOp> = union_fields
+                let variants: Result<Vec<FieldOp>, String> = union_fields
                     .iter()
                     .map(|(_, f)| Self::field_to_op(f.as_ref()))
                     .collect();
                 let type_ids: Vec<i8> = union_fields.iter().map(|(id, _)| id).collect();
-                FieldOp::Union { variants, type_ids, nullable }
+                Ok(FieldOp::Union { variants: variants?, type_ids, nullable })
             }
             // Fixed-size list
             DataType::FixedSizeList(element_field, size) => {
-                let element_op = Box::new(Self::field_to_op(element_field.as_ref()));
-                FieldOp::FixedSizeList { element: element_op, size: *size as usize, nullable }
+                let element_op = Box::new(Self::field_to_op(element_field.as_ref())?);
+                Ok(FieldOp::FixedSizeList { element: element_op, size: *size as usize, nullable })
             }
             // Decimal types - Avro encodes as fixed bytes
             DataType::Decimal128(precision, scale) => {
-                FieldOp::Decimal128 { _precision: *precision, _scale: *scale, nullable }
+                Ok(FieldOp::Decimal128 { _precision: *precision, _scale: *scale, nullable })
             }
             DataType::Decimal256(precision, scale) => {
-                FieldOp::Decimal256 { _precision: *precision, _scale: *scale, nullable }
+                Ok(FieldOp::Decimal256 { _precision: *precision, _scale: *scale, nullable })
             }
             // Duration - encoded as i64
-            DataType::Duration(_) => FieldOp::Duration { nullable },
+            DataType::Duration(_) => Ok(FieldOp::Duration { nullable }),
             // Interval types
-            DataType::Interval(unit) => FieldOp::Interval { unit: *unit, nullable },
-            // Default to Int64 for other types
-            _ => FieldOp::Int64 { nullable },
+            DataType::Interval(unit) => Ok(FieldOp::Interval { unit: *unit, nullable }),
+            // Unsupported types - fail fast
+            other => Err(format!(
+                "Unsupported data type for JIT Avro decoder: {:?} (field '{}')",
+                other, field.name()
+            )),
         }
     }
 

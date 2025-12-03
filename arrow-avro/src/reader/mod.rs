@@ -506,6 +506,10 @@ pub mod pooled_decoder;
 #[cfg(feature = "jit")]
 pub mod jit_decoder;
 
+/// Robustness tests for JIT decoder (bounds checking, malformed input)
+#[cfg(all(test, feature = "jit"))]
+mod jit_robustness_tests;
+
 // NOTE: pooled_decoder_parity_test.rs contains comprehensive parity tests
 // comparing PooledRecordDecoder vs vanilla Decoder. Currently disabled because:
 // 1. Writer API changed (try_new -> WriterBuilder::new(schema).build(writer))
