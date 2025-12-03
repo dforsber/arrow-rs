@@ -20,12 +20,7 @@
 //! let bytes_consumed = decoder.decode(input, &mut buffers, row_count)?;
 //! ```
 
-use arrow_array::{
-    ArrayRef, BinaryArray, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray,
-};
-use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
-use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, Schema};
+use arrow_schema::{DataType, Field, IntervalUnit, Schema};
 use std::sync::Arc;
 
 use cranelift::codegen::ir::FuncRef;
@@ -120,6 +115,8 @@ enum FieldOp {
     Duration { nullable: bool },
     /// Interval - read as fixed bytes
     Interval { unit: IntervalUnit, nullable: bool },
+    /// Null type - no data to read, used in unions for nullable fields
+    Null,
 }
 
 /// Column type metadata for buffer layout
@@ -525,6 +522,8 @@ impl JitDecoder {
             DataType::Duration(_) => Ok(FieldOp::Duration { nullable }),
             // Interval types
             DataType::Interval(unit) => Ok(FieldOp::Interval { unit: *unit, nullable }),
+            // Null type - used in unions for nullable fields
+            DataType::Null => Ok(FieldOp::Null),
             // Unsupported types - fail fast
             other => Err(format!(
                 "Unsupported data type for JIT Avro decoder: {:?} (field '{}')",
@@ -1378,6 +1377,11 @@ impl JitDecoder {
                 let size_const = builder.ins().iconst(types::I64, byte_size);
                 let new_output_pos = builder.ins().iadd(output_pos, size_const);
                 builder.def_var(output_vars[buf_idx], new_output_pos);
+            }
+            FieldOp::Null => {
+                // Null type: no data to read, no output to write
+                // Used in unions for nullable fields - the null variant reads nothing
+                // Output position stays the same since Null has no representation
             }
         }
     }
@@ -2618,7 +2622,7 @@ impl JitDecoder {
     }
 
     /// Get the fixed size in bytes for a data type, if it's fixed-size
-    fn fixed_size_for_type(data_type: &DataType) -> Option<usize> {
+    pub fn fixed_size_for_type(data_type: &DataType) -> Option<usize> {
         match data_type {
             DataType::Boolean => Some(1), // JIT outputs 1 byte per boolean
             DataType::Int8 | DataType::UInt8 => Some(1),
@@ -2773,234 +2777,6 @@ impl JitDecoder {
         Ok(result)
     }
 
-    /// Decode Avro data directly to an Arrow RecordBatch
-    ///
-    /// This method allocates buffers, runs the JIT decoder, and converts
-    /// the results to Arrow arrays.
-    ///
-    /// # Arguments
-    /// * `input` - Raw Avro bytes (without header/sync markers)
-    /// * `row_count` - Number of rows to decode
-    ///
-    /// # Returns
-    /// A RecordBatch with decoded data
-    pub fn decode_to_batch(
-        &self,
-        input: &[u8],
-        row_count: usize,
-    ) -> Result<RecordBatch, ArrowError> {
-        // Allocate buffers based on column types (variable-length types need 2 buffers)
-        let mut buffers: Vec<Vec<u8>> = Vec::with_capacity(self.total_buffers);
-        let mut buffer_ptrs: Vec<*mut u8> = Vec::with_capacity(self.total_buffers);
-
-        for (col_idx, (field, col_type)) in self.schema.fields().iter().zip(self.column_types.iter()).enumerate() {
-            match col_type {
-                ColumnType::Fixed => {
-                    let buffer_size = Self::estimate_buffer_size(field.data_type(), row_count);
-                    let mut buffer = vec![0u8; buffer_size];
-                    buffer_ptrs.push(buffer.as_mut_ptr());
-                    buffers.push(buffer);
-                }
-                ColumnType::Variable => {
-                    // First buffer: offsets (row_count + 1 i32 values)
-                    let offsets_size = (row_count + 1) * 4;
-                    let mut offsets_buffer = vec![0u8; offsets_size];
-                    buffer_ptrs.push(offsets_buffer.as_mut_ptr());
-                    buffers.push(offsets_buffer);
-
-                    // Second buffer: data (estimate based on type)
-                    let data_size = Self::estimate_variable_data_size(field.data_type(), row_count, col_idx);
-                    let mut data_buffer = vec![0u8; data_size];
-                    buffer_ptrs.push(data_buffer.as_mut_ptr());
-                    buffers.push(data_buffer);
-                }
-            }
-        }
-
-        // Run the JIT decoder
-        let _bytes_consumed = self.decode(input, &mut buffer_ptrs, row_count)
-            .map_err(|e| ArrowError::ExternalError(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                e,
-            ))))?;
-
-        // Convert raw buffers to Arrow arrays
-        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.num_columns);
-
-        for (col_idx, field) in self.schema.fields().iter().enumerate() {
-            let slot = &self.buffer_slots[col_idx];
-            let array = match slot.secondary {
-                None => {
-                    // Fixed-size type: single buffer
-                    let buffer = std::mem::take(&mut buffers[slot.primary]);
-                    Self::buffer_to_array(field.data_type(), buffer, row_count)?
-                }
-                Some(data_idx) => {
-                    // Variable-length type: offsets + data buffers
-                    let offsets_buffer = std::mem::take(&mut buffers[slot.primary]);
-                    let data_buffer = std::mem::take(&mut buffers[data_idx]);
-                    Self::variable_buffer_to_array(field.data_type(), offsets_buffer, data_buffer, row_count)?
-                }
-            };
-            arrays.push(array);
-        }
-
-        RecordBatch::try_new(self.schema.clone(), arrays)
-    }
-
-    /// Estimate buffer size for a column
-    fn estimate_buffer_size(data_type: &DataType, row_count: usize) -> usize {
-        match data_type {
-            DataType::Boolean => row_count, // 1 byte per boolean (not packed in JIT output)
-            DataType::Int32 | DataType::Float32 => row_count * 4,
-            DataType::Int64 | DataType::Float64 => row_count * 8,
-            DataType::Utf8 | DataType::Binary => row_count * 128, // Estimate average string length
-            DataType::FixedSizeBinary(n) => row_count * (*n as usize),
-            DataType::List(elem_field) => {
-                // Estimate avg 10 elements per list
-                10 * row_count * Self::estimate_buffer_size(elem_field.data_type(), 1)
-            }
-            DataType::Map(entries_field, _) => {
-                // Estimate avg 5 entries per map
-                5 * row_count * Self::estimate_buffer_size(entries_field.data_type(), 1)
-            }
-            _ => row_count * 8, // Default
-        }
-    }
-
-    /// Estimate data buffer size for variable-length types
-    #[allow(unused_variables)]
-    fn estimate_variable_data_size(data_type: &DataType, row_count: usize, col_idx: usize) -> usize {
-        match data_type {
-            DataType::Utf8 | DataType::Binary => row_count * 128, // avg 128 bytes per string
-            DataType::List(elem_field) => {
-                // Estimate avg 10 elements per list
-                let elem_size = Self::estimate_element_size(elem_field.data_type());
-                row_count * 10 * elem_size
-            }
-            DataType::Map(entries_field, _) => {
-                // Estimate avg 5 entries per map
-                let entry_size = Self::estimate_buffer_size(entries_field.data_type(), 1);
-                row_count * 5 * entry_size
-            }
-            _ => row_count * 64, // Default for unknown variable types
-        }
-    }
-
-    /// Estimate element size for array types
-    fn estimate_element_size(data_type: &DataType) -> usize {
-        match data_type {
-            DataType::Boolean => 1,
-            DataType::Int32 | DataType::Float32 => 4,
-            DataType::Int64 | DataType::Float64 => 8,
-            _ => 8,
-        }
-    }
-
-    /// Convert variable-length buffers (offsets + data) to an Arrow array
-    fn variable_buffer_to_array(
-        data_type: &DataType,
-        offsets_buffer: Vec<u8>,
-        data_buffer: Vec<u8>,
-        row_count: usize,
-    ) -> Result<ArrayRef, ArrowError> {
-        match data_type {
-            DataType::Utf8 => {
-                // Build StringArray from offsets and data buffers
-                // Offsets are i32 values, data is UTF-8 bytes
-                let offsets_bytes = &offsets_buffer[..(row_count + 1) * 4];
-                let offsets_i32: Vec<i32> = offsets_bytes
-                    .chunks_exact(4)
-                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
-
-                // Get actual data length from the last offset
-                let data_len = offsets_i32.last().copied().unwrap_or(0) as usize;
-                let data_slice = &data_buffer[..data_len];
-
-                // Safety: Validate UTF-8 and construct StringArray
-                // Use the safe constructor that validates UTF-8
-                let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets_i32));
-                let values = Buffer::from_slice_ref(data_slice);
-
-                // Validate UTF-8 by constructing through try_new
-                StringArray::try_new(offsets, values, None)
-                    .map(|arr| Arc::new(arr) as ArrayRef)
-            }
-            DataType::Binary => {
-                // Build BinaryArray from offsets and data buffers
-                let offsets_bytes = &offsets_buffer[..(row_count + 1) * 4];
-                let offsets_i32: Vec<i32> = offsets_bytes
-                    .chunks_exact(4)
-                    .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                    .collect();
-
-                // Get actual data length from the last offset
-                let data_len = offsets_i32.last().copied().unwrap_or(0) as usize;
-                let data_slice = &data_buffer[..data_len];
-
-                let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets_i32));
-                let values = Buffer::from_slice_ref(data_slice);
-
-                BinaryArray::try_new(offsets, values, None)
-                    .map(|arr| Arc::new(arr) as ArrayRef)
-            }
-            DataType::List(_) | DataType::Map(_, _) => {
-                // TODO: Implement List and Map array construction
-                // For now, return error as these need more complex handling
-                Err(ArrowError::NotYetImplemented(format!(
-                    "JIT decode_to_batch does not yet support {:?} - use decode_checked with manual buffer handling",
-                    data_type
-                )))
-            }
-            _ => Err(ArrowError::NotYetImplemented(format!(
-                "JIT variable_buffer_to_array does not support {:?}",
-                data_type
-            ))),
-        }
-    }
-
-    /// Convert a raw buffer to an Arrow array
-    fn buffer_to_array(
-        data_type: &DataType,
-        buffer: Vec<u8>,
-        row_count: usize,
-    ) -> Result<ArrayRef, ArrowError> {
-        match data_type {
-            DataType::Int32 => {
-                let scalar_buffer = ScalarBuffer::<i32>::from(Buffer::from_vec(buffer));
-                Ok(Arc::new(Int32Array::new(scalar_buffer.slice(0, row_count), None)))
-            }
-            DataType::Int64 => {
-                let scalar_buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer));
-                Ok(Arc::new(Int64Array::new(scalar_buffer.slice(0, row_count), None)))
-            }
-            DataType::Float32 => {
-                let scalar_buffer = ScalarBuffer::<f32>::from(Buffer::from_vec(buffer));
-                Ok(Arc::new(Float32Array::new(scalar_buffer.slice(0, row_count), None)))
-            }
-            DataType::Float64 => {
-                let scalar_buffer = ScalarBuffer::<f64>::from(Buffer::from_vec(buffer));
-                Ok(Arc::new(Float64Array::new(scalar_buffer.slice(0, row_count), None)))
-            }
-            DataType::Boolean => {
-                // JIT outputs one byte per boolean, need to convert
-                let bools: Vec<bool> = buffer.iter().take(row_count).map(|&b| b != 0).collect();
-                Ok(Arc::new(BooleanArray::from(bools)))
-            }
-            DataType::Utf8 | DataType::Binary | DataType::List(_) | DataType::Map(_, _) => {
-                // These variable-length types should be handled by variable_buffer_to_array
-                Err(ArrowError::InvalidArgumentError(format!(
-                    "Variable-length type {:?} should use variable_buffer_to_array",
-                    data_type
-                )))
-            }
-            _ => Err(ArrowError::NotYetImplemented(format!(
-                "JIT decoder does not yet support {:?}",
-                data_type
-            ))),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3864,67 +3640,6 @@ mod tests {
         for i in 0..row_count {
             let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(actual, 0, "Null should have 0 placeholder at index {}", i);
-        }
-    }
-
-    #[test]
-    fn test_decode_to_batch_int64() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-        ]));
-
-        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
-
-        let test_values: Vec<i64> = vec![10, 20, 30, 40, 50];
-
-        let mut input = Vec::new();
-        for &v in &test_values {
-            input.extend(encode_varint_i64(v));
-        }
-
-        let batch = decoder.decode_to_batch(&input, test_values.len()).expect("Decode to batch failed");
-
-        assert_eq!(batch.num_rows(), test_values.len());
-        assert_eq!(batch.num_columns(), 1);
-
-        let id_array = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        for (i, &expected) in test_values.iter().enumerate() {
-            assert_eq!(id_array.value(i), expected, "Id mismatch at index {}", i);
-        }
-    }
-
-    #[test]
-    fn test_decode_to_batch_multi_column() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Float64, false),
-            Field::new("count", DataType::Int32, false),
-        ]));
-
-        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
-
-        let row_count = 10;
-
-        let mut input = Vec::new();
-        for i in 0..row_count {
-            input.extend(encode_varint_i64(i as i64 * 100));
-            input.extend((i as f64 * 1.5).to_le_bytes());
-            input.extend(encode_varint_i32(i as i32 * 10));
-        }
-
-        let batch = decoder.decode_to_batch(&input, row_count).expect("Decode to batch failed");
-
-        assert_eq!(batch.num_rows(), row_count);
-        assert_eq!(batch.num_columns(), 3);
-
-        let id_array = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let value_array = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-        let count_array = batch.column(2).as_any().downcast_ref::<Int32Array>().unwrap();
-
-        for i in 0..row_count {
-            assert_eq!(id_array.value(i), i as i64 * 100, "Id mismatch at row {}", i);
-            assert!((value_array.value(i) - i as f64 * 1.5).abs() < 1e-10, "Value mismatch at row {}", i);
-            assert_eq!(count_array.value(i), i as i32 * 10, "Count mismatch at row {}", i);
         }
     }
 
@@ -5280,110 +4995,4 @@ mod tests {
         assert_eq!(decoder.required_capacity(2, row_count), None);
     }
 
-    // ============== decode_to_batch with Utf8/Binary ==============
-
-    #[test]
-    fn test_decode_to_batch_utf8() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, false),
-        ]));
-
-        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
-
-        let test_strings = ["hello", "world", "rust", "avro"];
-        let row_count = test_strings.len();
-
-        // Encode strings as Avro bytes: length varint + UTF-8 bytes
-        let mut input = Vec::new();
-        for s in &test_strings {
-            input.extend(encode_varint_i64(s.len() as i64));
-            input.extend(s.as_bytes());
-        }
-
-        let batch = decoder.decode_to_batch(&input, row_count).expect("Decode to batch failed");
-
-        assert_eq!(batch.num_rows(), row_count);
-        assert_eq!(batch.num_columns(), 1);
-
-        let name_array = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        for (i, expected) in test_strings.iter().enumerate() {
-            assert_eq!(name_array.value(i), *expected, "String mismatch at index {}", i);
-        }
-    }
-
-    #[test]
-    fn test_decode_to_batch_binary() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("data", DataType::Binary, false),
-        ]));
-
-        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
-
-        let test_binaries: Vec<&[u8]> = vec![
-            b"\x00\x01\x02",
-            b"\xff\xfe\xfd",
-            b"binary data",
-            b"",  // empty
-        ];
-        let row_count = test_binaries.len();
-
-        // Encode binaries as Avro bytes: length varint + raw bytes
-        let mut input = Vec::new();
-        for b in &test_binaries {
-            input.extend(encode_varint_i64(b.len() as i64));
-            input.extend(*b);
-        }
-
-        let batch = decoder.decode_to_batch(&input, row_count).expect("Decode to batch failed");
-
-        assert_eq!(batch.num_rows(), row_count);
-        assert_eq!(batch.num_columns(), 1);
-
-        let data_array = batch.column(0).as_any().downcast_ref::<BinaryArray>().unwrap();
-        for (i, expected) in test_binaries.iter().enumerate() {
-            assert_eq!(data_array.value(i), *expected, "Binary mismatch at index {}", i);
-        }
-    }
-
-    #[test]
-    fn test_decode_to_batch_mixed_with_utf8() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, false),
-            Field::new("value", DataType::Float64, false),
-        ]));
-
-        let decoder = JitDecoder::compile(&schema).expect("Failed to compile");
-
-        let row_count = 3;
-        let ids = [100i64, 200, 300];
-        let names = ["alice", "bob", "charlie"];
-        let values = [1.5f64, 2.5, 3.5];
-
-        let mut input = Vec::new();
-        for i in 0..row_count {
-            // Int64 (varint encoded)
-            input.extend(encode_varint_i64(ids[i]));
-            // String (length varint + UTF-8 bytes)
-            input.extend(encode_varint_i64(names[i].len() as i64));
-            input.extend(names[i].as_bytes());
-            // Float64 (8 bytes little-endian)
-            input.extend(values[i].to_le_bytes());
-        }
-
-        let batch = decoder.decode_to_batch(&input, row_count).expect("Decode to batch failed");
-
-        assert_eq!(batch.num_rows(), row_count);
-        assert_eq!(batch.num_columns(), 3);
-
-        let id_array = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-        let name_array = batch.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-        let value_array = batch.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-
-        for i in 0..row_count {
-            assert_eq!(id_array.value(i), ids[i], "Id mismatch at row {}", i);
-            assert_eq!(name_array.value(i), names[i], "Name mismatch at row {}", i);
-            assert!((value_array.value(i) - values[i]).abs() < 1e-10, "Value mismatch at row {}", i);
-        }
-    }
 }

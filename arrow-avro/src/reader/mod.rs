@@ -506,6 +506,14 @@ pub mod pooled_decoder;
 #[cfg(feature = "jit")]
 pub mod jit_decoder;
 
+/// Buffer-to-Array utilities for JIT decoder output
+#[cfg(feature = "jit")]
+pub mod jit_buffer_utils;
+
+/// SIMD-optimized varint decoding for x86_64 and aarch64
+#[cfg(feature = "jit")]
+pub mod simd_varint;
+
 /// Robustness tests for JIT decoder (bounds checking, malformed input)
 #[cfg(all(test, feature = "jit"))]
 mod jit_robustness_tests;

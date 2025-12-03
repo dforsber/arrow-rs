@@ -644,8 +644,13 @@ fn bench_string(c: &mut Criterion) {
     let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
     group.bench_function("jit", |b| {
         b.iter(|| {
-            let mut output = vec![0u8; row_count * (avg_len + 20)];
-            let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+            // String needs 2 buffers: offsets (i32) + data
+            let mut offsets = vec![0u8; (row_count + 1) * 4];
+            let mut data = vec![0u8; row_count * (avg_len + 20)];
+            let buffers = vec![
+                OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
+                OutputBuffer::new(data.as_mut_ptr(), data.len()),
+            ];
             let result = jit_decoder
                 .decode_checked(&test_data.raw_datum, &buffers, row_count)
                 .expect("decode");
@@ -672,8 +677,13 @@ fn bench_bytes(c: &mut Criterion) {
     let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
     group.bench_function("jit", |b| {
         b.iter(|| {
-            let mut output = vec![0u8; row_count * (avg_len + 20)];
-            let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+            // Bytes needs 2 buffers: offsets (i32) + data
+            let mut offsets = vec![0u8; (row_count + 1) * 4];
+            let mut data = vec![0u8; row_count * (avg_len + 20)];
+            let buffers = vec![
+                OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
+                OutputBuffer::new(data.as_mut_ptr(), data.len()),
+            ];
             let result = jit_decoder
                 .decode_checked(&test_data.raw_datum, &buffers, row_count)
                 .expect("decode");
@@ -760,9 +770,13 @@ fn bench_array(c: &mut Criterion) {
     let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
     group.bench_function("jit", |b| {
         b.iter(|| {
-            // List needs data buffer (elements * 8 bytes for i64) + extra for offsets
-            let mut output = vec![0u8; row_count * avg_len * 8 + row_count * 8];
-            let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+            // List<Int64> needs 2 buffers: offsets (i32) + values (i64)
+            let mut offsets = vec![0u8; (row_count + 1) * 4]; // i32 offsets
+            let mut values = vec![0u8; row_count * avg_len * 8]; // i64 values
+            let buffers = vec![
+                OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
+                OutputBuffer::new(values.as_mut_ptr(), values.len()),
+            ];
             let result = jit_decoder
                 .decode_checked(&test_data.raw_datum, &buffers, row_count)
                 .expect("decode");
@@ -789,9 +803,13 @@ fn bench_map(c: &mut Criterion) {
     let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
     group.bench_function("jit", |b| {
         b.iter(|| {
-            // Map needs space for keys (strings) + values (i64) + offsets
-            let mut output = vec![0u8; row_count * avg_entries * 50];
-            let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+            // Map<String, Int64> needs 2 buffers: offsets + combined key/value data
+            let mut offsets = vec![0u8; (row_count + 1) * 4]; // i32 offsets
+            let mut data = vec![0u8; row_count * avg_entries * 50]; // keys (strings) + values (i64)
+            let buffers = vec![
+                OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
+                OutputBuffer::new(data.as_mut_ptr(), data.len()),
+            ];
             let result = jit_decoder
                 .decode_checked(&test_data.raw_datum, &buffers, row_count)
                 .expect("decode");

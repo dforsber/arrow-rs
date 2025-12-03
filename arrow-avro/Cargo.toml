@@ -158,3 +158,8 @@ required-features = ["jit"]
 name = "jit_numeric_bench"
 harness = false
 required-features = ["jit"]
+
+[[bench]]
+name = "simd_varint_benchmark"
+harness = false
+required-features = ["jit"]
