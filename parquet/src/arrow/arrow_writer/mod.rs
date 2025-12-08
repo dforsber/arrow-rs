@@ -309,6 +309,16 @@ impl<W: Write + Send> ArrowWriter<W> {
         self.writer.bytes_written()
     }
 
+    /// Notify the writer that external padding bytes were added to the output.
+    /// This adjusts internal offset tracking so subsequent row groups
+    /// have correct file offsets in metadata.
+    ///
+    /// Call this after adding padding to the underlying buffer
+    /// (e.g., for S3 multipart 5MB minimum part size requirements).
+    pub fn add_external_padding(&mut self, bytes: usize) {
+        self.writer.add_external_padding(bytes);
+    }
+
     /// Encodes the provided [`RecordBatch`]
     ///
     /// If this would cause the current row group to exceed [`WriterProperties::max_row_group_size`]

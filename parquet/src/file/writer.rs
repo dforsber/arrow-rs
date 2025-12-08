@@ -68,6 +68,14 @@ impl<W: Write> TrackedWrite<W> {
         self.bytes_written
     }
 
+    /// Add bytes to the offset counter without writing data.
+    /// Used when external padding is added to the underlying writer
+    /// (e.g., for S3 multipart upload minimum part size requirements).
+    /// This ensures subsequent row groups have correct file offsets in metadata.
+    pub fn add_external_bytes(&mut self, bytes: usize) {
+        self.bytes_written += bytes;
+    }
+
     /// Returns a reference to the underlying writer.
     pub fn inner(&self) -> &W {
         self.inner.get_ref()
@@ -448,6 +456,16 @@ impl<W: Write + Send> SerializedFileWriter<W> {
     /// Returns the number of bytes written to this instance
     pub fn bytes_written(&self) -> usize {
         self.buf.bytes_written()
+    }
+
+    /// Notify the writer that external padding bytes were added to the output.
+    /// This adjusts internal offset tracking so subsequent row groups
+    /// have correct file offsets in metadata.
+    ///
+    /// Call this after adding padding to the underlying buffer
+    /// (e.g., for S3 multipart 5MB minimum part size requirements).
+    pub fn add_external_padding(&mut self, bytes: usize) {
+        self.buf.add_external_bytes(bytes);
     }
 
     /// Get the file encryptor used by this instance to encrypt data
