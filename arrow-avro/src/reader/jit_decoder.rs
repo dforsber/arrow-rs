@@ -138,6 +138,9 @@ pub struct BufferSlot {
     /// Index of the secondary buffer (data) for variable-length types
     /// None for fixed-size types
     pub secondary: Option<usize>,
+    /// Index of the validity bitmap buffer for nullable columns
+    /// None for non-nullable types
+    pub validity: Option<usize>,
     /// Element size in bytes for computing offsets
     /// For Bytes/String: 1 (offsets are byte positions)
     /// For List/Map: element size (offsets are element indices)
@@ -164,6 +167,72 @@ impl OutputBuffer {
 pub const JIT_ERROR_INPUT_BOUNDS: i64 = -1;
 /// Error code returned when output buffer capacity is exceeded
 pub const JIT_ERROR_OUTPUT_OVERFLOW: i64 = -2;
+
+/// Status of a chunked decode operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStatus {
+    /// All requested rows were decoded successfully
+    Ok,
+    /// Input bounds violation (malformed data)
+    InputBounds,
+    /// Output buffer full, partial progress returned
+    OutputOverflow,
+}
+
+/// Result of a chunked decode operation with partial progress information
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeResult {
+    /// Number of input bytes consumed (up to last complete row)
+    pub bytes_consumed: usize,
+    /// Number of complete rows decoded
+    pub rows_decoded: usize,
+    /// Decode status
+    pub status: DecodeStatus,
+}
+
+impl DecodeResult {
+    /// Create a successful decode result
+    #[inline]
+    pub fn ok(bytes_consumed: usize, rows_decoded: usize) -> Self {
+        Self {
+            bytes_consumed,
+            rows_decoded,
+            status: DecodeStatus::Ok,
+        }
+    }
+
+    /// Create an overflow result with partial progress
+    #[inline]
+    pub fn overflow(bytes_consumed: usize, rows_decoded: usize) -> Self {
+        Self {
+            bytes_consumed,
+            rows_decoded,
+            status: DecodeStatus::OutputOverflow,
+        }
+    }
+
+    /// Create an input bounds error result
+    #[inline]
+    pub fn input_error() -> Self {
+        Self {
+            bytes_consumed: 0,
+            rows_decoded: 0,
+            status: DecodeStatus::InputBounds,
+        }
+    }
+
+    /// Check if decode completed successfully
+    #[inline]
+    pub fn is_ok(&self) -> bool {
+        self.status == DecodeStatus::Ok
+    }
+
+    /// Check if more data needs to be decoded (overflow occurred)
+    #[inline]
+    pub fn has_more(&self) -> bool {
+        self.status == DecodeStatus::OutputOverflow
+    }
+}
 
 impl JitDecoder {
     /// Compile a schema-specific decoder
@@ -247,27 +316,46 @@ impl JitDecoder {
         // Compute column types and buffer slots
         let column_types: Vec<ColumnType> = field_ops.iter().map(Self::op_to_column_type).collect();
 
-        // Build buffer slot mapping: variable-length columns get 2 consecutive buffers (offsets, data)
+        // Build buffer slot mapping:
+        // - Fixed columns: 1 buffer (data), optionally +1 for validity
+        // - Variable columns: 2 buffers (offsets, data), optionally +1 for validity
         let mut buffer_slots = Vec::with_capacity(num_columns);
         let mut buffer_idx = 0usize;
-        for (col_type, field_op) in column_types.iter().zip(field_ops.iter()) {
+        for ((col_type, field_op), field) in column_types.iter().zip(field_ops.iter()).zip(schema.fields().iter()) {
             let element_size = Self::op_to_element_size(field_op);
+            let is_nullable = field.is_nullable();
             match col_type {
                 ColumnType::Fixed => {
+                    let validity = if is_nullable {
+                        let v = buffer_idx + 1;
+                        buffer_idx += 2; // data + validity
+                        Some(v)
+                    } else {
+                        buffer_idx += 1; // data only
+                        None
+                    };
                     buffer_slots.push(BufferSlot {
-                        primary: buffer_idx,
+                        primary: buffer_idx - if is_nullable { 2 } else { 1 },
                         secondary: None,
+                        validity,
                         element_size,
                     });
-                    buffer_idx += 1;
                 }
                 ColumnType::Variable => {
+                    let validity = if is_nullable {
+                        let v = buffer_idx + 2;
+                        buffer_idx += 3; // offsets + data + validity
+                        Some(v)
+                    } else {
+                        buffer_idx += 2; // offsets + data only
+                        None
+                    };
                     buffer_slots.push(BufferSlot {
-                        primary: buffer_idx,     // offsets buffer
-                        secondary: Some(buffer_idx + 1), // data buffer
+                        primary: buffer_idx - if is_nullable { 3 } else { 2 },
+                        secondary: Some(buffer_idx - if is_nullable { 2 } else { 1 }),
+                        validity,
                         element_size,
                     });
-                    buffer_idx += 2;
                 }
             }
         }
@@ -316,6 +404,7 @@ impl JitDecoder {
                 output_ptrs,
                 output_caps,
                 cursor_var,
+                row_var,
                 &output_vars,
                 ptr_type,
                 memcpy_func_ref,
@@ -542,6 +631,7 @@ impl JitDecoder {
         output_ptrs: Value,
         output_caps: Value,
         cursor_var: Variable,
+        row_var: Variable,
         output_vars: &[Variable],
         ptr_type: Type,
         memcpy_func_ref: FuncRef,
@@ -578,18 +668,23 @@ impl JitDecoder {
 
                     builder.ins().brif(is_null, null_block, &[], value_block, &[]);
 
-                    // Null block: write 0 placeholder
+                    // Null block: write 0 placeholder (validity bit stays 0 = null)
                     builder.switch_to_block(null_block);
                     let zero_val = builder.ins().iconst(types::I32, 0);
                     builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
                     builder.ins().jump(continue_block, &[]);
 
-                    // Value block: decode the value
+                    // Value block: decode the value and set validity bit
                     builder.switch_to_block(value_block);
                     let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i32(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -626,18 +721,23 @@ impl JitDecoder {
 
                     builder.ins().brif(is_null, null_block, &[], value_block, &[]);
 
-                    // Null block: write 0 placeholder
+                    // Null block: write 0 placeholder (validity bit stays 0 = null)
                     builder.switch_to_block(null_block);
                     let zero_val = builder.ins().iconst(types::I64, 0);
                     builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
                     builder.ins().jump(continue_block, &[]);
 
-                    // Value block: decode the value
+                    // Value block: decode the value and set validity bit
                     builder.switch_to_block(value_block);
                     let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     // Seal and continue
@@ -674,11 +774,13 @@ impl JitDecoder {
 
                     builder.ins().brif(is_null, null_block, &[], value_block, &[]);
 
+                    // Null block (validity bit stays 0 = null)
                     builder.switch_to_block(null_block);
                     let zero_val = builder.ins().iconst(types::I32, 0);
                     builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode and set validity bit
                     builder.switch_to_block(value_block);
                     let cursor = builder.use_var(cursor_var);
                     Self::emit_fixed_bounds_check(builder, cursor, 4, input_len, error_block);
@@ -688,6 +790,11 @@ impl JitDecoder {
                     let four = builder.ins().iconst(types::I64, 4);
                     let new_cursor = builder.ins().iadd(cursor, four);
                     builder.def_var(cursor_var, new_cursor);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -730,6 +837,7 @@ impl JitDecoder {
                     builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode and set validity bit
                     builder.switch_to_block(value_block);
                     let cursor = builder.use_var(cursor_var);
                     Self::emit_fixed_bounds_check(builder, cursor, 8, input_len, error_block);
@@ -739,6 +847,11 @@ impl JitDecoder {
                     let eight = builder.ins().iconst(types::I64, 8);
                     let new_cursor = builder.ins().iadd(cursor, eight);
                     builder.def_var(cursor_var, new_cursor);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -781,6 +894,7 @@ impl JitDecoder {
                     builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode and set validity bit
                     builder.switch_to_block(value_block);
                     let cursor = builder.use_var(cursor_var);
                     Self::emit_fixed_bounds_check(builder, cursor, 1, input_len, error_block);
@@ -790,6 +904,11 @@ impl JitDecoder {
                     let one = builder.ins().iconst(types::I64, 1);
                     let new_cursor = builder.ins().iadd(cursor, one);
                     builder.def_var(cursor_var, new_cursor);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -863,7 +982,7 @@ impl JitDecoder {
                     }
                     builder.ins().jump(continue_block, &[]);
 
-                    // Value block: write offset, decode bytes, update positions
+                    // Value block: write offset, decode bytes, update positions, set validity bit
                     builder.switch_to_block(value_block);
                     {
                         // Write current offset (data_pos as i32) BEFORE copying data
@@ -903,6 +1022,12 @@ impl JitDecoder {
                         // Advance data position
                         let new_data_pos = builder.ins().iadd(cur_data_pos, len);
                         builder.def_var(output_vars[data_buf_idx], new_data_pos);
+
+                        // Set validity bit to 1 for non-null value
+                        if let Some(validity_idx) = buffer_slot.validity {
+                            let row_idx = builder.use_var(row_var);
+                            Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                        }
                     }
                     builder.ins().jump(continue_block, &[]);
 
@@ -966,13 +1091,18 @@ impl JitDecoder {
                     // For fixed, we could memset to 0, but for simplicity just skip
                     builder.ins().jump(continue_block, &[]);
 
-                    // Value block: copy fixed bytes
+                    // Value block: copy fixed bytes and set validity bit
                     builder.switch_to_block(value_block);
                     let cursor = builder.use_var(cursor_var);
                     Self::emit_fixed_bounds_check(builder, cursor, *size as i64, input_len, error_block);
                     Self::emit_memcpy(builder, input_ptr, cursor, output_write_ptr, size_val, memcpy_func_ref);
                     let new_cursor = builder.ins().iadd(cursor, size_val);
                     builder.def_var(cursor_var, new_cursor);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1012,8 +1142,14 @@ impl JitDecoder {
                     builder.switch_to_block(null_block);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode struct and set validity bit
                     builder.switch_to_block(value_block);
                     Self::emit_struct_decode(builder, child_ops, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, buf_idx, error_block);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1045,12 +1181,18 @@ impl JitDecoder {
                     builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode enum and set validity bit
                     builder.switch_to_block(value_block);
                     let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     // Enum indices are stored directly (no zigzag)
                     let value_i32 = builder.ins().ireduce(types::I32, value);
                     builder.ins().store(MemFlags::trusted(), value_i32, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1101,9 +1243,14 @@ impl JitDecoder {
                     builder.switch_to_block(null_block);
                     builder.ins().jump(continue_block, &[]);
 
-                    // Value block: decode list
+                    // Value block: decode list and set validity bit
                     builder.switch_to_block(value_block);
                     Self::emit_list_decode(builder, element, buffer_slot, input_ptr, input_len, output_ptrs, output_caps, cursor_var, output_vars, ptr_type, error_block);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1136,8 +1283,14 @@ impl JitDecoder {
                     builder.switch_to_block(null_block);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode map and set validity bit
                     builder.switch_to_block(value_block);
                     Self::emit_map_decode(builder, value, buffer_slot, input_ptr, input_len, output_ptrs, output_caps, cursor_var, output_vars, ptr_type, error_block);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1169,8 +1322,14 @@ impl JitDecoder {
                     builder.switch_to_block(null_block);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode union and set validity bit
                     builder.switch_to_block(value_block);
                     Self::emit_union_decode(builder, variants, type_ids, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, buf_idx, error_block);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1199,8 +1358,14 @@ impl JitDecoder {
                     builder.switch_to_block(null_block);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode fixed size list and set validity bit
                     builder.switch_to_block(value_block);
                     Self::emit_fixed_size_list_decode(builder, element, *size, input_ptr, input_len, cursor_var, output_write_ptr, output_pos, output_vars, buf_idx, error_block);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1235,8 +1400,14 @@ impl JitDecoder {
                     builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 8);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode and set validity bit
                     builder.switch_to_block(value_block);
                     Self::emit_decimal128_decode(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1277,8 +1448,14 @@ impl JitDecoder {
                     builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 24);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode and set validity bit
                     builder.switch_to_block(value_block);
                     Self::emit_decimal256_decode(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1313,11 +1490,17 @@ impl JitDecoder {
                     builder.ins().store(MemFlags::trusted(), zero_val, output_write_ptr, 0);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode and set validity bit
                     builder.switch_to_block(value_block);
                     let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     let zigzag = Self::emit_zigzag_decode_i64(builder, value);
                     builder.ins().store(MemFlags::trusted(), zigzag, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -1362,8 +1545,14 @@ impl JitDecoder {
                     builder.switch_to_block(null_block);
                     builder.ins().jump(continue_block, &[]);
 
+                    // Value block: decode and set validity bit
                     builder.switch_to_block(value_block);
                     Self::emit_interval_decode(builder, *unit, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
+                    // Set validity bit to 1 for non-null value
+                    if let Some(validity_idx) = buffer_slot.validity {
+                        let row_idx = builder.use_var(row_var);
+                        Self::emit_set_validity_bit(builder, output_ptrs, validity_idx, row_idx, ptr_type);
+                    }
                     builder.ins().jump(continue_block, &[]);
 
                     builder.seal_block(null_block);
@@ -2337,6 +2526,55 @@ impl JitDecoder {
         }
     }
 
+    /// Emit Cranelift IR to set a validity bit for a non-null value
+    ///
+    /// Arrow validity bitmaps: bit 0 = null, bit 1 = valid
+    /// Since buffers are initialized to 0 (all null), we only need to set bits for valid values.
+    ///
+    /// # Arguments
+    /// * `builder` - Function builder
+    /// * `output_ptrs` - Base pointer to output pointer array
+    /// * `validity_idx` - Index of validity buffer in output_ptrs
+    /// * `row_idx` - Current row index (to calculate byte and bit position)
+    /// * `ptr_type` - Pointer type (I64)
+    fn emit_set_validity_bit(
+        builder: &mut FunctionBuilder,
+        output_ptrs: Value,
+        validity_idx: usize,
+        row_idx: Value,
+        ptr_type: Type,
+    ) {
+        // Get validity buffer pointer
+        let validity_buf_offset = builder.ins().iconst(ptr_type, (validity_idx * 8) as i64);
+        let validity_ptr_addr = builder.ins().iadd(output_ptrs, validity_buf_offset);
+        let validity_ptr = builder.ins().load(ptr_type, MemFlags::trusted(), validity_ptr_addr, 0);
+
+        // Calculate byte_index = row_idx / 8
+        let eight = builder.ins().iconst(types::I64, 8);
+        let byte_index = builder.ins().udiv(row_idx, eight);
+
+        // Calculate bit_position = row_idx % 8
+        let bit_position = builder.ins().urem(row_idx, eight);
+
+        // Calculate address of the validity byte
+        let validity_byte_addr = builder.ins().iadd(validity_ptr, byte_index);
+
+        // Load current byte value
+        let current_byte = builder.ins().load(types::I8, MemFlags::trusted(), validity_byte_addr, 0);
+
+        // Calculate the bit mask: 1 << bit_position
+        let one_i8 = builder.ins().iconst(types::I8, 1);
+        // Need to truncate bit_position from I64 to I8 for shift
+        let bit_pos_i8 = builder.ins().ireduce(types::I8, bit_position);
+        let bit_mask = builder.ins().ishl(one_i8, bit_pos_i8);
+
+        // Set the bit: current_byte | bit_mask
+        let new_byte = builder.ins().bor(current_byte, bit_mask);
+
+        // Store the updated byte
+        builder.ins().store(MemFlags::trusted(), new_byte, validity_byte_addr, 0);
+    }
+
     /// Emit Cranelift IR for varint decoding with bounds checking
     /// Handles up to 10 bytes (full i64 range)
     /// Returns (decoded_value, new_cursor_position)
@@ -2775,6 +3013,152 @@ impl JitDecoder {
         }
 
         Ok(result)
+    }
+
+    /// Decode Avro data with chunked progress reporting
+    ///
+    /// This method is designed for streaming/chunked decode scenarios where:
+    /// - Input may be larger than output buffer capacity
+    /// - Partial progress must be tracked for continuation
+    ///
+    /// Pre-calculates max rows based on fixed-size column capacities,
+    /// then handles variable-length overflow with binary search.
+    ///
+    /// # Arguments
+    /// * `input` - Raw Avro bytes (without header/sync markers)
+    /// * `output_buffers` - Output buffer specifications with pointers and capacities
+    /// * `row_count` - Maximum number of rows to decode
+    ///
+    /// # Returns
+    /// DecodeResult with bytes_consumed, rows_decoded, and status
+    pub fn decode_chunked(
+        &self,
+        input: &[u8],
+        output_buffers: &[OutputBuffer],
+        row_count: usize,
+    ) -> DecodeResult {
+        if row_count == 0 {
+            return DecodeResult::ok(0, 0);
+        }
+
+        if output_buffers.len() != self.total_buffers {
+            return DecodeResult::input_error();
+        }
+
+        // Calculate max rows that fit based on fixed-size column capacities
+        // JIT doesn't do bounds checking for fixed-size columns, so we must pre-validate
+        let max_rows_by_capacity = self.compute_max_rows(output_buffers);
+
+        if max_rows_by_capacity == 0 {
+            // Buffer too small for even 1 row
+            return DecodeResult::overflow(0, 0);
+        }
+
+        // Use minimum of requested rows and capacity-limited rows
+        let rows_to_decode = row_count.min(max_rows_by_capacity);
+
+        let mut ptrs: Vec<*mut u8> = output_buffers.iter().map(|b| b.ptr).collect();
+        let caps: Vec<usize> = output_buffers.iter().map(|b| b.capacity).collect();
+
+        let result = self.decode_with_caps(input, &mut ptrs, &caps, rows_to_decode);
+
+        match result {
+            Ok(bytes_consumed) => {
+                if rows_to_decode < row_count {
+                    // We decoded fewer rows than requested due to capacity
+                    DecodeResult::overflow(bytes_consumed, rows_to_decode)
+                } else {
+                    DecodeResult::ok(bytes_consumed, rows_to_decode)
+                }
+            }
+            Err(ref e) if e.contains("overflow") => {
+                // Variable-length column overflow - use binary search
+                self.find_max_rows_variable(input, output_buffers, rows_to_decode)
+            }
+            Err(_) => {
+                // Input bounds error
+                DecodeResult::input_error()
+            }
+        }
+    }
+
+    /// Compute maximum rows that fit based on fixed-size column capacities
+    fn compute_max_rows(&self, output_buffers: &[OutputBuffer]) -> usize {
+        let mut max_rows = usize::MAX;
+
+        for (col_idx, field) in self.schema.fields().iter().enumerate() {
+            let slot = &self.buffer_slots[col_idx];
+
+            // Check fixed-size columns
+            if let Some(elem_size) = Self::fixed_size_for_type(field.data_type()) {
+                let capacity = output_buffers[slot.primary].capacity;
+                let rows_that_fit = capacity / elem_size;
+                max_rows = max_rows.min(rows_that_fit);
+            }
+
+            // Check offsets buffer for variable-length columns
+            if slot.secondary.is_some() {
+                // Offsets buffer needs (row_count + 1) * 4 bytes
+                let offsets_capacity = output_buffers[slot.primary].capacity;
+                let rows_that_fit = if offsets_capacity >= 4 {
+                    (offsets_capacity / 4).saturating_sub(1)
+                } else {
+                    0
+                };
+                max_rows = max_rows.min(rows_that_fit);
+            }
+        }
+
+        max_rows
+    }
+
+    /// Find maximum rows for variable-length overflow using binary search
+    fn find_max_rows_variable(
+        &self,
+        input: &[u8],
+        output_buffers: &[OutputBuffer],
+        max_rows: usize,
+    ) -> DecodeResult {
+        let caps: Vec<usize> = output_buffers.iter().map(|b| b.capacity).collect();
+
+        // Try 1 row first
+        let mut ptrs: Vec<*mut u8> = output_buffers.iter().map(|b| b.ptr).collect();
+        if self.decode_with_caps(input, &mut ptrs, &caps, 1).is_err() {
+            return DecodeResult::overflow(0, 0);
+        }
+
+        // Exponential search to find upper bound
+        let mut low = 1usize;
+        let mut high = 2usize;
+
+        while high < max_rows {
+            let mut ptrs: Vec<*mut u8> = output_buffers.iter().map(|b| b.ptr).collect();
+            if self.decode_with_caps(input, &mut ptrs, &caps, high).is_ok() {
+                low = high;
+                high *= 2;
+            } else {
+                break;
+            }
+        }
+        high = high.min(max_rows);
+
+        // Binary search between low and high
+        while low < high {
+            let mid = low + (high - low + 1) / 2;
+            let mut ptrs: Vec<*mut u8> = output_buffers.iter().map(|b| b.ptr).collect();
+            if self.decode_with_caps(input, &mut ptrs, &caps, mid).is_ok() {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+
+        // Final decode to get bytes_consumed
+        let mut ptrs: Vec<*mut u8> = output_buffers.iter().map(|b| b.ptr).collect();
+        match self.decode_with_caps(input, &mut ptrs, &caps, low) {
+            Ok(bytes_consumed) => DecodeResult::overflow(bytes_consumed, low),
+            Err(_) => DecodeResult::overflow(0, 0),
+        }
     }
 
 }
@@ -3555,7 +3939,8 @@ mod tests {
 
         let row_count = test_values.len();
         let mut output = vec![0u8; row_count * 8];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        let mut validity = vec![0u8; (row_count + 7) / 8];
+        let mut output_ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
         let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
@@ -3598,7 +3983,8 @@ mod tests {
 
         let row_count = values_or_nulls.len();
         let mut output = vec![0xFFu8; row_count * 8];  // Fill with sentinel
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        let mut validity = vec![0u8; (row_count + 7) / 8];
+        let mut output_ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
         let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
@@ -3632,7 +4018,8 @@ mod tests {
         }
 
         let mut output = vec![0xFFu8; row_count * 8];  // Fill with sentinel
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        let mut validity = vec![0u8; (row_count + 7) / 8];
+        let mut output_ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
         let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
@@ -3726,7 +4113,8 @@ mod tests {
 
         let row_count = values.len();
         let mut output = vec![0xFFu8; row_count * 4];
-        let mut output_ptrs = vec![output.as_mut_ptr()];
+        let mut validity = vec![0u8; (row_count + 7) / 8];
+        let mut output_ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
         let consumed = decoder.decode(&input, &mut output_ptrs, row_count).expect("Decode failed");
         assert_eq!(consumed, input.len());
@@ -4993,6 +5381,1297 @@ mod tests {
         assert_eq!(decoder.required_capacity(1, row_count), Some(40)); // 10 * 4
         // Variable column returns None
         assert_eq!(decoder.required_capacity(2, row_count), None);
+    }
+
+    #[test]
+    fn test_decode_result_struct() {
+        // Test ok() constructor
+        let ok_result = DecodeResult::ok(100, 10);
+        assert_eq!(ok_result.bytes_consumed, 100);
+        assert_eq!(ok_result.rows_decoded, 10);
+        assert_eq!(ok_result.status, DecodeStatus::Ok);
+        assert!(ok_result.is_ok());
+        assert!(!ok_result.has_more());
+
+        // Test overflow() constructor
+        let overflow_result = DecodeResult::overflow(50, 5);
+        assert_eq!(overflow_result.bytes_consumed, 50);
+        assert_eq!(overflow_result.rows_decoded, 5);
+        assert_eq!(overflow_result.status, DecodeStatus::OutputOverflow);
+        assert!(!overflow_result.is_ok());
+        assert!(overflow_result.has_more());
+
+        // Test input_error() constructor
+        let error_result = DecodeResult::input_error();
+        assert_eq!(error_result.bytes_consumed, 0);
+        assert_eq!(error_result.rows_decoded, 0);
+        assert_eq!(error_result.status, DecodeStatus::InputBounds);
+        assert!(!error_result.is_ok());
+        assert!(!error_result.has_more());
+    }
+
+    #[test]
+    fn test_decode_chunked_success() {
+        // Test decode_chunked when all rows fit
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Encode 10 rows
+        let mut input = Vec::new();
+        for i in 0..10i64 {
+            input.extend(encode_varint_i64(i));
+        }
+
+        // Buffer big enough for all rows (80 bytes for 10 i64s)
+        let mut output = vec![0u8; 80];
+        let output_buffers = vec![OutputBuffer::new(output.as_mut_ptr(), 80)];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, 10);
+
+        assert!(result.is_ok());
+        assert!(!result.has_more());
+        assert_eq!(result.rows_decoded, 10);
+        assert_eq!(result.bytes_consumed, input.len());
+    }
+
+    #[test]
+    fn test_decode_chunked_overflow() {
+        // Test decode_chunked when buffer is too small
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Encode 100 rows
+        let mut input = Vec::new();
+        for i in 0..100i64 {
+            input.extend(encode_varint_i64(i));
+        }
+
+        // Buffer only big enough for 10 rows (80 bytes)
+        let mut output = vec![0u8; 80];
+        let output_buffers = vec![OutputBuffer::new(output.as_mut_ptr(), 80)];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, 100);
+
+        // Should report overflow with partial progress
+        assert!(!result.is_ok());
+        assert!(result.has_more());
+        assert_eq!(result.rows_decoded, 10); // 80 bytes / 8 bytes per i64 = 10 rows
+        assert!(result.bytes_consumed > 0);
+        assert!(result.bytes_consumed < input.len());
+    }
+
+    #[test]
+    fn test_decode_chunked_single_row_overflow() {
+        // Test when even a single row doesn't fit
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Single row
+        let input = encode_varint_i64(42);
+
+        // Buffer too small for even 1 row (need 8 bytes, have 4)
+        let mut output = vec![0u8; 4];
+        let output_buffers = vec![OutputBuffer::new(output.as_mut_ptr(), 4)];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, 1);
+
+        // Should report overflow with 0 rows decoded
+        assert!(!result.is_ok());
+        assert!(result.has_more());
+        assert_eq!(result.rows_decoded, 0);
+        assert_eq!(result.bytes_consumed, 0);
+    }
+
+    #[test]
+    fn test_decode_chunked_continuation() {
+        // Test that we can continue decoding from where we left off
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Encode 20 rows
+        let mut input = Vec::new();
+        for i in 0..20i64 {
+            input.extend(encode_varint_i64(i));
+        }
+
+        // Buffer for 10 rows
+        let mut output = vec![0u8; 80];
+        let output_buffers = vec![OutputBuffer::new(output.as_mut_ptr(), 80)];
+
+        // First chunk
+        let result1 = decoder.decode_chunked(&input, &output_buffers, 20);
+        assert!(result1.has_more());
+        assert_eq!(result1.rows_decoded, 10);
+
+        // Second chunk - continue from where we left off
+        let remaining_input = &input[result1.bytes_consumed..];
+        let remaining_rows = 20 - result1.rows_decoded;
+
+        // Reset output buffer
+        output.fill(0);
+        let output_buffers = vec![OutputBuffer::new(output.as_mut_ptr(), 80)];
+
+        let result2 = decoder.decode_chunked(remaining_input, &output_buffers, remaining_rows);
+        assert!(result2.is_ok());
+        assert_eq!(result2.rows_decoded, 10);
+
+        // Total rows decoded should be 20
+        assert_eq!(result1.rows_decoded + result2.rows_decoded, 20);
+    }
+
+    // =========================================================================
+    // COMPREHENSIVE NULLABLE TESTS WITH VALIDITY BITMAP VERIFICATION
+    // =========================================================================
+    //
+    // These tests verify that:
+    // 1. Validity bitmaps are correctly set (bit=1 for non-null, bit=0 for null)
+    // 2. Data values are correct for non-null entries
+    // 3. All data types handle nullability correctly
+    // 4. Corner cases (all nulls, no nulls, mixed, single row) work correctly
+    // =========================================================================
+
+    /// Helper to check validity bit at a given row index
+    fn check_validity_bit(validity: &[u8], row: usize) -> bool {
+        let byte_idx = row / 8;
+        let bit_idx = row % 8;
+        if byte_idx >= validity.len() {
+            return false;
+        }
+        (validity[byte_idx] & (1 << bit_idx)) != 0
+    }
+
+    /// Helper to count valid (non-null) bits in validity buffer
+    fn count_valid_bits(validity: &[u8], row_count: usize) -> usize {
+        (0..row_count).filter(|&i| check_validity_bit(validity, i)).count()
+    }
+
+    // -------------------------------------------------------------------------
+    // Int64 Nullable Tests with Validity Bitmap
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_nullable_int64_validity_all_non_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+        let test_values: Vec<i64> = vec![10, -20, 0, i64::MAX, i64::MIN];
+        let row_count = test_values.len();
+
+        let mut input = Vec::new();
+        for &v in &test_values {
+            input.extend(encode_union_tag(false)); // non-null
+            input.extend(encode_varint_i64(v));
+        }
+
+        // Allocate data buffer and validity buffer
+        let mut data_buf = vec![0u8; row_count * 8];
+        let validity_bytes = (row_count + 7) / 8;
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok(), "Decode failed: {:?}", result);
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify all validity bits are set to 1
+        for i in 0..row_count {
+            assert!(check_validity_bit(&validity_buf, i),
+                "Validity bit should be 1 for non-null at row {}", i);
+        }
+        assert_eq!(count_valid_bits(&validity_buf, row_count), row_count);
+
+        // Verify data values
+        for (i, &expected) in test_values.iter().enumerate() {
+            let actual = i64::from_le_bytes(data_buf[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Data mismatch at row {}", i);
+        }
+    }
+
+    #[test]
+    fn test_nullable_int64_validity_all_nulls_zeroed_buffer() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+        let row_count = 10;
+
+        let mut input = Vec::new();
+        for _ in 0..row_count {
+            input.extend(encode_union_tag(true)); // null
+        }
+
+        let mut data_buf = vec![0u8; row_count * 8];
+        let validity_bytes = (row_count + 7) / 8;
+        let mut validity_buf = vec![0u8; validity_bytes]; // zeroed - nulls stay as 0
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        // All validity bits should be 0 (null)
+        for i in 0..row_count {
+            assert!(!check_validity_bit(&validity_buf, i),
+                "Validity bit should be 0 for null at row {}", i);
+        }
+        assert_eq!(count_valid_bits(&validity_buf, row_count), 0);
+    }
+
+    #[test]
+    fn test_nullable_int64_validity_mixed_pattern() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Mixed pattern: value, null, value, value, null, null, value
+        let values: Vec<Option<i64>> = vec![
+            Some(100), None, Some(-50), Some(0), None, None, Some(999),
+        ];
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(val) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_varint_i64(*val));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count * 8];
+        let validity_bytes = (row_count + 7) / 8;
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify validity bits match pattern
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            match v {
+                Some(_) => assert!(is_valid, "Row {} should be valid (non-null)", i),
+                None => assert!(!is_valid, "Row {} should be invalid (null)", i),
+            }
+        }
+
+        // Verify data values for non-null entries
+        for (i, v) in values.iter().enumerate() {
+            if let Some(expected) = v {
+                let actual = i64::from_le_bytes(data_buf[i * 8..(i + 1) * 8].try_into().unwrap());
+                assert_eq!(actual, *expected, "Data mismatch at row {}", i);
+            }
+        }
+    }
+
+    #[test]
+    fn test_nullable_int64_single_row_non_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let mut input = Vec::new();
+        input.extend(encode_union_tag(false));
+        input.extend(encode_varint_i64(42));
+
+        let mut data_buf = vec![0u8; 8];
+        let mut validity_buf = vec![0u8; 1];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, 1);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, 1);
+
+        assert!(check_validity_bit(&validity_buf, 0), "Single row should be valid");
+        let actual = i64::from_le_bytes(data_buf[0..8].try_into().unwrap());
+        assert_eq!(actual, 42);
+    }
+
+    #[test]
+    fn test_nullable_int64_single_row_null() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let mut input = Vec::new();
+        input.extend(encode_union_tag(true)); // null
+
+        let mut data_buf = vec![0u8; 8];
+        let mut validity_buf = vec![0u8; 1];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, 1);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, 1);
+
+        assert!(!check_validity_bit(&validity_buf, 0), "Single null row should be invalid");
+    }
+
+    // -------------------------------------------------------------------------
+    // Int32 Nullable Tests with Validity Bitmap
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_nullable_int32_validity_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let values: Vec<Option<i32>> = vec![
+            Some(1), Some(-1), None, Some(i32::MAX), None, Some(i32::MIN), Some(0),
+        ];
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(val) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_varint_i32(*val));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count * 4];
+        let validity_bytes = (row_count + 7) / 8;
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify validity and data
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            match v {
+                Some(expected) => {
+                    assert!(is_valid, "Row {} should be valid", i);
+                    let actual = i32::from_le_bytes(data_buf[i * 4..(i + 1) * 4].try_into().unwrap());
+                    assert_eq!(actual, *expected, "Data mismatch at row {}", i);
+                }
+                None => {
+                    assert!(!is_valid, "Row {} should be invalid (null)", i);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Float64 Nullable Tests with Validity Bitmap
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_nullable_float64_validity_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let values: Vec<Option<f64>> = vec![
+            Some(3.14159), None, Some(-0.0), Some(f64::INFINITY), None,
+            Some(f64::NEG_INFINITY), Some(1e308), None,
+        ];
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(val) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(val.to_le_bytes());
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count * 8];
+        let validity_bytes = (row_count + 7) / 8;
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            match v {
+                Some(expected) => {
+                    assert!(is_valid, "Row {} should be valid", i);
+                    let actual = f64::from_le_bytes(data_buf[i * 8..(i + 1) * 8].try_into().unwrap());
+                    if expected.is_nan() {
+                        assert!(actual.is_nan(), "Row {} should be NaN", i);
+                    } else {
+                        assert_eq!(actual, *expected, "Data mismatch at row {}", i);
+                    }
+                }
+                None => {
+                    assert!(!is_valid, "Row {} should be invalid", i);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nullable_float64_nan_handling() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let values: Vec<Option<f64>> = vec![Some(f64::NAN), None, Some(f64::NAN)];
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(val) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(val.to_le_bytes());
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count * 8];
+        let mut validity_buf = vec![0u8; 1];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+
+        // Row 0: NaN (valid)
+        assert!(check_validity_bit(&validity_buf, 0));
+        let v0 = f64::from_le_bytes(data_buf[0..8].try_into().unwrap());
+        assert!(v0.is_nan());
+
+        // Row 1: null
+        assert!(!check_validity_bit(&validity_buf, 1));
+
+        // Row 2: NaN (valid)
+        assert!(check_validity_bit(&validity_buf, 2));
+        let v2 = f64::from_le_bytes(data_buf[16..24].try_into().unwrap());
+        assert!(v2.is_nan());
+    }
+
+    // -------------------------------------------------------------------------
+    // Float32 Nullable Tests with Validity Bitmap
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_nullable_float32_validity_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Float32, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let values: Vec<Option<f32>> = vec![
+            Some(1.5f32), None, Some(-0.0f32), Some(f32::MAX), None, Some(f32::MIN),
+        ];
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(val) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(val.to_le_bytes());
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count * 4];
+        let validity_bytes = (row_count + 7) / 8;
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            match v {
+                Some(expected) => {
+                    assert!(is_valid, "Row {} should be valid", i);
+                    let actual = f32::from_le_bytes(data_buf[i * 4..(i + 1) * 4].try_into().unwrap());
+                    assert_eq!(actual, *expected, "Data mismatch at row {}", i);
+                }
+                None => {
+                    assert!(!is_valid, "Row {} should be invalid", i);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Boolean Nullable Tests with Validity Bitmap
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_nullable_boolean_validity_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let values: Vec<Option<bool>> = vec![
+            Some(true), None, Some(false), Some(true), None, None, Some(false),
+        ];
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(val) => {
+                    input.extend(encode_union_tag(false));
+                    input.push(if *val { 1 } else { 0 });
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count]; // 1 byte per boolean
+        let validity_bytes = (row_count + 7) / 8;
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            match v {
+                Some(expected) => {
+                    assert!(is_valid, "Row {} should be valid", i);
+                    let actual = data_buf[i] != 0;
+                    assert_eq!(actual, *expected, "Boolean mismatch at row {}", i);
+                }
+                None => {
+                    assert!(!is_valid, "Row {} should be invalid", i);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_nullable_boolean_all_true() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("flag", DataType::Boolean, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+        let row_count = 8; // exactly one byte of validity
+
+        let mut input = Vec::new();
+        for _ in 0..row_count {
+            input.extend(encode_union_tag(false));
+            input.push(1); // true
+        }
+
+        let mut data_buf = vec![0u8; row_count];
+        let mut validity_buf = vec![0u8; 1];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+
+        // All bits should be 1 -> validity_buf[0] = 0xFF
+        assert_eq!(validity_buf[0], 0xFF, "All 8 validity bits should be set");
+
+        for i in 0..row_count {
+            assert_eq!(data_buf[i], 1, "All values should be true");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // String/Bytes (Variable-length) Nullable Tests with Validity Bitmap
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_nullable_string_validity_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let values: Vec<Option<&str>> = vec![
+            Some("hello"), None, Some(""), Some("world"), None, Some("test"),
+        ];
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(s) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_avro_bytes(s.as_bytes()));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        // Variable-length: offsets buffer + data buffer + validity buffer
+        let offsets_size = (row_count + 1) * 4; // i32 offsets, need n+1 for final offset
+        let data_size = 256; // plenty of space
+        let validity_bytes = (row_count + 7) / 8;
+
+        let mut offsets_buf = vec![0u8; offsets_size];
+        let mut data_buf = vec![0u8; data_size];
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(offsets_buf.as_mut_ptr(), offsets_buf.len()),
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok(), "Decode failed: {:?}", result);
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify validity bits
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            match v {
+                Some(_) => assert!(is_valid, "Row {} should be valid", i),
+                None => assert!(!is_valid, "Row {} should be invalid", i),
+            }
+        }
+
+        // Verify string values by reading offsets
+        let non_null_count = values.iter().filter(|v| v.is_some()).count();
+        assert_eq!(count_valid_bits(&validity_buf, row_count), non_null_count);
+    }
+
+    #[test]
+    fn test_nullable_string_all_empty_strings() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+        let row_count = 5;
+
+        let mut input = Vec::new();
+        for _ in 0..row_count {
+            input.extend(encode_union_tag(false)); // non-null
+            input.extend(encode_avro_bytes(b"")); // empty string
+        }
+
+        let offsets_size = (row_count + 1) * 4;
+        let data_size = 64;
+        let validity_bytes = (row_count + 7) / 8;
+
+        let mut offsets_buf = vec![0u8; offsets_size];
+        let mut data_buf = vec![0u8; data_size];
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(offsets_buf.as_mut_ptr(), offsets_buf.len()),
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        // All should be valid (empty string != null)
+        assert_eq!(count_valid_bits(&validity_buf, row_count), row_count);
+    }
+
+    #[test]
+    fn test_nullable_string_all_nulls() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+        let row_count = 5;
+
+        let mut input = Vec::new();
+        for _ in 0..row_count {
+            input.extend(encode_union_tag(true)); // null
+        }
+
+        let offsets_size = (row_count + 1) * 4;
+        let data_size = 64;
+        let validity_bytes = (row_count + 7) / 8;
+
+        let mut offsets_buf = vec![0u8; offsets_size];
+        let mut data_buf = vec![0u8; data_size];
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(offsets_buf.as_mut_ptr(), offsets_buf.len()),
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        // All should be null
+        assert_eq!(count_valid_bits(&validity_buf, row_count), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Enum (Dictionary) Nullable Tests with Validity Bitmap
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_nullable_enum_validity_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "status",
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let values: Vec<Option<u32>> = vec![Some(0), None, Some(1), Some(2), None, Some(0)];
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(idx) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_enum_index(*idx));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count * 4]; // i32 indices
+        let validity_bytes = (row_count + 7) / 8;
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            match v {
+                Some(expected) => {
+                    assert!(is_valid, "Row {} should be valid", i);
+                    let actual = i32::from_le_bytes(data_buf[i * 4..(i + 1) * 4].try_into().unwrap());
+                    assert_eq!(actual as u32, *expected, "Enum index mismatch at row {}", i);
+                }
+                None => {
+                    assert!(!is_valid, "Row {} should be invalid", i);
+                }
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Multi-column Nullable Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_multi_column_nullable_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new("value", DataType::Float64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Pattern: (id, value) - some nulls in each column
+        let rows: Vec<(Option<i64>, Option<f64>)> = vec![
+            (Some(1), Some(1.5)),
+            (None, Some(2.5)),
+            (Some(3), None),
+            (None, None),
+            (Some(5), Some(5.5)),
+        ];
+        let row_count = rows.len();
+
+        let mut input = Vec::new();
+        for (id, val) in &rows {
+            // id column
+            match id {
+                Some(v) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_varint_i64(*v));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+            // value column
+            match val {
+                Some(v) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(v.to_le_bytes());
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        // Column 0 (id): data + validity
+        // Column 1 (value): data + validity
+        let mut id_data = vec![0u8; row_count * 8];
+        let mut id_validity = vec![0u8; (row_count + 7) / 8];
+        let mut val_data = vec![0u8; row_count * 8];
+        let mut val_validity = vec![0u8; (row_count + 7) / 8];
+
+        let output_buffers = vec![
+            OutputBuffer::new(id_data.as_mut_ptr(), id_data.len()),
+            OutputBuffer::new(id_validity.as_mut_ptr(), id_validity.len()),
+            OutputBuffer::new(val_data.as_mut_ptr(), val_data.len()),
+            OutputBuffer::new(val_validity.as_mut_ptr(), val_validity.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok(), "Decode failed: {:?}", result);
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify id column
+        for (i, (id, _)) in rows.iter().enumerate() {
+            let is_valid = check_validity_bit(&id_validity, i);
+            match id {
+                Some(expected) => {
+                    assert!(is_valid, "Row {} id should be valid", i);
+                    let actual = i64::from_le_bytes(id_data[i * 8..(i + 1) * 8].try_into().unwrap());
+                    assert_eq!(actual, *expected);
+                }
+                None => assert!(!is_valid, "Row {} id should be null", i),
+            }
+        }
+
+        // Verify value column
+        for (i, (_, val)) in rows.iter().enumerate() {
+            let is_valid = check_validity_bit(&val_validity, i);
+            match val {
+                Some(expected) => {
+                    assert!(is_valid, "Row {} value should be valid", i);
+                    let actual = f64::from_le_bytes(val_data[i * 8..(i + 1) * 8].try_into().unwrap());
+                    assert_eq!(actual, *expected);
+                }
+                None => assert!(!is_valid, "Row {} value should be null", i),
+            }
+        }
+    }
+
+    #[test]
+    fn test_mixed_nullable_and_non_nullable_columns() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("required_id", DataType::Int64, false),  // NOT nullable
+            Field::new("optional_value", DataType::Int64, true), // nullable
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Pattern: required_id always present, optional_value sometimes null
+        let rows: Vec<(i64, Option<i64>)> = vec![
+            (1, Some(100)),
+            (2, None),
+            (3, Some(300)),
+            (4, None),
+            (5, Some(500)),
+        ];
+        let row_count = rows.len();
+
+        let mut input = Vec::new();
+        for (id, val) in &rows {
+            // required_id - no union tag
+            input.extend(encode_varint_i64(*id));
+            // optional_value - has union tag
+            match val {
+                Some(v) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_varint_i64(*v));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        // Column 0 (required): data only (no validity)
+        // Column 1 (optional): data + validity
+        let mut id_data = vec![0u8; row_count * 8];
+        let mut val_data = vec![0u8; row_count * 8];
+        let mut val_validity = vec![0u8; (row_count + 7) / 8];
+
+        let output_buffers = vec![
+            OutputBuffer::new(id_data.as_mut_ptr(), id_data.len()),
+            OutputBuffer::new(val_data.as_mut_ptr(), val_data.len()),
+            OutputBuffer::new(val_validity.as_mut_ptr(), val_validity.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok(), "Decode failed: {:?}", result);
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify required_id (all values should be present)
+        for (i, (expected_id, _)) in rows.iter().enumerate() {
+            let actual = i64::from_le_bytes(id_data[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, *expected_id, "required_id mismatch at row {}", i);
+        }
+
+        // Verify optional_value with validity
+        for (i, (_, val)) in rows.iter().enumerate() {
+            let is_valid = check_validity_bit(&val_validity, i);
+            match val {
+                Some(expected) => {
+                    assert!(is_valid, "Row {} optional_value should be valid", i);
+                    let actual = i64::from_le_bytes(val_data[i * 8..(i + 1) * 8].try_into().unwrap());
+                    assert_eq!(actual, *expected);
+                }
+                None => assert!(!is_valid, "Row {} optional_value should be null", i),
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Edge Cases and Stress Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_nullable_validity_byte_boundary_9_rows() {
+        // Test crossing byte boundary: 9 rows = 2 validity bytes
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // 9 rows: bits 0-7 in byte 0, bit 8 in byte 1
+        let values: Vec<Option<i64>> = vec![
+            Some(1), None, Some(3), Some(4), None, Some(6), Some(7), Some(8), Some(9),
+        ];
+        let row_count = values.len();
+        assert_eq!(row_count, 9);
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(val) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_varint_i64(*val));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count * 8];
+        let validity_bytes = (row_count + 7) / 8;
+        assert_eq!(validity_bytes, 2);
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify each bit
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            assert_eq!(is_valid, v.is_some(), "Validity mismatch at row {}", i);
+        }
+    }
+
+    #[test]
+    fn test_nullable_validity_16_rows() {
+        // Test exactly 16 rows = 2 full validity bytes
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Alternating null/non-null pattern
+        let values: Vec<Option<i64>> = (0..16).map(|i| {
+            if i % 2 == 0 { Some(i as i64) } else { None }
+        }).collect();
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(val) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_varint_i64(*val));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count * 8];
+        let mut validity_buf = vec![0u8; 2];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+
+        // Expected pattern: 0b01010101 for both bytes (even indices valid)
+        assert_eq!(validity_buf[0], 0b01010101, "First validity byte mismatch");
+        assert_eq!(validity_buf[1], 0b01010101, "Second validity byte mismatch");
+    }
+
+    #[test]
+    fn test_nullable_large_row_count() {
+        // Test with 1000 rows to stress test validity bitmap handling
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+        let row_count = 1000;
+
+        // Every 3rd row is null
+        let values: Vec<Option<i64>> = (0..row_count).map(|i| {
+            if i % 3 == 0 { None } else { Some(i as i64) }
+        }).collect();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(val) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_varint_i64(*val));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let mut data_buf = vec![0u8; row_count * 8];
+        let validity_bytes = (row_count + 7) / 8;
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify all validity bits
+        let mut null_count = 0;
+        let mut valid_count = 0;
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            assert_eq!(is_valid, v.is_some(), "Validity mismatch at row {}", i);
+            if v.is_some() {
+                valid_count += 1;
+            } else {
+                null_count += 1;
+            }
+        }
+
+        // Every 3rd row is null: 334 nulls, 666 valid (for 1000 rows)
+        assert_eq!(null_count, 334);
+        assert_eq!(valid_count, 666);
+        assert_eq!(count_valid_bits(&validity_buf, row_count), valid_count);
+    }
+
+    #[test]
+    fn test_nullable_zero_rows() {
+        // Test with 0 rows - should handle gracefully
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let input: Vec<u8> = Vec::new();
+        let mut data_buf = vec![0u8; 8]; // some space, but 0 rows
+        let mut validity_buf = vec![0u8; 1];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, 0);
+        assert!(result.is_ok());
+        assert_eq!(result.rows_decoded, 0);
+        assert_eq!(result.bytes_consumed, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Binary (Bytes) Nullable Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_nullable_binary_validity_mixed() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("data", DataType::Binary, true),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let values: Vec<Option<&[u8]>> = vec![
+            Some(b"hello"),
+            None,
+            Some(b""),
+            Some(&[0, 1, 255, 128]),
+            None,
+        ];
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(data) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_avro_bytes(data));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let offsets_size = (row_count + 1) * 4;
+        let data_size = 256;
+        let validity_bytes = (row_count + 7) / 8;
+
+        let mut offsets_buf = vec![0u8; offsets_size];
+        let mut data_buf = vec![0u8; data_size];
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(offsets_buf.as_mut_ptr(), offsets_buf.len()),
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok(), "Decode failed");
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify validity
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            assert_eq!(is_valid, v.is_some(), "Validity mismatch at row {}", i);
+        }
     }
 
 }

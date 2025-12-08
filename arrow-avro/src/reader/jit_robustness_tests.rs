@@ -775,7 +775,8 @@ fn test_nullable_truncated_tag() {
     // Empty input - can't even read the null tag
     let data: Vec<u8> = vec![];
     let mut output = vec![0u8; 8];
-    let mut ptrs = vec![output.as_mut_ptr()];
+    let mut validity = vec![0u8; 1]; // validity buffer for nullable field
+    let mut ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
     let result = decoder.decode(&data, &mut ptrs, 1);
     assert!(result.is_err(), "Expected error for truncated nullable tag");
@@ -791,7 +792,8 @@ fn test_nullable_valid_null() {
     encode_varint(&mut data, 0); // null
 
     let mut output = vec![0u8; 8];
-    let mut ptrs = vec![output.as_mut_ptr()];
+    let mut validity = vec![0u8; 1]; // validity buffer for nullable field
+    let mut ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
     let result = decoder.decode(&data, &mut ptrs, 1);
     assert!(result.is_ok(), "Expected success for valid null");
@@ -808,7 +810,8 @@ fn test_nullable_valid_value() {
     encode_varint(&mut data, 42); // value
 
     let mut output = vec![0u8; 8];
-    let mut ptrs = vec![output.as_mut_ptr()];
+    let mut validity = vec![0u8; 1]; // validity buffer for nullable field
+    let mut ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
     let result = decoder.decode(&data, &mut ptrs, 1);
     assert!(result.is_ok(), "Expected success for valid nullable value");
@@ -825,7 +828,8 @@ fn test_nullable_truncated_value_after_tag() {
     data.extend_from_slice(&[0x00; 4]); // Only 4 bytes, need 8 for Float64
 
     let mut output = vec![0u8; 8];
-    let mut ptrs = vec![output.as_mut_ptr()];
+    let mut validity = vec![0u8; 1]; // validity buffer for nullable field
+    let mut ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
     let result = decoder.decode(&data, &mut ptrs, 1);
     assert!(result.is_err(), "Expected error for truncated value after null tag");

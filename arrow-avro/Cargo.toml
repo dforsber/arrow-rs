@@ -74,6 +74,7 @@ cranelift-jit = { version = "0.126", optional = true }
 cranelift-module = { version = "0.126", optional = true }
 cranelift-native = { version = "0.126", optional = true }
 target-lexicon = { version = "0.13", optional = true }
+bytes = "1.10.1"
 
 [dev-dependencies]
 arrow-data = { workspace = true }
