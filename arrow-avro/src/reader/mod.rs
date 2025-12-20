@@ -499,9 +499,6 @@ mod header;
 mod record;
 mod vlq;
 
-/// Pooled decoder for zero-allocation Avro decoding
-pub mod pooled_decoder;
-
 /// JIT-compiled decoder using Cranelift for maximum performance
 #[cfg(feature = "jit")]
 pub mod jit_decoder;
@@ -513,21 +510,6 @@ pub mod jit_buffer_utils;
 /// Robustness tests for JIT decoder (bounds checking, malformed input)
 #[cfg(all(test, feature = "jit"))]
 mod jit_robustness_tests;
-
-// NOTE: pooled_decoder_parity_test.rs contains comprehensive parity tests
-// comparing PooledRecordDecoder vs vanilla Decoder. Currently disabled because:
-// 1. Writer API changed (try_new -> WriterBuilder::new(schema).build(writer))
-// 2. PooledBufferProvider::new now takes (buffer, layout) instead of just layout
-// 3. Need ArrowNativeType import for as_usize() on offsets
-//
-// The 47 roundtrip tests in pooled_decoder.rs verify correctness for all types
-// including deeply nested List<Struct>, List<List>, Map<String,Struct>, etc.
-//
-#[cfg(test)]
-mod pooled_decoder_parity_test;
-
-#[cfg(test)]
-mod pooled_decoder_stress_test;
 
 fn is_incomplete_data(err: &ArrowError) -> bool {
     matches!(

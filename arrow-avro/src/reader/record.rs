@@ -185,7 +185,7 @@ struct EnumResolution {
     default_index: i32,
 }
 
-/// Internal decoder enum for Avro types - made pub(crate) for use in pooled_decoder
+/// Internal decoder enum for Avro types
 #[derive(Debug, AsRefStr)]
 #[allow(private_interfaces)]
 pub(crate) enum Decoder {
@@ -248,8 +248,8 @@ pub(crate) enum Decoder {
 }
 
 impl Decoder {
-    /// Create a simple decoder from Arrow DataType (for use in pooled_decoder struct handling)
-    /// This creates basic decoders without schema resolution - just for primitive and string types
+    /// Create a simple decoder from Arrow DataType
+    /// This creates basic decoders without schema resolution - for primitive and complex types
     pub(crate) fn from_arrow_type(data_type: &DataType) -> Self {
         match data_type {
             DataType::Null => Self::Null(0),
@@ -281,6 +281,47 @@ impl Decoder {
                 }).collect();
                 Self::Record(Fields::from(arrow_fields), child_decoders, None)
             }
+            DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
+                let child_decoder = Self::from_arrow_type(field.data_type());
+                Self::Array(
+                    field.clone(),
+                    OffsetBufferBuilder::new(1024),
+                    Box::new(child_decoder),
+                )
+            }
+            DataType::Map(entries_field, _) => {
+                // Map is encoded as array of {key, value} structs in Avro
+                // Map variant: (value_field, map_offsets, key_offsets, key_data, value_decoder)
+                if let DataType::Struct(fields) = entries_field.data_type() {
+                    if fields.len() == 2 {
+                        let value_decoder = Self::from_arrow_type(fields[1].data_type());
+                        return Self::Map(
+                            fields[1].clone(),                    // value field
+                            OffsetBufferBuilder::new(1024),       // map offsets
+                            OffsetBufferBuilder::new(1024),       // key offsets
+                            Vec::with_capacity(1024 * 32),        // key data
+                            Box::new(value_decoder),              // value decoder
+                        );
+                    }
+                }
+                // Fallback if map structure is unexpected
+                Self::Int64(Vec::with_capacity(1024))
+            }
+            DataType::Dictionary(_, value_type) => {
+                // Dictionary/Enum - indices stored as i32
+                // For Avro enums, the value type should be Utf8
+                if matches!(value_type.as_ref(), DataType::Utf8) {
+                    Self::Enum(Vec::with_capacity(1024), Arc::new([]), None)
+                } else {
+                    Self::Int32(Vec::with_capacity(1024))
+                }
+            }
+            DataType::LargeUtf8 => Self::String(OffsetBufferBuilder::new(1024), Vec::with_capacity(1024 * 32)),
+            DataType::LargeBinary => Self::Binary(OffsetBufferBuilder::new(1024), Vec::with_capacity(1024 * 32)),
+            DataType::Date64 => Self::Int64(Vec::with_capacity(1024)),
+            DataType::Duration(_) => Self::Int64(Vec::with_capacity(1024)),
+            DataType::Interval(_) => Self::Duration(IntervalMonthDayNanoBuilder::new()),
+            DataType::Decimal256(precision, scale) => Self::Decimal256(*precision as usize, Some(*scale as usize), None, Decimal256Builder::with_capacity(1024)),
             // Fallback to Int64 for unsupported types
             _ => Self::Int64(Vec::with_capacity(1024)),
         }
