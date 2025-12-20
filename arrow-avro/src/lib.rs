@@ -195,13 +195,6 @@ pub mod compression;
 /// Avro data types and Arrow data types.
 pub mod codec;
 
-/// Buffer provider for zero-allocation Avro decoding
-///
-/// This module provides traits and implementations for decoding Avro data
-/// directly into pre-allocated memory buffers, enabling zero memory churn
-/// during the hot path.
-pub mod buffer_provider;
-
 /// Extension trait for AvroField to add Utf8View support
 ///
 /// This trait adds methods for working with Utf8View support to the AvroField struct.

@@ -106,31 +106,6 @@ name = "avro_writer"
 harness = false
 
 [[bench]]
-name = "pooled_list_benchmark"
-harness = false
-
-[[bench]]
-name = "pooled_flat_benchmark"
-harness = false
-
-[[bench]]
-name = "pooled_string_benchmark"
-harness = false
-
-[[bench]]
-name = "pooled_all_types_benchmark"
-harness = false
-
-[[bench]]
-name = "pooled_decoder_bench"
-harness = false
-
-[[bench]]
-name = "jit_benchmark"
-harness = false
-required-features = ["jit"]
-
-[[bench]]
 name = "jit_vs_apache_benchmark"
 harness = false
 required-features = ["jit"]

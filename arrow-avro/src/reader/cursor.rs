@@ -80,15 +80,6 @@ impl<'a> AvroCursor<'a> {
         Ok((val >> 1) as i64 ^ -((val & 1) as i64))
     }
 
-    /// Peek at the next long value without consuming it
-    /// Used to determine size of variable-length data before allocating
-    #[inline]
-    pub(crate) fn peek_long(&self) -> Result<i64, ArrowError> {
-        let (val, _offset) = read_varint(self.buf)
-            .ok_or_else(|| ArrowError::ParseError("bad varint".to_string()))?;
-        Ok((val >> 1) as i64 ^ -((val & 1) as i64))
-    }
-
     pub(crate) fn get_bytes(&mut self) -> Result<&'a [u8], ArrowError> {
         let len: usize = self.get_long()?.try_into().map_err(|_| {
             ArrowError::ParseError("offset overflow reading avro bytes".to_string())
