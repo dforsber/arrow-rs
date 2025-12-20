@@ -3166,6 +3166,7 @@ impl JitDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::TimeUnit;
 
     /// Encode i64 as zigzag + varint (Avro format)
     fn encode_varint_i64(value: i64) -> Vec<u8> {
@@ -6671,6 +6672,402 @@ mod tests {
         for (i, v) in values.iter().enumerate() {
             let is_valid = check_validity_bit(&validity_buf, i);
             assert_eq!(is_valid, v.is_some(), "Validity mismatch at row {}", i);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Timestamp Type Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_roundtrip_timestamp_microsecond() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Test timestamp values in microseconds
+        let test_values: Vec<i64> = vec![
+            0,                      // Unix epoch
+            1704067200000000,       // 2024-01-01 00:00:00
+            -86400000000,           // 1969-12-31 (before epoch)
+            i64::MAX / 2,           // Large positive
+        ];
+
+        let mut input = Vec::new();
+        for &v in &test_values {
+            input.extend(encode_varint_i64(v));
+        }
+
+        let row_count = test_values.len();
+        let mut output = vec![0u8; row_count * 8];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder
+            .decode(&input, &mut output_ptrs, row_count)
+            .expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, &expected) in test_values.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(
+                actual, expected,
+                "Timestamp microsecond mismatch at index {}: expected {}, got {}",
+                i, expected, actual
+            );
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_timestamp_millisecond() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        )]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Test timestamp values in milliseconds
+        let test_values: Vec<i64> = vec![
+            0,              // Unix epoch
+            1704067200000,  // 2024-01-01 00:00:00
+            -86400000,      // 1969-12-31 (before epoch)
+            1704067260000,  // 2024-01-01 00:01:00
+        ];
+
+        let mut input = Vec::new();
+        for &v in &test_values {
+            input.extend(encode_varint_i64(v));
+        }
+
+        let row_count = test_values.len();
+        let mut output = vec![0u8; row_count * 8];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder
+            .decode(&input, &mut output_ptrs, row_count)
+            .expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, &expected) in test_values.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(
+                actual, expected,
+                "Timestamp millisecond mismatch at index {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_timestamp_nanosecond() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Test timestamp values in nanoseconds
+        let test_values: Vec<i64> = vec![
+            0,                       // Unix epoch
+            1704067200000000000,     // 2024-01-01 00:00:00
+            -86400000000000,         // 1969-12-31 (before epoch)
+            1704067260000000000,     // 2024-01-01 00:01:00
+        ];
+
+        let mut input = Vec::new();
+        for &v in &test_values {
+            input.extend(encode_varint_i64(v));
+        }
+
+        let row_count = test_values.len();
+        let mut output = vec![0u8; row_count * 8];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder
+            .decode(&input, &mut output_ptrs, row_count)
+            .expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, &expected) in test_values.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(
+                actual, expected,
+                "Timestamp nanosecond mismatch at index {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_timestamp_second() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Test timestamp values in seconds
+        let test_values: Vec<i64> = vec![
+            0,           // Unix epoch
+            1704067200,  // 2024-01-01 00:00:00
+            -86400,      // 1969-12-31 (before epoch)
+            1704067260,  // 2024-01-01 00:01:00
+        ];
+
+        let mut input = Vec::new();
+        for &v in &test_values {
+            input.extend(encode_varint_i64(v));
+        }
+
+        let row_count = test_values.len();
+        let mut output = vec![0u8; row_count * 8];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder
+            .decode(&input, &mut output_ptrs, row_count)
+            .expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, &expected) in test_values.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(actual, expected, "Timestamp second mismatch at index {}", i);
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_timestamp_with_timezone() {
+        // Timestamp with UTC timezone
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            false,
+        )]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let test_values: Vec<i64> = vec![1704067200000000, 1704067260000000, 1704067320000000];
+
+        let mut input = Vec::new();
+        for &v in &test_values {
+            input.extend(encode_varint_i64(v));
+        }
+
+        let row_count = test_values.len();
+        let mut output = vec![0u8; row_count * 8];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder
+            .decode(&input, &mut output_ptrs, row_count)
+            .expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, &expected) in test_values.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(
+                actual, expected,
+                "Timestamp with timezone mismatch at index {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_nullable_timestamp_microsecond() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            true,
+        )]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let values: Vec<Option<i64>> = vec![
+            Some(1704067200000000),
+            None,
+            Some(1704067320000000),
+            None,
+            Some(0),
+        ];
+
+        let row_count = values.len();
+
+        let mut input = Vec::new();
+        for v in &values {
+            match v {
+                Some(ts) => {
+                    input.extend(encode_union_tag(false));
+                    input.extend(encode_varint_i64(*ts));
+                }
+                None => {
+                    input.extend(encode_union_tag(true));
+                }
+            }
+        }
+
+        let validity_bytes = (row_count + 7) / 8;
+        let mut data_buf = vec![0u8; row_count * 8];
+        let mut validity_buf = vec![0u8; validity_bytes];
+
+        let output_buffers = vec![
+            OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+            OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+        ];
+
+        let result = decoder.decode_chunked(&input, &output_buffers, row_count);
+        assert!(result.is_ok(), "Decode failed");
+        assert_eq!(result.rows_decoded, row_count);
+
+        // Verify validity bits
+        for (i, v) in values.iter().enumerate() {
+            let is_valid = check_validity_bit(&validity_buf, i);
+            assert_eq!(
+                is_valid,
+                v.is_some(),
+                "Validity mismatch at row {}: expected {}, got {}",
+                i,
+                v.is_some(),
+                is_valid
+            );
+        }
+
+        // Verify non-null values
+        for (i, v) in values.iter().enumerate() {
+            if let Some(expected) = v {
+                let actual = i64::from_le_bytes(data_buf[i * 8..(i + 1) * 8].try_into().unwrap());
+                assert_eq!(
+                    actual, *expected,
+                    "Nullable timestamp value mismatch at row {}",
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_timestamp_units_combined() {
+        // Test all timestamp units in a single multi-column schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ts_micros",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_millis",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_nanos",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_seconds",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+        ]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        let row_count = 3;
+        let mut input = Vec::new();
+
+        for i in 0..row_count {
+            // Microseconds
+            input.extend(encode_varint_i64(1704067200000000 + i as i64 * 60000000));
+            // Milliseconds
+            input.extend(encode_varint_i64(1704067200000 + i as i64 * 60000));
+            // Nanoseconds
+            input.extend(encode_varint_i64(1704067200000000000 + i as i64 * 60000000000));
+            // Seconds
+            input.extend(encode_varint_i64(1704067200 + i as i64 * 60));
+        }
+
+        let mut output_micros = vec![0u8; row_count * 8];
+        let mut output_millis = vec![0u8; row_count * 8];
+        let mut output_nanos = vec![0u8; row_count * 8];
+        let mut output_seconds = vec![0u8; row_count * 8];
+
+        let mut output_ptrs = vec![
+            output_micros.as_mut_ptr(),
+            output_millis.as_mut_ptr(),
+            output_nanos.as_mut_ptr(),
+            output_seconds.as_mut_ptr(),
+        ];
+
+        let consumed = decoder
+            .decode(&input, &mut output_ptrs, row_count)
+            .expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        // Verify values
+        for i in 0..row_count {
+            let micros =
+                i64::from_le_bytes(output_micros[i * 8..(i + 1) * 8].try_into().unwrap());
+            let millis =
+                i64::from_le_bytes(output_millis[i * 8..(i + 1) * 8].try_into().unwrap());
+            let nanos = i64::from_le_bytes(output_nanos[i * 8..(i + 1) * 8].try_into().unwrap());
+            let seconds =
+                i64::from_le_bytes(output_seconds[i * 8..(i + 1) * 8].try_into().unwrap());
+
+            assert_eq!(micros, 1704067200000000 + i as i64 * 60000000);
+            assert_eq!(millis, 1704067200000 + i as i64 * 60000);
+            assert_eq!(nanos, 1704067200000000000 + i as i64 * 60000000000);
+            assert_eq!(seconds, 1704067200 + i as i64 * 60);
+        }
+    }
+
+    #[test]
+    fn test_timestamp_edge_values() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]));
+
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Test extreme values
+        let test_values: Vec<i64> = vec![
+            i64::MIN / 2,  // Large negative (avoid overflow in zigzag)
+            -1,            // Just before epoch
+            0,             // Epoch
+            1,             // Just after epoch
+            i64::MAX / 2,  // Large positive
+        ];
+
+        let mut input = Vec::new();
+        for &v in &test_values {
+            input.extend(encode_varint_i64(v));
+        }
+
+        let row_count = test_values.len();
+        let mut output = vec![0u8; row_count * 8];
+        let mut output_ptrs = vec![output.as_mut_ptr()];
+
+        let consumed = decoder
+            .decode(&input, &mut output_ptrs, row_count)
+            .expect("Decode failed");
+        assert_eq!(consumed, input.len());
+
+        for (i, &expected) in test_values.iter().enumerate() {
+            let actual = i64::from_le_bytes(output[i * 8..(i + 1) * 8].try_into().unwrap());
+            assert_eq!(
+                actual, expected,
+                "Timestamp edge value mismatch at index {}: expected {}, got {}",
+                i, expected, actual
+            );
         }
     }
 

@@ -55,7 +55,7 @@ fn bench_all_simple_types(c: &mut Criterion) {
     let mut group = c.benchmark_group("jit_types");
     group.throughput(Throughput::Elements(ROW_COUNT as u64));
 
-    // Combined schema for primitives + boolean + fixed + enum + decimal + duration + interval
+    // Combined schema for primitives + boolean + fixed + enum + decimal + duration + interval + timestamps
     let schema = Arc::new(Schema::new(vec![
         // Primitives
         Field::new("int32_col", DataType::Int32, false),
@@ -74,6 +74,11 @@ fn bench_all_simple_types(c: &mut Criterion) {
         Field::new("duration_col", DataType::Duration(TimeUnit::Microsecond), false),
         // Interval
         Field::new("interval_col", DataType::Interval(IntervalUnit::YearMonth), false),
+        // Timestamps - all 4 time units
+        Field::new("ts_micros", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("ts_millis", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+        Field::new("ts_nanos", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("ts_seconds", DataType::Timestamp(TimeUnit::Second, None), false),
     ]));
 
     // Generate combined data for all types
@@ -99,6 +104,14 @@ fn bench_all_simple_types(c: &mut Criterion) {
         encode_varint(&mut data, i as i64 * 1000);
         // interval year_month (varint)
         encode_varint(&mut data, (i % 120) as i64);
+        // timestamp microseconds (varint)
+        encode_varint(&mut data, 1704067200000000i64 + i as i64 * 1000000);
+        // timestamp milliseconds (varint)
+        encode_varint(&mut data, 1704067200000i64 + i as i64 * 1000);
+        // timestamp nanoseconds (varint)
+        encode_varint(&mut data, 1704067200000000000i64 + i as i64 * 1000000000);
+        // timestamp seconds (varint)
+        encode_varint(&mut data, 1704067200i64 + i as i64);
     }
 
     let decoder = JitDecoder::compile(&schema).expect("compile");
@@ -115,6 +128,10 @@ fn bench_all_simple_types(c: &mut Criterion) {
             let mut out7 = vec![0u8; ROW_COUNT * 16];    // decimal128
             let mut out8 = vec![0u8; ROW_COUNT * 8];     // duration
             let mut out9 = vec![0u8; ROW_COUNT * 4];     // interval
+            let mut out10 = vec![0u8; ROW_COUNT * 8];    // timestamp microseconds
+            let mut out11 = vec![0u8; ROW_COUNT * 8];    // timestamp milliseconds
+            let mut out12 = vec![0u8; ROW_COUNT * 8];    // timestamp nanoseconds
+            let mut out13 = vec![0u8; ROW_COUNT * 8];    // timestamp seconds
 
             let buffers = vec![
                 OutputBuffer::new(out0.as_mut_ptr(), out0.len()),
@@ -127,6 +144,10 @@ fn bench_all_simple_types(c: &mut Criterion) {
                 OutputBuffer::new(out7.as_mut_ptr(), out7.len()),
                 OutputBuffer::new(out8.as_mut_ptr(), out8.len()),
                 OutputBuffer::new(out9.as_mut_ptr(), out9.len()),
+                OutputBuffer::new(out10.as_mut_ptr(), out10.len()),
+                OutputBuffer::new(out11.as_mut_ptr(), out11.len()),
+                OutputBuffer::new(out12.as_mut_ptr(), out12.len()),
+                OutputBuffer::new(out13.as_mut_ptr(), out13.len()),
             ];
             let result = decoder.decode_checked(&data, &buffers, ROW_COUNT).expect("decode");
             black_box(result);

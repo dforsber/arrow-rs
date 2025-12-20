@@ -1482,6 +1482,307 @@ fn test_parity_timestamp_millisecond() {
     assert_eq!(pooled.num_rows(), 3);
 }
 
+#[test]
+fn test_parity_timestamp_millisecond_nullable() {
+    use arrow::datatypes::TimeUnit;
+
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        true,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(TimestampMillisecondArray::from(vec![
+            Some(1704067200000i64),
+            None,
+            Some(1704067320000i64),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMillisecondArray>()
+        .unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert_eq!(pooled_col.value(0), 1704067200000i64);
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert_eq!(pooled_col.value(2), 1704067320000i64);
+}
+
+#[test]
+fn test_parity_timestamp_nanosecond() {
+    use arrow::datatypes::TimeUnit;
+
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        false,
+    )]);
+
+    // Nanoseconds since epoch
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(TimestampNanosecondArray::from(vec![
+            1704067200000000000i64, // 2024-01-01 00:00:00
+            1704067260000000000i64, // 2024-01-01 00:01:00
+            1704067320000000000i64, // 2024-01-01 00:02:00
+        ]))],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert_eq!(pooled_col.value(0), 1704067200000000000i64);
+    assert_eq!(pooled_col.value(1), 1704067260000000000i64);
+    assert_eq!(pooled_col.value(2), 1704067320000000000i64);
+}
+
+#[test]
+fn test_parity_timestamp_nanosecond_nullable() {
+    use arrow::datatypes::TimeUnit;
+
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        true,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(TimestampNanosecondArray::from(vec![
+            Some(1704067200000000000i64),
+            None,
+            Some(1704067320000000000i64),
+        ]))],
+    )
+    .unwrap();
+
+    let (_, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap();
+    assert!(!pooled_col.is_null(0));
+    assert_eq!(pooled_col.value(0), 1704067200000000000i64);
+    assert!(pooled_col.is_null(1));
+    assert!(!pooled_col.is_null(2));
+    assert_eq!(pooled_col.value(2), 1704067320000000000i64);
+}
+
+#[test]
+fn test_parity_timestamp_second() {
+    use arrow::datatypes::TimeUnit;
+
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Second, None),
+        false,
+    )]);
+
+    // Seconds since epoch
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(TimestampSecondArray::from(vec![
+            1704067200i64, // 2024-01-01 00:00:00
+            1704067260i64, // 2024-01-01 00:01:00
+            1704067320i64, // 2024-01-01 00:02:00
+        ]))],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampSecondArray>()
+        .unwrap();
+    assert_eq!(pooled_col.value(0), 1704067200i64);
+    assert_eq!(pooled_col.value(1), 1704067260i64);
+    assert_eq!(pooled_col.value(2), 1704067320i64);
+}
+
+#[test]
+fn test_parity_local_timestamp_microsecond() {
+    use arrow::datatypes::TimeUnit;
+
+    // Local timestamp (no timezone) - uses local-timestamp-micros in Avro
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(TimestampMicrosecondArray::from(vec![
+            1704067200000000i64,
+            1704067260000000i64,
+            1704067320000000i64,
+        ]))],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+}
+
+#[test]
+fn test_parity_timestamp_with_utc_timezone() {
+    use arrow::datatypes::TimeUnit;
+
+    // Timestamp with UTC timezone - uses timestamp-micros in Avro
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+        false,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(
+            TimestampMicrosecondArray::from(vec![
+                1704067200000000i64,
+                1704067260000000i64,
+                1704067320000000i64,
+            ])
+            .with_timezone("+00:00"),
+        )],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(pooled_col.value(0), 1704067200000000i64);
+    // Verify timezone is preserved
+    assert!(pooled_col.timezone().is_some());
+}
+
+#[test]
+fn test_parity_timestamp_millisecond_with_timezone() {
+    use arrow::datatypes::TimeUnit;
+
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+        false,
+    )]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(
+            TimestampMillisecondArray::from(vec![
+                1704067200000i64,
+                1704067260000i64,
+                1704067320000i64,
+            ])
+            .with_timezone("UTC"),
+        )],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+}
+
+#[test]
+fn test_parity_timestamp_edge_values() {
+    use arrow::datatypes::TimeUnit;
+
+    let schema = ArrowSchema::new(vec![Field::new(
+        "ts_col",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]);
+
+    // Test edge cases: zero, negative (before epoch), very large
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![Arc::new(TimestampMicrosecondArray::from(vec![
+            0i64,                    // Unix epoch
+            -86400000000i64,         // 1969-12-31 (before epoch)
+            i64::MAX / 2,            // Large positive value
+        ]))],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 3);
+    assert_eq!(pooled.num_rows(), 3);
+
+    let pooled_col = pooled
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .unwrap();
+    assert_eq!(pooled_col.value(0), 0i64);
+    assert_eq!(pooled_col.value(1), -86400000000i64);
+    assert_eq!(pooled_col.value(2), i64::MAX / 2);
+}
+
+#[test]
+fn test_parity_all_timestamp_types_combined() {
+    use arrow::datatypes::TimeUnit;
+
+    // Test all timestamp variants in a single schema
+    let schema = ArrowSchema::new(vec![
+        Field::new("ts_micros", DataType::Timestamp(TimeUnit::Microsecond, None), false),
+        Field::new("ts_millis", DataType::Timestamp(TimeUnit::Millisecond, None), false),
+        Field::new("ts_nanos", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
+        Field::new("ts_seconds", DataType::Timestamp(TimeUnit::Second, None), false),
+        Field::new("ts_micros_tz", DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())), false),
+        Field::new("ts_micros_nullable", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+    ]);
+
+    let batch = RecordBatch::try_new(
+        Arc::new(schema.clone()),
+        vec![
+            Arc::new(TimestampMicrosecondArray::from(vec![1704067200000000i64, 1704067260000000i64])),
+            Arc::new(TimestampMillisecondArray::from(vec![1704067200000i64, 1704067260000i64])),
+            Arc::new(TimestampNanosecondArray::from(vec![1704067200000000000i64, 1704067260000000000i64])),
+            Arc::new(TimestampSecondArray::from(vec![1704067200i64, 1704067260i64])),
+            Arc::new(TimestampMicrosecondArray::from(vec![1704067200000000i64, 1704067260000000i64]).with_timezone("+00:00")),
+            Arc::new(TimestampMicrosecondArray::from(vec![Some(1704067200000000i64), None])),
+        ],
+    )
+    .unwrap();
+
+    let (vanilla, pooled) = compare_decoders(&schema, &batch);
+    assert_eq!(vanilla.num_rows(), 2);
+    assert_eq!(pooled.num_rows(), 2);
+    assert_eq!(vanilla.num_columns(), 6);
+    assert_eq!(pooled.num_columns(), 6);
+}
+
 // ============================================================================
 // Decimal Types Tests
 // ============================================================================

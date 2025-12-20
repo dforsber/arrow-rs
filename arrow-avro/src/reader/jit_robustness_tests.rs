@@ -1251,3 +1251,250 @@ fn test_large_row_count_insufficient_data() {
     let result = decoder.decode(&data, &mut ptrs, 1000);
     assert!(result.is_err(), "Expected error for insufficient data");
 }
+
+// =============================================================================
+// Timestamp type robustness tests
+// =============================================================================
+
+use arrow_schema::TimeUnit;
+
+#[test]
+fn test_timestamp_empty_input() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+
+    let data: Vec<u8> = vec![];
+    let mut output = vec![0u8; 8];
+    let mut ptrs = vec![output.as_mut_ptr()];
+
+    let result = decoder.decode(&data, &mut ptrs, 1);
+    assert!(result.is_err(), "Expected error for empty timestamp input");
+}
+
+#[test]
+fn test_timestamp_truncated_varint() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+
+    // Varint with continuation bit set but no following byte
+    let data: Vec<u8> = vec![0x80];
+    let mut output = vec![0u8; 8];
+    let mut ptrs = vec![output.as_mut_ptr()];
+
+    let result = decoder.decode(&data, &mut ptrs, 1);
+    assert!(result.is_err(), "Expected error for truncated timestamp varint");
+}
+
+#[test]
+fn test_timestamp_max_value() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+
+    let mut data = Vec::new();
+    encode_varint(&mut data, i64::MAX);
+
+    let mut output = vec![0u8; 8];
+    let mut ptrs = vec![output.as_mut_ptr()];
+
+    let result = decoder.decode(&data, &mut ptrs, 1);
+    assert!(result.is_ok(), "Expected success for max timestamp value");
+
+    let value = i64::from_le_bytes(output[..8].try_into().unwrap());
+    assert_eq!(value, i64::MAX);
+}
+
+#[test]
+fn test_timestamp_min_value() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+
+    let mut data = Vec::new();
+    encode_varint(&mut data, i64::MIN);
+
+    let mut output = vec![0u8; 8];
+    let mut ptrs = vec![output.as_mut_ptr()];
+
+    let result = decoder.decode(&data, &mut ptrs, 1);
+    assert!(result.is_ok(), "Expected success for min timestamp value");
+
+    let value = i64::from_le_bytes(output[..8].try_into().unwrap());
+    assert_eq!(value, i64::MIN);
+}
+
+#[test]
+fn test_timestamp_millisecond_truncated() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        false,
+    )]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+
+    // Multi-byte varint truncated midway
+    let data: Vec<u8> = vec![0x80, 0x80, 0x80]; // Needs more bytes
+    let mut output = vec![0u8; 8];
+    let mut ptrs = vec![output.as_mut_ptr()];
+
+    let result = decoder.decode(&data, &mut ptrs, 1);
+    assert!(result.is_err(), "Expected error for truncated millisecond timestamp");
+}
+
+#[test]
+fn test_timestamp_nanosecond_large_values() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Nanosecond, None),
+        false,
+    )]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+
+    // Large nanosecond values (year 2024 in nanoseconds)
+    let test_values: Vec<i64> = vec![
+        1704067200000000000,  // 2024-01-01 00:00:00 UTC in nanoseconds
+        i64::MAX / 2,         // Very large but valid
+        -1704067200000000000, // Negative (before epoch)
+    ];
+
+    for expected in test_values {
+        let mut data = Vec::new();
+        encode_varint(&mut data, expected);
+
+        let mut output = vec![0u8; 8];
+        let mut ptrs = vec![output.as_mut_ptr()];
+
+        let result = decoder.decode(&data, &mut ptrs, 1);
+        assert!(result.is_ok(), "Expected success for nanosecond timestamp {}", expected);
+
+        let value = i64::from_le_bytes(output[..8].try_into().unwrap());
+        assert_eq!(value, expected, "Nanosecond value mismatch");
+    }
+}
+
+#[test]
+fn test_timestamp_with_timezone_robustness() {
+    // Timestamp with timezone should decode the same as without
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+        false,
+    )]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+
+    let mut data = Vec::new();
+    encode_varint(&mut data, 1704067200000000);
+
+    let mut output = vec![0u8; 8];
+    let mut ptrs = vec![output.as_mut_ptr()];
+
+    let result = decoder.decode(&data, &mut ptrs, 1);
+    assert!(result.is_ok(), "Expected success for timestamp with timezone");
+
+    let value = i64::from_le_bytes(output[..8].try_into().unwrap());
+    assert_eq!(value, 1704067200000000);
+}
+
+#[test]
+fn test_timestamp_all_units_insufficient_data() {
+    // Test all timestamp units handle insufficient data correctly
+    let units = vec![
+        TimeUnit::Second,
+        TimeUnit::Millisecond,
+        TimeUnit::Microsecond,
+        TimeUnit::Nanosecond,
+    ];
+
+    for unit in units {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(unit, None),
+            false,
+        )]));
+        let decoder = JitDecoder::compile(&schema).expect("compile");
+
+        // Data for only 1 row
+        let mut data = Vec::new();
+        encode_varint(&mut data, 42);
+
+        let mut output = vec![0u8; 800];
+        let mut ptrs = vec![output.as_mut_ptr()];
+
+        // Try to decode 100 rows
+        let result = decoder.decode(&data, &mut ptrs, 100);
+        assert!(result.is_err(), "Expected error for {:?} with insufficient data", unit);
+    }
+}
+
+#[test]
+fn test_nullable_timestamp_truncated_union_tag() {
+    use super::jit_decoder::OutputBuffer;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        true,
+    )]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+
+    // Empty input - no union tag at all
+    let data: Vec<u8> = vec![];
+
+    let mut data_buf = vec![0u8; 8];
+    let mut validity_buf = vec![0u8; 1];
+
+    let output_buffers = vec![
+        OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+        OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+    ];
+
+    let result = decoder.decode_chunked(&data, &output_buffers, 1);
+    // Should fail - no data for union tag
+    assert!(!result.is_ok() || result.rows_decoded == 0,
+        "Expected failure or zero rows for truncated nullable timestamp");
+}
+
+#[test]
+fn test_nullable_timestamp_null_value_handling() {
+    use super::jit_decoder::OutputBuffer;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        true,
+    )]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+
+    // Encode null value (union index 0 = null in [null, T] union)
+    let mut data = Vec::new();
+    encode_raw_varint(&mut data, 0); // null
+
+    let mut data_buf = vec![0u8; 8];
+    let mut validity_buf = vec![0u8; 1];
+
+    let output_buffers = vec![
+        OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
+        OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
+    ];
+
+    let result = decoder.decode_chunked(&data, &output_buffers, 1);
+    assert!(result.is_ok(), "Expected success decoding null timestamp");
+    assert_eq!(result.rows_decoded, 1);
+
+    // Validity bit should indicate null (bit 0 should be 0)
+    assert_eq!(validity_buf[0] & 1, 0, "Expected null bit to be set");
+}

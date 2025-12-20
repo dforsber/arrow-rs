@@ -2178,4 +2178,334 @@ mod tests {
         assert_eq!(roundtrip, batch);
         Ok(())
     }
+
+    /// Test TimestampSecond encoding - Avro has no timestamp-seconds, so it converts to millis.
+    /// This tests that the conversion is correct (values * 1000, type becomes Millisecond).
+    #[test]
+    fn test_roundtrip_timestamp_second_to_millis() -> Result<(), ArrowError> {
+        use arrow_array::types::{TimestampMillisecondType, TimestampSecondType};
+        let schema = Schema::new(vec![Field::new(
+            "ts_sec",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]);
+        let input_seconds: Vec<i64> = vec![0, 1, -1, 1704067200];
+        let ts_sec: PrimitiveArray<TimestampSecondType> = input_seconds.clone().into();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(ts_sec) as ArrayRef],
+        )?;
+        let mut writer = AvroWriter::new(Vec::<u8>::new(), schema.clone())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let bytes = writer.into_inner();
+        let rt_reader = ReaderBuilder::new()
+            .build(std::io::Cursor::new(bytes))
+            .expect("build reader for TimestampSecond roundtrip");
+        let rt_schema = rt_reader.schema();
+        let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
+        let roundtrip = arrow::compute::concat_batches(&rt_schema, &rt_batches)
+            .expect("concat roundtrip");
+
+        // Avro converts Timestamp(Second) to timestamp-millis
+        // The reader may return either TimestampMillisecond or Int64 depending on schema
+        assert_eq!(roundtrip.num_rows(), 4);
+
+        // Get raw i64 values from the column (works for both Int64 and Timestamp types)
+        let rt_col = roundtrip.column(0);
+        let values: Vec<i64> = (0..4)
+            .map(|i| {
+                if let Some(arr) = rt_col
+                    .as_any()
+                    .downcast_ref::<PrimitiveArray<TimestampMillisecondType>>()
+                {
+                    arr.value(i)
+                } else if let Some(arr) = rt_col
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+                {
+                    arr.value(i)
+                } else {
+                    panic!(
+                        "expected TimestampMillisecond or Int64, got {:?}",
+                        rt_col.data_type()
+                    );
+                }
+            })
+            .collect();
+
+        // Values should be scaled: seconds * 1000 = milliseconds
+        for (i, sec) in input_seconds.iter().enumerate() {
+            assert_eq!(
+                values[i],
+                sec * 1000,
+                "Timestamp second->millis conversion failed at index {i}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Test roundtrip for nullable timestamps (ms, us, ns - skipping Second since it converts)
+    #[test]
+    fn test_roundtrip_nullable_timestamps() -> Result<(), ArrowError> {
+        use arrow_array::types::{
+            TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        };
+
+        // Note: Timestamp(Second) is excluded because Avro converts it to millis
+        let schema = Schema::new(vec![
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]);
+
+        let ts_ms: PrimitiveArray<TimestampMillisecondType> =
+            vec![None, Some(1_i64), None, Some(1704067200000_i64)].into();
+        let ts_us: PrimitiveArray<TimestampMicrosecondType> =
+            vec![Some(1704067200000000_i64), None, Some(0_i64), None].into();
+        let ts_ns: PrimitiveArray<TimestampNanosecondType> =
+            vec![None, Some(0_i64), None, Some(1704067200000000000_i64)].into();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(ts_ms) as ArrayRef,
+                Arc::new(ts_us) as ArrayRef,
+                Arc::new(ts_ns) as ArrayRef,
+            ],
+        )?;
+
+        let mut writer = AvroWriter::new(Vec::<u8>::new(), schema.clone())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let bytes = writer.into_inner();
+
+        let rt_reader = ReaderBuilder::new()
+            .build(std::io::Cursor::new(bytes))
+            .expect("build reader for nullable timestamps roundtrip");
+        let rt_schema = rt_reader.schema();
+        let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
+        let roundtrip = arrow::compute::concat_batches(&rt_schema, &rt_batches)
+            .expect("concat roundtrip");
+
+        assert_eq!(roundtrip, batch, "Nullable timestamps roundtrip mismatch");
+        Ok(())
+    }
+
+    /// Test roundtrip for timestamps with edge values (epoch boundaries, extremes)
+    #[test]
+    fn test_roundtrip_timestamp_edge_values() -> Result<(), ArrowError> {
+        use arrow_array::types::TimestampMicrosecondType;
+
+        let schema = Schema::new(vec![Field::new(
+            "ts_us",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]);
+
+        // Edge values: zero, negative (before epoch), Unix epoch, Y2K, 2024, max safe
+        let edge_values: Vec<i64> = vec![
+            0,                      // Unix epoch
+            -1,                     // Just before epoch
+            -86400000000,           // 1 day before epoch
+            946684800000000,        // Y2K (2000-01-01)
+            1704067200000000,       // 2024-01-01
+            i64::MAX / 2,           // Large positive (safe range)
+            i64::MIN / 2,           // Large negative (safe range)
+        ];
+
+        let ts_us: PrimitiveArray<TimestampMicrosecondType> = edge_values.into();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(ts_us) as ArrayRef],
+        )?;
+
+        let mut writer = AvroWriter::new(Vec::<u8>::new(), schema.clone())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let bytes = writer.into_inner();
+
+        let rt_reader = ReaderBuilder::new()
+            .build(std::io::Cursor::new(bytes))
+            .expect("build reader for edge values roundtrip");
+        let rt_schema = rt_reader.schema();
+        let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
+        let roundtrip = arrow::compute::concat_batches(&rt_schema, &rt_batches)
+            .expect("concat roundtrip");
+
+        assert_eq!(roundtrip, batch, "Timestamp edge values roundtrip mismatch");
+        Ok(())
+    }
+
+    /// Test roundtrip for all natively-supported timestamp units (ms, us, ns)
+    /// Note: Timestamp(Second) converts to millis in Avro, tested separately
+    #[test]
+    fn test_roundtrip_all_timestamp_units() -> Result<(), ArrowError> {
+        use arrow_array::types::{
+            TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        };
+
+        let schema = Schema::new(vec![
+            Field::new(
+                "ts_ms",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_us",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_ns",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]);
+
+        // Same logical instant in different units
+        let epoch_2024 = 1704067200_i64; // 2024-01-01 00:00:00 UTC
+        let ts_ms: PrimitiveArray<TimestampMillisecondType> =
+            vec![epoch_2024 * 1000, 0, -1000].into();
+        let ts_us: PrimitiveArray<TimestampMicrosecondType> =
+            vec![epoch_2024 * 1000000, 0, -1000000].into();
+        let ts_ns: PrimitiveArray<TimestampNanosecondType> =
+            vec![epoch_2024 * 1000000000, 0, -1000000000].into();
+
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(ts_ms) as ArrayRef,
+                Arc::new(ts_us) as ArrayRef,
+                Arc::new(ts_ns) as ArrayRef,
+            ],
+        )?;
+
+        let mut writer = AvroWriter::new(Vec::<u8>::new(), schema.clone())?;
+        writer.write(&batch)?;
+        writer.finish()?;
+        let bytes = writer.into_inner();
+
+        let rt_reader = ReaderBuilder::new()
+            .build(std::io::Cursor::new(bytes))
+            .expect("build reader for all timestamp units roundtrip");
+        let rt_schema = rt_reader.schema();
+        let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
+        let roundtrip = arrow::compute::concat_batches(&rt_schema, &rt_batches)
+            .expect("concat roundtrip");
+
+        assert_eq!(roundtrip, batch, "All timestamp units roundtrip mismatch");
+        Ok(())
+    }
+
+    /// Test roundtrip for timestamps using the streaming writer format
+    #[test]
+    fn test_stream_writer_timestamp_roundtrip() -> Result<(), ArrowError> {
+        use arrow_array::types::TimestampMicrosecondType;
+
+        let schema = Schema::new(vec![Field::new(
+            "ts_col",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]);
+
+        let ts: PrimitiveArray<TimestampMicrosecondType> =
+            vec![1704067200000000_i64, 0_i64, -86400000000_i64].into();
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(ts) as ArrayRef],
+        )?;
+
+        let buf: Vec<u8> = Vec::new();
+        let mut writer = AvroStreamWriter::new(buf, schema.clone())?;
+        writer.write(&batch)?;
+        let encoded = writer.into_inner();
+
+        // Decode using schema store
+        let mut store = SchemaStore::new();
+        let avro_schema = AvroSchema::try_from(&schema)?;
+        let _fp = store.register(avro_schema)?;
+
+        let mut decoder = ReaderBuilder::new()
+            .with_writer_schema_store(store)
+            .build_decoder()?;
+        let _consumed = decoder.decode(&encoded)?;
+        let decoded = decoder
+            .flush()?
+            .expect("expected at least one batch from decoder");
+
+        assert_eq!(decoded.num_columns(), 1);
+        assert_eq!(decoded.num_rows(), 3);
+
+        // Verify values
+        let col = decoded
+            .column(0)
+            .as_any()
+            .downcast_ref::<PrimitiveArray<TimestampMicrosecondType>>()
+            .expect("timestamp column");
+        assert_eq!(col.value(0), 1704067200000000_i64);
+        assert_eq!(col.value(1), 0_i64);
+        assert_eq!(col.value(2), -86400000000_i64);
+
+        Ok(())
+    }
+
+    /// Test roundtrip for multiple timestamp batches written sequentially
+    #[test]
+    fn test_roundtrip_timestamp_multiple_batches() -> Result<(), ArrowError> {
+        use arrow_array::types::TimestampMicrosecondType;
+
+        let schema = Schema::new(vec![Field::new(
+            "ts_col",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )]);
+
+        let batch1 = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(
+                vec![1704067200000000_i64, 1704067260000000_i64].into(),
+            ) as Arc<PrimitiveArray<TimestampMicrosecondType>>],
+        )?;
+        let batch2 = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(
+                vec![1704067320000000_i64, 1704067380000000_i64].into(),
+            ) as Arc<PrimitiveArray<TimestampMicrosecondType>>],
+        )?;
+
+        let mut writer = AvroWriter::new(Vec::<u8>::new(), schema.clone())?;
+        writer.write(&batch1)?;
+        writer.write(&batch2)?;
+        writer.finish()?;
+        let bytes = writer.into_inner();
+
+        let rt_reader = ReaderBuilder::new()
+            .build(std::io::Cursor::new(bytes))
+            .expect("build reader for multi-batch roundtrip");
+        let rt_schema = rt_reader.schema();
+        let rt_batches = rt_reader.collect::<Result<Vec<_>, _>>()?;
+        let roundtrip = arrow::compute::concat_batches(&rt_schema, &rt_batches)
+            .expect("concat roundtrip");
+
+        // Concat original batches for comparison
+        let original =
+            arrow::compute::concat_batches(&Arc::new(schema), &[batch1, batch2])
+                .expect("concat original");
+
+        assert_eq!(roundtrip, original, "Multi-batch timestamp roundtrip mismatch");
+        Ok(())
+    }
 }
