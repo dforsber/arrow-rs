@@ -22,10 +22,10 @@ use crate::schema::{Fingerprint, Nullability, Prefix};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     ArrowPrimitiveType, Date32Type, DurationMicrosecondType, DurationMillisecondType,
-    DurationNanosecondType, DurationSecondType, Float32Type, Float64Type, Int16Type, Int32Type,
-    Int64Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType,
+    DurationNanosecondType, DurationSecondType, Float32Type, Float64Type, Int8Type, Int16Type,
+    Int32Type, Int64Type, IntervalDayTimeType, IntervalMonthDayNanoType, IntervalYearMonthType,
     Time32MillisecondType, Time64MicrosecondType, TimestampMicrosecondType,
-    TimestampMillisecondType,
+    TimestampMillisecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::types::{
     RunEndIndexType, Time32SecondType, TimestampNanosecondType, TimestampSecondType,
@@ -259,8 +259,26 @@ impl<'a> FieldEncoder<'a> {
                         })?;
                     Encoder::BinaryView(BinaryViewEncoder(arr))
                 }
+                DataType::Int8 => {
+                    Encoder::Int8ToInt(Int8ToIntEncoder(array.as_primitive::<Int8Type>()))
+                }
+                DataType::Int16 => {
+                    Encoder::Int16ToInt(Int16ToIntEncoder(array.as_primitive::<Int16Type>()))
+                }
                 DataType::Int32 => Encoder::Int(IntEncoder(array.as_primitive::<Int32Type>())),
                 DataType::Int64 => Encoder::Long(LongEncoder(array.as_primitive::<Int64Type>())),
+                DataType::UInt8 => {
+                    Encoder::UInt8ToInt(UInt8ToIntEncoder(array.as_primitive::<UInt8Type>()))
+                }
+                DataType::UInt16 => {
+                    Encoder::UInt16ToInt(UInt16ToIntEncoder(array.as_primitive::<UInt16Type>()))
+                }
+                DataType::UInt32 => {
+                    Encoder::UInt32ToLong(UInt32ToLongEncoder(array.as_primitive::<UInt32Type>()))
+                }
+                DataType::UInt64 => {
+                    Encoder::UInt64ToLong(UInt64ToLongEncoder(array.as_primitive::<UInt64Type>()))
+                }
                 DataType::Date32 => Encoder::Date32(IntEncoder(array.as_primitive::<Date32Type>())),
                 DataType::Date64 => {
                     return Err(ArrowError::NotYetImplemented(
@@ -1107,6 +1125,18 @@ enum Encoder<'a> {
     Boolean(BooleanEncoder<'a>),
     Int(IntEncoder<'a, Int32Type>),
     Long(LongEncoder<'a, Int64Type>),
+    /// Int8 widened to Avro int (32-bit)
+    Int8ToInt(Int8ToIntEncoder<'a>),
+    /// Int16 widened to Avro int (32-bit)
+    Int16ToInt(Int16ToIntEncoder<'a>),
+    /// UInt8 widened to Avro int (32-bit)
+    UInt8ToInt(UInt8ToIntEncoder<'a>),
+    /// UInt16 widened to Avro int (32-bit)
+    UInt16ToInt(UInt16ToIntEncoder<'a>),
+    /// UInt32 widened to Avro long (64-bit)
+    UInt32ToLong(UInt32ToLongEncoder<'a>),
+    /// UInt64 encoded as Avro long (may overflow for values > i64::MAX)
+    UInt64ToLong(UInt64ToLongEncoder<'a>),
     TimestampMicros(LongEncoder<'a, TimestampMicrosecondType>),
     TimestampMillis(LongEncoder<'a, TimestampMillisecondType>),
     TimestampNanos(LongEncoder<'a, TimestampNanosecondType>),
@@ -1167,6 +1197,12 @@ impl<'a> Encoder<'a> {
             Encoder::Boolean(e) => e.encode(out, idx),
             Encoder::Int(e) => e.encode(out, idx),
             Encoder::Long(e) => e.encode(out, idx),
+            Encoder::Int8ToInt(e) => e.encode(out, idx),
+            Encoder::Int16ToInt(e) => e.encode(out, idx),
+            Encoder::UInt8ToInt(e) => e.encode(out, idx),
+            Encoder::UInt16ToInt(e) => e.encode(out, idx),
+            Encoder::UInt32ToLong(e) => e.encode(out, idx),
+            Encoder::UInt64ToLong(e) => e.encode(out, idx),
             Encoder::TimestampMicros(e) => e.encode(out, idx),
             Encoder::TimestampMillis(e) => e.encode(out, idx),
             Encoder::TimestampNanos(e) => e.encode(out, idx),
@@ -1235,6 +1271,62 @@ struct LongEncoder<'a, P: ArrowPrimitiveType<Native = i64>>(&'a PrimitiveArray<P
 impl<'a, P: ArrowPrimitiveType<Native = i64>> LongEncoder<'a, P> {
     fn encode<W: Write + ?Sized>(&mut self, out: &mut W, idx: usize) -> Result<(), ArrowError> {
         write_long(out, self.0.value(idx))
+    }
+}
+
+/// Int8 widened to Avro int (32-bit)
+struct Int8ToIntEncoder<'a>(&'a PrimitiveArray<Int8Type>);
+impl Int8ToIntEncoder<'_> {
+    fn encode<W: Write + ?Sized>(&mut self, out: &mut W, idx: usize) -> Result<(), ArrowError> {
+        write_int(out, self.0.value(idx) as i32)
+    }
+}
+
+/// Int16 widened to Avro int (32-bit)
+struct Int16ToIntEncoder<'a>(&'a PrimitiveArray<Int16Type>);
+impl Int16ToIntEncoder<'_> {
+    fn encode<W: Write + ?Sized>(&mut self, out: &mut W, idx: usize) -> Result<(), ArrowError> {
+        write_int(out, self.0.value(idx) as i32)
+    }
+}
+
+/// UInt8 widened to Avro int (32-bit)
+struct UInt8ToIntEncoder<'a>(&'a PrimitiveArray<UInt8Type>);
+impl UInt8ToIntEncoder<'_> {
+    fn encode<W: Write + ?Sized>(&mut self, out: &mut W, idx: usize) -> Result<(), ArrowError> {
+        write_int(out, self.0.value(idx) as i32)
+    }
+}
+
+/// UInt16 widened to Avro int (32-bit)
+struct UInt16ToIntEncoder<'a>(&'a PrimitiveArray<UInt16Type>);
+impl UInt16ToIntEncoder<'_> {
+    fn encode<W: Write + ?Sized>(&mut self, out: &mut W, idx: usize) -> Result<(), ArrowError> {
+        write_int(out, self.0.value(idx) as i32)
+    }
+}
+
+/// UInt32 widened to Avro long (64-bit)
+struct UInt32ToLongEncoder<'a>(&'a PrimitiveArray<UInt32Type>);
+impl UInt32ToLongEncoder<'_> {
+    fn encode<W: Write + ?Sized>(&mut self, out: &mut W, idx: usize) -> Result<(), ArrowError> {
+        write_long(out, self.0.value(idx) as i64)
+    }
+}
+
+/// UInt64 encoded as Avro long (64-bit signed)
+/// Note: Values > i64::MAX will wrap to negative values
+struct UInt64ToLongEncoder<'a>(&'a PrimitiveArray<UInt64Type>);
+impl UInt64ToLongEncoder<'_> {
+    fn encode<W: Write + ?Sized>(&mut self, out: &mut W, idx: usize) -> Result<(), ArrowError> {
+        let val = self.0.value(idx);
+        if val > i64::MAX as u64 {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "UInt64 value {} exceeds i64::MAX and cannot be encoded as Avro long",
+                val
+            )));
+        }
+        write_long(out, val as i64)
     }
 }
 
