@@ -14,7 +14,8 @@
 
 use arrow_array::{
     types::{IntervalDayTime, IntervalMonthDayNano},
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, ListArray,
+    StructArray,
     Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray,
     DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, IntervalDayTimeArray,
@@ -243,10 +244,14 @@ pub fn pooled_buffer_to_array(
     let validity = buffer_set.validity;
 
     match data_type {
-        // Boolean (1 bit per value, packed)
+        // Boolean: the JIT writes ONE BYTE per value (0/1) — see
+        // JitDecoder::fixed_size_for_type — so pack those bytes into Arrow's
+        // bit-packed BooleanBuffer. The previous code wrapped the byte buffer
+        // directly as a bitmap (BooleanBuffer::new), which read 8 booleans out
+        // of each byte and silently corrupted every value (true -> false).
         DataType::Boolean => {
-            let buffer = Buffer::from(buffer_set.primary.freeze());
-            let bool_buffer = BooleanBuffer::new(buffer, 0, row_count);
+            let bytes = &buffer_set.primary[..];
+            let bool_buffer = BooleanBuffer::from_iter((0..row_count).map(|i| bytes[i] != 0));
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
             Ok(Arc::new(BooleanArray::new(bool_buffer, null_buffer)))
         }
@@ -483,6 +488,73 @@ pub fn pooled_buffer_to_array(
             Ok(Arc::new(LargeBinaryArray::new(offsets, data_buffer, null_buffer)))
         }
 
+        // List<scalar>: i32 element-indexed offsets (primary) + element data
+        // (secondary). Mirrors buffer_to_array_owned; child via recursion. The
+        // data buffer is pool-overallocated, so truncate to the exact element
+        // count before building the child.
+        DataType::List(child_field) => {
+            let offsets_sb = ScalarBuffer::<i32>::from(Buffer::from(buffer_set.primary.freeze()));
+            let total_elems = offsets_sb.last().copied().unwrap_or(0).max(0) as usize;
+            let child_type = child_field.data_type();
+            let elem_size = JitDecoder::fixed_size_for_type(child_type).ok_or_else(|| {
+                ArrowError::NotYetImplemented(format!(
+                    "List child type {child_type:?} is not a fixed-size scalar"
+                ))
+            })?;
+            let mut data = buffer_set.secondary.ok_or_else(|| {
+                ArrowError::InvalidArgumentError("List requires a data buffer".into())
+            })?;
+            data.truncate(total_elems * elem_size);
+            let child = pooled_buffer_to_array(
+                child_field,
+                PooledBufferSet::from_pool(data, None, None),
+                total_elems,
+            )?;
+            let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(ListArray::new(
+                child_field.clone(),
+                OffsetBuffer::new(offsets_sb),
+                child,
+                null_buffer,
+            )))
+        }
+
+        // Struct<scalar children>: de-interleave the JIT's row-major packed buffer
+        // into columnar child arrays (see buffer_to_array_owned).
+        DataType::Struct(child_fields) => {
+            let sizes: Vec<usize> = child_fields
+                .iter()
+                .map(|f| {
+                    JitDecoder::fixed_size_for_type(f.data_type()).ok_or_else(|| {
+                        ArrowError::NotYetImplemented(format!(
+                            "Struct child {:?} is not a fixed-size scalar",
+                            f.data_type()
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let stride: usize = sizes.iter().sum();
+            let packed = buffer_set.primary;
+            let mut children: Vec<ArrayRef> = Vec::with_capacity(child_fields.len());
+            let mut field_off = 0usize;
+            for (ci, f) in child_fields.iter().enumerate() {
+                let s = sizes[ci];
+                let mut child_buf = BytesMut::with_capacity(row_count * s);
+                for row in 0..row_count {
+                    let start = row * stride + field_off;
+                    child_buf.extend_from_slice(&packed[start..start + s]);
+                }
+                children.push(pooled_buffer_to_array(
+                    f,
+                    PooledBufferSet::from_pool(child_buf, None, None),
+                    row_count,
+                )?);
+                field_off += s;
+            }
+            let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(StructArray::new(child_fields.clone(), children, null_buffer)))
+        }
+
         // Unsupported types
         _ => Err(ArrowError::NotYetImplemented(format!(
             "pooled_buffer_to_array does not yet support {:?}",
@@ -600,10 +672,11 @@ pub fn buffer_to_array(
     };
 
     match data_type {
-        // Boolean (1 bit per value, packed)
+        // Boolean: JIT writes one byte per value; pack into a bit-packed
+        // BooleanBuffer (see the detailed note in `buffers_to_batch_owned`).
         DataType::Boolean => {
-            let buffer = Buffer::from(buffer_set.primary.clone());
-            let bool_buffer = BooleanBuffer::new(buffer, 0, row_count);
+            let bytes = &buffer_set.primary[..];
+            let bool_buffer = BooleanBuffer::from_iter((0..row_count).map(|i| bytes[i] != 0));
             Ok(Arc::new(BooleanArray::new(bool_buffer, null_buffer)))
         }
 
@@ -850,10 +923,11 @@ pub fn buffer_to_array_owned(
     let validity = buffer_set.validity;
 
     match data_type {
-        // Boolean (1 bit per value, packed)
+        // Boolean: JIT writes one byte per value; pack into a bit-packed
+        // BooleanBuffer (see the detailed note in `buffers_to_batch_owned`).
         DataType::Boolean => {
-            let buffer = Buffer::from_vec(buffer_set.primary);
-            let bool_buffer = BooleanBuffer::new(buffer, 0, row_count);
+            let bytes = &buffer_set.primary[..];
+            let bool_buffer = BooleanBuffer::from_iter((0..row_count).map(|i| bytes[i] != 0));
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
             Ok(Arc::new(BooleanArray::new(bool_buffer, null_buffer)))
         }
@@ -1084,6 +1158,76 @@ pub fn buffer_to_array_owned(
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
             let offsets = OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets_buffer));
             Ok(Arc::new(LargeBinaryArray::new(offsets, data_buffer, null_buffer)))
+        }
+
+        // List<scalar>: the JIT writes i32 element-indexed offsets (primary) and
+        // a contiguous element-data buffer (secondary) — Arrow's ListArray layout.
+        // Build the child via the scalar arms (recurse on a child BufferSet),
+        // truncated to the exact element count. Scalar element types only;
+        // complex element types fall through to NotYetImplemented.
+        DataType::List(child_field) => {
+            let offsets_sb = ScalarBuffer::<i32>::from(Buffer::from_vec(buffer_set.primary));
+            let total_elems = offsets_sb.last().copied().unwrap_or(0).max(0) as usize;
+            let child_type = child_field.data_type();
+            let elem_size = JitDecoder::fixed_size_for_type(child_type).ok_or_else(|| {
+                ArrowError::NotYetImplemented(format!(
+                    "List child type {child_type:?} is not a fixed-size scalar"
+                ))
+            })?;
+            let mut data = buffer_set.secondary.ok_or_else(|| {
+                ArrowError::InvalidArgumentError("List requires a data buffer".into())
+            })?;
+            data.truncate(total_elems * elem_size);
+            let child = buffer_to_array_owned(
+                child_field,
+                BufferSet { primary: data, secondary: None, validity: None, primary_len: 0, secondary_len: 0 },
+                total_elems,
+            )?;
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(ListArray::new(
+                child_field.clone(),
+                OffsetBuffer::new(offsets_sb),
+                child,
+                null_buffer,
+            )))
+        }
+
+        // Struct<scalar children>: the JIT packs children row-major into ONE
+        // buffer at fixed byte offsets. De-interleave into columnar child arrays
+        // (Arrow's layout). Scalar children only (the JIT's struct codegen does
+        // not emit nullable/complex children).
+        DataType::Struct(child_fields) => {
+            let sizes: Vec<usize> = child_fields
+                .iter()
+                .map(|f| {
+                    JitDecoder::fixed_size_for_type(f.data_type()).ok_or_else(|| {
+                        ArrowError::NotYetImplemented(format!(
+                            "Struct child {:?} is not a fixed-size scalar",
+                            f.data_type()
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            let stride: usize = sizes.iter().sum();
+            let packed = buffer_set.primary;
+            let mut children: Vec<ArrayRef> = Vec::with_capacity(child_fields.len());
+            let mut field_off = 0usize;
+            for (ci, f) in child_fields.iter().enumerate() {
+                let s = sizes[ci];
+                let mut child_buf = Vec::with_capacity(row_count * s);
+                for row in 0..row_count {
+                    let start = row * stride + field_off;
+                    child_buf.extend_from_slice(&packed[start..start + s]);
+                }
+                children.push(buffer_to_array_owned(
+                    f,
+                    BufferSet { primary: child_buf, secondary: None, validity: None, primary_len: 0, secondary_len: 0 },
+                    row_count,
+                )?);
+                field_off += s;
+            }
+            let null_buffer = BufferSet::into_null_buffer(validity, row_count);
+            Ok(Arc::new(StructArray::new(child_fields.clone(), children, null_buffer)))
         }
 
         // Unsupported types

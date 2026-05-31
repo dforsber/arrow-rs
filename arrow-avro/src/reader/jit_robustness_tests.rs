@@ -1498,3 +1498,141 @@ fn test_nullable_timestamp_null_value_handling() {
     // Validity bit should indicate null (bit 0 should be 0)
     assert_eq!(validity_buf[0] & 1, 0, "Expected null bit to be set");
 }
+
+// =============================================================================
+// Boolean correctness regression
+//
+// The JIT writes ONE BYTE per boolean (JitDecoder::fixed_size_for_type), so the
+// buffer→Arrow conversion in jit_buffer_utils must PACK those bytes into a
+// bit-packed BooleanBuffer. A prior bug wrapped the byte buffer directly as a
+// bitmap, reading 8 booleans out of each byte and corrupting every value
+// (true -> false). This guards against regressing that.
+// =============================================================================
+
+#[test]
+fn test_boolean_decode_not_corrupted_byte_vs_bit() {
+    use super::jit_buffer_utils::{buffers_to_batch_owned, BufferSet};
+    use super::jit_decoder::OutputBuffer;
+    use arrow_array::{Array, BooleanArray};
+
+    // 9 values → spans more than one byte, so a byte-vs-bit confusion is visible.
+    let vals = [true, false, true, true, false, false, true, false, true];
+    let data: Vec<u8> = vals.iter().map(|&v| v as u8).collect(); // Avro bool = 1 byte
+
+    let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Boolean, false)]));
+    let decoder = JitDecoder::compile(&schema).expect("compile");
+    let row_count = vals.len();
+
+    let elem = JitDecoder::fixed_size_for_type(&DataType::Boolean).unwrap_or(1);
+    let mut bs = BufferSet::new_fixed(row_count * elem);
+    let outs = vec![OutputBuffer::new(bs.primary_ptr(), bs.primary.len())];
+    decoder.decode_checked(&data, &outs, row_count).expect("decode");
+
+    let batch = buffers_to_batch_owned(&schema, vec![bs], row_count).expect("to_batch");
+    let col = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("bool column");
+    assert_eq!(col.len(), row_count);
+    for (i, &v) in vals.iter().enumerate() {
+        assert_eq!(col.value(i), v, "boolean row {i} corrupted (byte-vs-bit regression)");
+    }
+}
+
+// =============================================================================
+// Nested List<scalar> + Struct<scalar> via the POOLED converter
+// (pooled_buffers_to_batch_owned) — the production pooled path (server.rs:581).
+// =============================================================================
+
+#[test]
+fn test_pooled_nested_list_and_struct_roundtrip() {
+    use super::jit_buffer_utils::{pooled_buffers_to_batch_owned, PooledBufferSet};
+    use super::jit_decoder::OutputBuffer;
+    use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, ListArray, StructArray};
+    use arrow_schema::Fields;
+
+    fn packed(dt: &DataType) -> usize {
+        match dt {
+            DataType::Struct(c) => c.iter().map(|f| packed(f.data_type())).sum(),
+            o => JitDecoder::fixed_size_for_type(o).unwrap_or(8),
+        }
+    }
+    fn decode_pooled(schema: &Arc<Schema>, data: &[u8], rows: usize) -> arrow_array::RecordBatch {
+        let dec = JitDecoder::compile(schema).expect("compile");
+        let var_cap = (data.len() * 16).max(1 << 16);
+        let mut sets = Vec::new();
+        for (ci, f) in schema.fields().iter().enumerate() {
+            let slot = dec.buffer_slot(ci).unwrap();
+            let bs = if slot.secondary.is_some() {
+                PooledBufferSet::new_variable((rows + 1) * 4, var_cap)
+            } else {
+                PooledBufferSet::new_fixed(rows * packed(f.data_type()))
+            };
+            sets.push(bs);
+        }
+        let mut outs = Vec::new();
+        for (ci, bs) in sets.iter_mut().enumerate() {
+            let slot = dec.buffer_slot(ci).unwrap();
+            outs.push(OutputBuffer::new(bs.primary_ptr(), bs.primary_capacity()));
+            if slot.secondary.is_some() {
+                outs.push(OutputBuffer::new(bs.secondary_ptr(), bs.secondary_capacity()));
+            }
+        }
+        dec.decode_checked(data, &outs, rows).expect("decode");
+        pooled_buffers_to_batch_owned(schema, sets, rows).expect("convert")
+    }
+
+    // List<Int64>
+    let lschema = Arc::new(Schema::new(vec![Field::new(
+        "l",
+        DataType::List(Arc::new(Field::new("item", DataType::Int64, false))),
+        false,
+    )]));
+    let lists: Vec<Vec<i64>> = vec![vec![], vec![1, -2, 3], vec![7; 5]];
+    let mut d = Vec::new();
+    for list in &lists {
+        if !list.is_empty() {
+            encode_varint(&mut d, list.len() as i64);
+            for v in list {
+                encode_varint(&mut d, *v);
+            }
+        }
+        encode_varint(&mut d, 0);
+    }
+    let batch = decode_pooled(&lschema, &d, lists.len());
+    let la = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    for (i, list) in lists.iter().enumerate() {
+        let v = la.value(i);
+        assert_eq!(
+            v.as_any().downcast_ref::<Int64Array>().unwrap().values(),
+            list.as_slice(),
+            "pooled list row {i}"
+        );
+    }
+
+    // Struct<Int64, Float64, Boolean>
+    let sfields = Fields::from(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Float64, false),
+        Field::new("c", DataType::Boolean, false),
+    ]);
+    let sschema = Arc::new(Schema::new(vec![Field::new("s", DataType::Struct(sfields), false)]));
+    let srows: Vec<(i64, f64, bool)> = vec![(1, 1.5, true), (-9, -2.5, false)];
+    let mut sd = Vec::new();
+    for (a, b, c) in &srows {
+        encode_varint(&mut sd, *a);
+        sd.extend_from_slice(&b.to_le_bytes());
+        sd.push(if *c { 1 } else { 0 });
+    }
+    let batch = decode_pooled(&sschema, &sd, srows.len());
+    let sa = batch.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let ac = sa.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let bc = sa.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+    let cc = sa.column(2).as_any().downcast_ref::<BooleanArray>().unwrap();
+    for (i, (a, b, c)) in srows.iter().enumerate() {
+        assert_eq!(ac.value(i), *a, "pooled struct.a {i}");
+        assert_eq!(bc.value(i), *b, "pooled struct.b {i}");
+        assert_eq!(cc.value(i), *c, "pooled struct.c {i}");
+    }
+}
