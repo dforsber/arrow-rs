@@ -254,6 +254,14 @@ fn jit_decode(arrow_schema: &SchemaRef, body: &[u8], rows: usize) -> Result<Reco
     let decoder = JitDecoder::compile(arrow_schema)
         .map_err(|e| ArrowError::ComputeError(format!("JIT compile: {e}")))?;
 
+    // Empty batch: production early-returns on empty records before allocating.
+    // Mirror that — and avoid 0-length buffers whose dangling ptr is misaligned
+    // for wide ScalarBuffer<T> (the array length would otherwise derive from
+    // bytes/elem, breaking for FixedSizeBinary(1) and wide types alike).
+    if rows == 0 {
+        return Ok(RecordBatch::new_empty(arrow_schema.clone()));
+    }
+
     let var_data_cap = (body.len() + 64).max(64);
     let mut sets: Vec<BufferSet> = Vec::with_capacity(arrow_schema.fields().len());
     for (ci, field) in arrow_schema.fields().iter().enumerate() {
@@ -270,8 +278,11 @@ fn jit_decode(arrow_schema: &SchemaRef, body: &[u8], rows: usize) -> Result<Reco
             }
             b
         } else {
+            // Exactly rows*elem bytes — NOT max(1). A spare byte would make a
+            // FixedSizeBinary(1) column report length 1 for an empty batch
+            // (length = bytes/size). Production sizes this as row_count*elem too.
             let elem = packed_column_bytes(field.data_type());
-            let mut b = BufferSet::new_fixed((rows * elem).max(1));
+            let mut b = BufferSet::new_fixed(rows * elem);
             if nullable {
                 b = b.with_validity(validity_bytes);
             }
@@ -469,6 +480,81 @@ fn diff_fixed_edges() {
             Scalar::Fixed(vec![255u8; 16]),
         ],
     );
+}
+
+#[test]
+fn diff_list_long() {
+    // List<long> encoded by apache_avro (canonical: count / items / 0-terminator
+    // blocks). Reproduces the Tier-2 pooled-path List failure in the fast repo.
+    let json = r#"{"type":"record","name":"R","fields":[
+        {"name":"l","type":{"type":"array","items":"long"}}]}"#;
+    let schema = ApacheSchema::parse_str(json).expect("apache parse");
+    let lists: Vec<Vec<i64>> = vec![vec![], vec![1, -2, 3], vec![7; 5]];
+    let mut body = Vec::new();
+    for arr in &lists {
+        let rec = Value::Record(vec![(
+            "l".into(),
+            Value::Array(arr.iter().map(|v| Value::Long(*v)).collect()),
+        )]);
+        body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode"));
+    }
+    let (ref_batch, arrow_schema) = reference_decode(json, &body, lists.len());
+    let jit_batch = jit_decode(&arrow_schema, &body, lists.len())
+        .unwrap_or_else(|e| panic!("JIT list decode failed: {e}"));
+    assert_eq!(ref_batch, jit_batch, "List<long> JIT vs reference");
+}
+
+#[test]
+fn diff_list_long_pooled_chunked() {
+    // The pooled + decode_chunked path (what boilstream's production pooled
+    // decoder drives), allocated like `allocate_pooled_buffers_adaptive`. A
+    // non-nullable List<Int64> must produce element-indexed offsets [0,0,3,8]
+    // and decode cleanly. (The Tier-2 failure that motivated this came from the
+    // caller mapping the list child as nullable, compiling the wrong element
+    // decoder — see boilstream's ArrowConverter fix.)
+    use super::jit_buffer_utils::{pooled_buffers_to_batch_owned, PooledBufferSet};
+    let json = r#"{"type":"record","name":"R","fields":[
+        {"name":"l","type":{"type":"array","items":"long"}}]}"#;
+    let schema = ApacheSchema::parse_str(json).expect("apache parse");
+    let lists: Vec<Vec<i64>> = vec![vec![], vec![1, -2, 3], vec![7; 5]];
+    let mut body = Vec::new();
+    for arr in &lists {
+        let rec = Value::Record(vec![(
+            "l".into(),
+            Value::Array(arr.iter().map(|v| Value::Long(*v)).collect()),
+        )]);
+        body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode"));
+    }
+    let (ref_batch, arrow_schema) = reference_decode(json, &body, lists.len());
+    let rows = lists.len();
+    let decoder = JitDecoder::compile(&arrow_schema).expect("compile");
+
+    let mut bs = PooledBufferSet::new_variable((rows + 1) * 4, rows * 64);
+    let outs = vec![
+        OutputBuffer::new(bs.primary_ptr(), bs.primary_capacity()),
+        OutputBuffer::new(bs.secondary_ptr(), bs.secondary_capacity()),
+    ];
+    let res = decoder.decode_chunked(&body, &outs, rows);
+    assert_eq!(res.rows_decoded, rows, "chunked decode rows");
+    let batch =
+        pooled_buffers_to_batch_owned(&arrow_schema, vec![bs], res.rows_decoded).expect("convert");
+    assert_eq!(ref_batch, batch, "pooled+chunked List<long> vs reference");
+}
+
+#[test]
+fn diff_fixed1_three_rows() {
+    // size-1 FixedSizeBinary: length = bytes/size, so off-by-one allocation is
+    // visible here.
+    diff_single(
+        Kind::Fixed(1),
+        vec![Scalar::Fixed(vec![1]), Scalar::Fixed(vec![2]), Scalar::Fixed(vec![3])],
+    );
+}
+
+#[test]
+fn diff_fixed_empty_batch() {
+    // Empty batch + FixedSizeBinary(1): array length must be 0, not 1.
+    assert_diff(&[(Kind::Fixed(1), false)], &[]);
 }
 
 #[test]
