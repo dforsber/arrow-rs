@@ -35,11 +35,14 @@
 //! can.
 //!
 //! Coverage discipline:
-//! - **Verified baseline**: every type listed in `SUPPORTED` must round-trip
-//!   (exhaustive edge cases + a proptest over random multi-column batches).
+//! - **Verified baseline** (`Kind`): every kind must round-trip — exhaustive
+//!   edge cases + a proptest over random multi-column batches (incl. nullable).
 //! - **Loud rejection**: unsupported shapes (e.g. Map) must make the JIT path
 //!   return `Err`, never silently-wrong data. `gate_*` tests assert this.
-//! Add a type to `SUPPORTED` only once it has a passing differential test.
+//! Add a kind only once it has a passing differential test.
+//!
+//! Deferred (need richer encoding plumbing, tracked for the next increment):
+//! Decimal128/256 (`apache_avro::Decimal`), Duration (Avro `duration` fixed-12).
 
 use super::jit_buffer_utils::{buffers_to_batch_owned, BufferSet};
 use super::jit_decoder::{JitDecoder, OutputBuffer};
@@ -51,8 +54,8 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 use proptest::prelude::*;
 
-/// A scalar Avro value to generate/encode. Each variant maps 1:1 to an Avro
-/// primitive and to the Arrow type the decoders must produce.
+/// A generated Avro value. Each variant maps 1:1 to a [`Kind`] and to the Arrow
+/// type the decoders must produce.
 #[derive(Clone, Debug, PartialEq)]
 enum Scalar {
     Bool(bool),
@@ -62,6 +65,12 @@ enum Scalar {
     Double(f64),
     Str(String),
     Bytes(Vec<u8>),
+    Date(i32),
+    TimeMillis(i32),
+    TimeMicros(i64),
+    TsMillis(i64),
+    TsMicros(i64),
+    Fixed(Vec<u8>),
 }
 
 impl Scalar {
@@ -74,25 +83,111 @@ impl Scalar {
             Scalar::Double(v) => Value::Double(*v),
             Scalar::Str(v) => Value::String(v.clone()),
             Scalar::Bytes(v) => Value::Bytes(v.clone()),
+            Scalar::Date(v) => Value::Date(*v),
+            Scalar::TimeMillis(v) => Value::TimeMillis(*v),
+            Scalar::TimeMicros(v) => Value::TimeMicros(*v),
+            Scalar::TsMillis(v) => Value::TimestampMillis(*v),
+            Scalar::TsMicros(v) => Value::TimestampMicros(*v),
+            Scalar::Fixed(v) => Value::Fixed(v.len(), v.clone()),
         }
     }
 }
 
-/// A column spec: Avro type name + whether it is nullable (`["null", T]`).
-type ColSpec<'a> = (&'a str, bool);
+/// A column's logical kind: knows its Avro type-JSON fragment and how to
+/// generate a value. The single source of truth for "supported".
+#[derive(Clone, Debug)]
+enum Kind {
+    Bool,
+    Int,
+    Long,
+    Float,
+    Double,
+    Str,
+    Bytes,
+    Date,
+    TimeMillis,
+    TimeMicros,
+    TsMillis,
+    TsMicros,
+    /// Avro `fixed` of the given size → Arrow FixedSizeBinary.
+    Fixed(usize),
+}
+
+impl Kind {
+    /// The complete Avro type-JSON fragment for field index `i`. `fixed`
+    /// requires a unique name per field.
+    fn type_json(&self, i: usize) -> String {
+        match self {
+            Kind::Bool => "\"boolean\"".into(),
+            Kind::Int => "\"int\"".into(),
+            Kind::Long => "\"long\"".into(),
+            Kind::Float => "\"float\"".into(),
+            Kind::Double => "\"double\"".into(),
+            Kind::Str => "\"string\"".into(),
+            Kind::Bytes => "\"bytes\"".into(),
+            Kind::Date => r#"{"type":"int","logicalType":"date"}"#.into(),
+            Kind::TimeMillis => r#"{"type":"int","logicalType":"time-millis"}"#.into(),
+            Kind::TimeMicros => r#"{"type":"long","logicalType":"time-micros"}"#.into(),
+            Kind::TsMillis => r#"{"type":"long","logicalType":"timestamp-millis"}"#.into(),
+            Kind::TsMicros => r#"{"type":"long","logicalType":"timestamp-micros"}"#.into(),
+            Kind::Fixed(n) => format!(r#"{{"type":"fixed","name":"Fixed_f{i}","size":{n}}}"#),
+        }
+    }
+
+    /// Generate a value from a deterministic PRNG state. Temporal values are
+    /// constrained to valid domains (time-of-day ranges); the decoders pass the
+    /// raw integers through, but staying in-range avoids encoder validation.
+    fn gen_value(&self, state: &mut u64) -> Scalar {
+        let r = next_u64(state);
+        match self {
+            Kind::Bool => Scalar::Bool(r & 1 == 1),
+            Kind::Int => Scalar::Int(r as i32),
+            Kind::Long => Scalar::Long(r as i64),
+            Kind::Float => {
+                let f = f32::from_bits(r as u32);
+                Scalar::Float(if f.is_nan() { 0.0 } else { f })
+            }
+            Kind::Double => {
+                let d = f64::from_bits(r);
+                Scalar::Double(if d.is_nan() { 0.0 } else { d })
+            }
+            Kind::Str => {
+                let len = (r % 12) as usize;
+                let s: String = (0..len)
+                    .map(|_| ((next_u64(state) % 26) as u8 + b'a') as char)
+                    .collect();
+                Scalar::Str(s)
+            }
+            Kind::Bytes => {
+                let len = (r % 12) as usize;
+                Scalar::Bytes((0..len).map(|_| next_u64(state) as u8).collect())
+            }
+            Kind::Date => Scalar::Date(r as i32),
+            Kind::TimeMillis => Scalar::TimeMillis((r % 86_400_000) as i32),
+            Kind::TimeMicros => Scalar::TimeMicros((r % 86_400_000_000) as i64),
+            Kind::TsMillis => Scalar::TsMillis(r as i64),
+            Kind::TsMicros => Scalar::TsMicros(r as i64),
+            Kind::Fixed(n) => Scalar::Fixed((0..*n).map(|_| next_u64(state) as u8).collect()),
+        }
+    }
+}
+
+/// A column spec: kind + whether it is nullable (`["null", T]`).
+type Col = (Kind, bool);
 
 /// Build the Avro record-schema JSON. Nullable columns use a `["null", T]`
-/// union (null first → default branch 0, matching how the encoder tags values).
-fn record_json(specs: &[ColSpec]) -> String {
+/// union (null first → default branch 0, matching the encoder's tagging).
+fn record_json(cols: &[Col]) -> String {
     let mut fields = String::new();
-    for (i, (t, nullable)) in specs.iter().enumerate() {
+    for (i, (kind, nullable)) in cols.iter().enumerate() {
         if i > 0 {
             fields.push(',');
         }
+        let frag = kind.type_json(i);
         if *nullable {
-            fields.push_str(&format!(r#"{{"name":"f{i}","type":["null","{t}"]}}"#));
+            fields.push_str(&format!(r#"{{"name":"f{i}","type":["null",{frag}]}}"#));
         } else {
-            fields.push_str(&format!(r#"{{"name":"f{i}","type":"{t}"}}"#));
+            fields.push_str(&format!(r#"{{"name":"f{i}","type":{frag}}}"#));
         }
     }
     format!(r#"{{"type":"record","name":"R","fields":[{fields}]}}"#)
@@ -101,7 +196,7 @@ fn record_json(specs: &[ColSpec]) -> String {
 /// Encode `rows` to a single concatenated raw-datum buffer via apache_avro.
 /// `None` in a nullable column encodes as union branch 0 (`null`); a present
 /// value in a nullable column encodes as branch 1.
-fn encode_rows(json: &str, specs: &[ColSpec], rows: &[Vec<Option<Scalar>>]) -> Vec<u8> {
+fn encode_rows(json: &str, cols: &[Col], rows: &[Vec<Option<Scalar>>]) -> Vec<u8> {
     let schema = ApacheSchema::parse_str(json).expect("apache parse_str");
     let mut body = Vec::new();
     for row in rows {
@@ -109,9 +204,9 @@ fn encode_rows(json: &str, specs: &[ColSpec], rows: &[Vec<Option<Scalar>>]) -> V
             row.iter()
                 .enumerate()
                 .map(|(i, cell)| {
-                    let (_, nullable) = specs[i];
+                    let (_, nullable) = &cols[i];
                     let v = match cell {
-                        Some(s) if nullable => Value::Union(1, Box::new(s.to_value())),
+                        Some(s) if *nullable => Value::Union(1, Box::new(s.to_value())),
                         Some(s) => s.to_value(),
                         None => Value::Union(0, Box::new(Value::Null)),
                     };
@@ -125,8 +220,8 @@ fn encode_rows(json: &str, specs: &[ColSpec], rows: &[Vec<Option<Scalar>>]) -> V
 }
 
 /// Reference decode via the interpreted `RecordDecoder`. Returns the batch and
-/// the Arrow schema it derived (which we then feed to the JIT path so both use
-/// an identical schema — any difference is then purely in the values).
+/// the Arrow schema it derived (fed to the JIT path so both use an identical
+/// schema — any difference is then purely in the values).
 fn reference_decode(json: &str, body: &[u8], rows: usize) -> (RecordBatch, SchemaRef) {
     let avro_schema: AvroSchema = serde_json::from_str(json).expect("serde parse avro schema");
     let field = AvroFieldBuilder::new(&avro_schema)
@@ -159,7 +254,6 @@ fn jit_decode(arrow_schema: &SchemaRef, body: &[u8], rows: usize) -> Result<Reco
     let decoder = JitDecoder::compile(arrow_schema)
         .map_err(|e| ArrowError::ComputeError(format!("JIT compile: {e}")))?;
 
-    // Generous variable-length data sizing: enough for the whole input.
     let var_data_cap = (body.len() + 64).max(64);
     let mut sets: Vec<BufferSet> = Vec::with_capacity(arrow_schema.fields().len());
     for (ci, field) in arrow_schema.fields().iter().enumerate() {
@@ -208,128 +302,211 @@ fn jit_decode(arrow_schema: &SchemaRef, body: &[u8], rows: usize) -> Result<Reco
     buffers_to_batch_owned(arrow_schema, sets, rows)
 }
 
-/// The differential assertion (general, nullable-aware): encode, decode both
-/// ways, require equality.
-fn assert_general(specs: &[ColSpec], rows: &[Vec<Option<Scalar>>]) {
-    let json = record_json(specs);
-    let body = encode_rows(&json, specs, rows);
+/// The differential assertion: encode, decode both ways, require equality.
+fn assert_diff(cols: &[Col], rows: &[Vec<Option<Scalar>>]) {
+    let json = record_json(cols);
+    let body = encode_rows(&json, cols, rows);
     let (ref_batch, schema) = reference_decode(&json, &body, rows.len());
     let jit_batch = jit_decode(&schema, &body, rows.len())
-        .unwrap_or_else(|e| panic!("JIT decode failed for {specs:?}: {e}"));
+        .unwrap_or_else(|e| panic!("JIT decode failed for {cols:?}: {e}"));
     assert_eq!(
         ref_batch, jit_batch,
-        "JIT batch diverged from reference for columns {specs:?}"
+        "JIT batch diverged from reference for columns {cols:?}"
     );
 }
 
-/// Back-compat non-nullable helper: all columns required, all cells present.
-fn assert_jit_matches_reference(col_types: &[&str], rows: &[Vec<Scalar>]) {
-    let specs: Vec<ColSpec> = col_types.iter().map(|t| (*t, false)).collect();
-    let rows_opt: Vec<Vec<Option<Scalar>>> = rows
-        .iter()
-        .map(|r| r.iter().cloned().map(Some).collect())
-        .collect();
-    assert_general(&specs, &rows_opt);
+/// Convenience: single required (non-nullable) column, one value per row.
+fn diff_single(kind: Kind, vals: Vec<Scalar>) {
+    let cols = vec![(kind, false)];
+    let rows: Vec<Vec<Option<Scalar>>> = vals.into_iter().map(|v| vec![Some(v)]).collect();
+    assert_diff(&cols, &rows);
 }
 
 // ===========================================================================
-// Verified baseline — exhaustive edge cases per supported scalar type.
+// Verified baseline — exhaustive edge cases per supported kind.
 // ===========================================================================
 
 #[test]
 fn diff_bool_edges() {
-    let rows: Vec<Vec<Scalar>> =
+    diff_single(
+        Kind::Bool,
         [true, false, false, true, true, true, false, false, true]
             .iter()
-            .map(|&b| vec![Scalar::Bool(b)])
-            .collect();
-    assert_jit_matches_reference(&["boolean"], &rows);
+            .map(|&b| Scalar::Bool(b))
+            .collect(),
+    );
 }
 
 #[test]
 fn diff_int_edges() {
-    let rows: Vec<Vec<Scalar>> = [i32::MIN, -1, 0, 1, 127, 128, i32::MAX]
-        .iter()
-        .map(|&v| vec![Scalar::Int(v)])
-        .collect();
-    assert_jit_matches_reference(&["int"], &rows);
+    diff_single(
+        Kind::Int,
+        [i32::MIN, -1, 0, 1, 127, 128, i32::MAX]
+            .iter()
+            .map(|&v| Scalar::Int(v))
+            .collect(),
+    );
 }
 
 #[test]
 fn diff_long_edges() {
-    let rows: Vec<Vec<Scalar>> = [i64::MIN, -1, 0, 1, i64::MAX]
-        .iter()
-        .map(|&v| vec![Scalar::Long(v)])
-        .collect();
-    assert_jit_matches_reference(&["long"], &rows);
+    diff_single(
+        Kind::Long,
+        [i64::MIN, -1, 0, 1, i64::MAX]
+            .iter()
+            .map(|&v| Scalar::Long(v))
+            .collect(),
+    );
 }
 
 #[test]
 fn diff_float_edges() {
-    let rows: Vec<Vec<Scalar>> = [0.0f32, -0.0, 1.5, -1.5, f32::MIN, f32::MAX, f32::INFINITY]
-        .iter()
-        .map(|&v| vec![Scalar::Float(v)])
-        .collect();
-    assert_jit_matches_reference(&["float"], &rows);
+    diff_single(
+        Kind::Float,
+        [0.0f32, -0.0, 1.5, -1.5, f32::MIN, f32::MAX, f32::INFINITY]
+            .iter()
+            .map(|&v| Scalar::Float(v))
+            .collect(),
+    );
 }
 
 #[test]
 fn diff_double_edges() {
-    let rows: Vec<Vec<Scalar>> = [0.0f64, -0.0, 1.5, -1.5, f64::MIN, f64::MAX]
-        .iter()
-        .map(|&v| vec![Scalar::Double(v)])
-        .collect();
-    assert_jit_matches_reference(&["double"], &rows);
+    diff_single(
+        Kind::Double,
+        [0.0f64, -0.0, 1.5, -1.5, f64::MIN, f64::MAX]
+            .iter()
+            .map(|&v| Scalar::Double(v))
+            .collect(),
+    );
 }
 
 #[test]
 fn diff_string_edges() {
-    let rows: Vec<Vec<Scalar>> = ["", "a", "hello world", "ünïcödé→★", "with\ttab\nnewline"]
-        .iter()
-        .map(|s| vec![Scalar::Str(s.to_string())])
-        .collect();
-    assert_jit_matches_reference(&["string"], &rows);
+    diff_single(
+        Kind::Str,
+        ["", "a", "hello world", "ünïcödé→★", "with\ttab\nnewline"]
+            .iter()
+            .map(|s| Scalar::Str(s.to_string()))
+            .collect(),
+    );
 }
 
 #[test]
 fn diff_bytes_edges() {
-    let rows: Vec<Vec<Scalar>> = [vec![], vec![0u8], vec![0u8, 255, 1, 254], vec![7u8; 100]]
-        .iter()
-        .map(|b| vec![Scalar::Bytes(b.clone())])
-        .collect();
-    assert_jit_matches_reference(&["bytes"], &rows);
+    diff_single(
+        Kind::Bytes,
+        [vec![], vec![0u8], vec![0u8, 255, 1, 254], vec![7u8; 100]]
+            .iter()
+            .map(|b| Scalar::Bytes(b.clone()))
+            .collect(),
+    );
+}
+
+#[test]
+fn diff_date_edges() {
+    diff_single(
+        Kind::Date,
+        [i32::MIN, -1, 0, 1, 19000, i32::MAX]
+            .iter()
+            .map(|&v| Scalar::Date(v))
+            .collect(),
+    );
+}
+
+#[test]
+fn diff_time_millis_edges() {
+    diff_single(
+        Kind::TimeMillis,
+        [0, 1, 1000, 86_399_999]
+            .iter()
+            .map(|&v| Scalar::TimeMillis(v))
+            .collect(),
+    );
+}
+
+#[test]
+fn diff_time_micros_edges() {
+    diff_single(
+        Kind::TimeMicros,
+        [0i64, 1, 1_000_000, 86_399_999_999]
+            .iter()
+            .map(|&v| Scalar::TimeMicros(v))
+            .collect(),
+    );
+}
+
+#[test]
+fn diff_timestamp_millis_edges() {
+    diff_single(
+        Kind::TsMillis,
+        [i64::MIN, -1, 0, 1, 1_700_000_000_000, i64::MAX]
+            .iter()
+            .map(|&v| Scalar::TsMillis(v))
+            .collect(),
+    );
+}
+
+#[test]
+fn diff_timestamp_micros_edges() {
+    diff_single(
+        Kind::TsMicros,
+        [i64::MIN, -1, 0, 1, 1_700_000_000_000_000, i64::MAX]
+            .iter()
+            .map(|&v| Scalar::TsMicros(v))
+            .collect(),
+    );
+}
+
+#[test]
+fn diff_fixed_edges() {
+    // Avro `fixed` → Arrow FixedSizeBinary(n). All values must be exactly n bytes.
+    diff_single(
+        Kind::Fixed(16),
+        vec![
+            Scalar::Fixed(vec![0u8; 16]),
+            Scalar::Fixed((0u8..16).collect()),
+            Scalar::Fixed(vec![255u8; 16]),
+        ],
+    );
 }
 
 #[test]
 fn diff_multi_column_mixed() {
+    let cols = vec![
+        (Kind::Bool, false),
+        (Kind::Int, false),
+        (Kind::Str, false),
+        (Kind::TsMicros, false),
+    ];
     let rows = vec![
         vec![
-            Scalar::Bool(true),
-            Scalar::Int(7),
-            Scalar::Str("x".into()),
-            Scalar::Double(3.5),
+            Some(Scalar::Bool(true)),
+            Some(Scalar::Int(7)),
+            Some(Scalar::Str("x".into())),
+            Some(Scalar::TsMicros(1)),
         ],
         vec![
-            Scalar::Bool(false),
-            Scalar::Int(-9),
-            Scalar::Str("".into()),
-            Scalar::Double(-0.0),
+            Some(Scalar::Bool(false)),
+            Some(Scalar::Int(-9)),
+            Some(Scalar::Str("".into())),
+            Some(Scalar::TsMicros(-1)),
         ],
     ];
-    assert_jit_matches_reference(&["boolean", "int", "string", "double"], &rows);
+    assert_diff(&cols, &rows);
 }
 
 #[test]
 fn diff_empty_batch() {
     // Zero rows must still produce equal (empty) batches with the right schema.
-    assert_jit_matches_reference(&["int"], &[]);
+    assert_diff(&[(Kind::Int, false)], &[]);
 }
 
 #[test]
 fn diff_nullable_scalars_edges() {
     // ["null", T] unions — the most common real Avro shape. Interleave present
     // and null values so validity bitmaps span byte boundaries.
-    let specs: Vec<ColSpec> = vec![("long", true), ("string", true), ("boolean", true)];
+    let cols = vec![(Kind::Long, true), (Kind::Str, true), (Kind::Bool, true)];
     let rows: Vec<Vec<Option<Scalar>>> = vec![
         vec![Some(Scalar::Long(1)), None, Some(Scalar::Bool(true))],
         vec![None, Some(Scalar::Str("x".into())), None],
@@ -337,19 +514,18 @@ fn diff_nullable_scalars_edges() {
         vec![None, None, None],
         vec![Some(Scalar::Long(i64::MAX)), Some(Scalar::Str("ünï".into())), Some(Scalar::Bool(true))],
     ];
-    assert_general(&specs, &rows);
+    assert_diff(&cols, &rows);
 }
 
 #[test]
 fn diff_nullable_mixed_with_required() {
-    // Mix nullable and required columns in one record.
-    let specs: Vec<ColSpec> = vec![("int", false), ("double", true), ("bytes", true)];
+    let cols = vec![(Kind::Int, false), (Kind::Double, true), (Kind::Date, true)];
     let rows: Vec<Vec<Option<Scalar>>> = vec![
         vec![Some(Scalar::Int(7)), Some(Scalar::Double(1.5)), None],
-        vec![Some(Scalar::Int(-1)), None, Some(Scalar::Bytes(vec![1, 2, 3]))],
+        vec![Some(Scalar::Int(-1)), None, Some(Scalar::Date(100))],
         vec![Some(Scalar::Int(0)), None, None],
     ];
-    assert_general(&specs, &rows);
+    assert_diff(&cols, &rows);
 }
 
 // ===========================================================================
@@ -358,8 +534,6 @@ fn diff_nullable_mixed_with_required() {
 
 #[test]
 fn gate_map_is_loudly_rejected() {
-    // Reference decodes a Map fine; the JIT converter must return Err
-    // (NotYetImplemented), proving no silent-wrong path.
     let json = r#"{"type":"record","name":"R","fields":[
         {"name":"m","type":{"type":"map","values":"long"}}]}"#;
     let schema = ApacheSchema::parse_str(json).expect("apache parse");
@@ -378,52 +552,31 @@ fn gate_map_is_loudly_rejected() {
 }
 
 // ===========================================================================
-// Property test — random multi-column batches over the supported scalar set.
-// proptest controls (column types, row count, value seed); rand fills values
-// deterministically from the seed. Shrinks structure (drop columns/rows) to a
-// minimal counterexample on failure.
+// Property test — random multi-column batches over the supported kinds.
+// proptest controls (kinds, per-column nullability, row count, value seed); a
+// deterministic SplitMix64 fills values from the seed so failures replay
+// exactly. proptest shrinks structure (drop columns/rows) to a minimal repro.
 // ===========================================================================
 
-#[derive(Clone, Debug)]
-enum ColType {
-    Bool,
-    Int,
-    Long,
-    Float,
-    Double,
-    Str,
-    Bytes,
-}
-
-impl ColType {
-    fn avro(&self) -> &'static str {
-        match self {
-            ColType::Bool => "boolean",
-            ColType::Int => "int",
-            ColType::Long => "long",
-            ColType::Float => "float",
-            ColType::Double => "double",
-            ColType::Str => "string",
-            ColType::Bytes => "bytes",
-        }
-    }
-}
-
-fn col_type_strategy() -> impl Strategy<Value = ColType> {
+fn kind_strategy() -> impl Strategy<Value = Kind> {
     prop_oneof![
-        Just(ColType::Bool),
-        Just(ColType::Int),
-        Just(ColType::Long),
-        Just(ColType::Float),
-        Just(ColType::Double),
-        Just(ColType::Str),
-        Just(ColType::Bytes),
+        Just(Kind::Bool),
+        Just(Kind::Int),
+        Just(Kind::Long),
+        Just(Kind::Float),
+        Just(Kind::Double),
+        Just(Kind::Str),
+        Just(Kind::Bytes),
+        Just(Kind::Date),
+        Just(Kind::TimeMillis),
+        Just(Kind::TimeMicros),
+        Just(Kind::TsMillis),
+        Just(Kind::TsMicros),
+        (1usize..=20).prop_map(Kind::Fixed),
     ]
 }
 
-/// Deterministically fill a scalar for a column from a per-cell PRNG state.
-/// (Simple SplitMix64 — avoids a rand-version dependency and is reproducible
-/// from the proptest-chosen seed, so failures replay exactly.)
+/// SplitMix64 — reproducible from the proptest-chosen seed, no rand-version dep.
 fn next_u64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
@@ -432,72 +585,36 @@ fn next_u64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn gen_scalar(ct: &ColType, state: &mut u64) -> Scalar {
-    let r = next_u64(state);
-    match ct {
-        ColType::Bool => Scalar::Bool(r & 1 == 1),
-        ColType::Int => Scalar::Int(r as i32),
-        ColType::Long => Scalar::Long(r as i64),
-        ColType::Float => Scalar::Float(f32::from_bits(r as u32)),
-        ColType::Double => Scalar::Double(f64::from_bits(r)),
-        ColType::Str => {
-            let len = (r % 12) as usize;
-            let s: String = (0..len)
-                .map(|_| {
-                    let c = (next_u64(state) % 26) as u8 + b'a';
-                    c as char
-                })
-                .collect();
-            Scalar::Str(s)
-        }
-        ColType::Bytes => {
-            let len = (r % 12) as usize;
-            let b: Vec<u8> = (0..len).map(|_| next_u64(state) as u8).collect();
-            Scalar::Bytes(b)
-        }
-    }
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 
     #[test]
-    fn prop_differential_supported_scalars(
-        types in prop::collection::vec(col_type_strategy(), 1..=5),
+    fn prop_differential_supported_kinds(
+        kinds in prop::collection::vec(kind_strategy(), 1..=5),
         nullable_flags in prop::collection::vec(any::<bool>(), 1..=5),
         n_rows in 0usize..=48,
         seed in any::<u64>(),
     ) {
-        // NaN floats compare unequal to themselves, which would make
-        // assert_eq! on the batches fail spuriously — skip NaN by construction
-        // (the edge tests cover the bit-pattern paths deterministically).
         let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
-        let specs: Vec<ColSpec> = types
+        let cols: Vec<Col> = kinds
             .iter()
             .enumerate()
-            .map(|(i, c)| (c.avro(), *nullable_flags.get(i).unwrap_or(&false)))
+            .map(|(i, k)| (k.clone(), *nullable_flags.get(i).unwrap_or(&false)))
             .collect();
         let rows: Vec<Vec<Option<Scalar>>> = (0..n_rows)
             .map(|_| {
-                specs
-                    .iter()
-                    .zip(types.iter())
-                    .map(|((_, nullable), ct)| {
+                cols.iter()
+                    .map(|(kind, nullable)| {
                         // ~1 in 4 cells null for nullable columns.
                         if *nullable && next_u64(&mut state) % 4 == 0 {
-                            return None;
+                            None
+                        } else {
+                            Some(kind.gen_value(&mut state))
                         }
-                        let mut s = gen_scalar(ct, &mut state);
-                        match &mut s {
-                            Scalar::Float(f) if f.is_nan() => *f = 0.0,
-                            Scalar::Double(d) if d.is_nan() => *d = 0.0,
-                            _ => {}
-                        }
-                        Some(s)
                     })
                     .collect()
             })
             .collect();
-        assert_general(&specs, &rows);
+        assert_diff(&cols, &rows);
     }
 }
