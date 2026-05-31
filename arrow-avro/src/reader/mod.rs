@@ -511,6 +511,11 @@ pub mod jit_buffer_utils;
 #[cfg(all(test, feature = "jit"))]
 mod jit_robustness_tests;
 
+/// Differential tests: JIT decode vs the independent `RecordDecoder` reference,
+/// over canonical Avro bytes encoded by `apache_avro`. The compliance oracle.
+#[cfg(all(test, feature = "jit"))]
+mod jit_differential_tests;
+
 fn is_incomplete_data(err: &ArrowError) -> bool {
     matches!(
         err,
