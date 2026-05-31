@@ -78,28 +78,45 @@ impl Scalar {
     }
 }
 
-/// Build the Avro record-schema JSON for a row of column types. Field names are
-/// `f0..fN`; types come from the first row (all rows share the same types).
-fn record_json(col_types: &[&str]) -> String {
+/// A column spec: Avro type name + whether it is nullable (`["null", T]`).
+type ColSpec<'a> = (&'a str, bool);
+
+/// Build the Avro record-schema JSON. Nullable columns use a `["null", T]`
+/// union (null first → default branch 0, matching how the encoder tags values).
+fn record_json(specs: &[ColSpec]) -> String {
     let mut fields = String::new();
-    for (i, t) in col_types.iter().enumerate() {
+    for (i, (t, nullable)) in specs.iter().enumerate() {
         if i > 0 {
             fields.push(',');
         }
-        fields.push_str(&format!(r#"{{"name":"f{i}","type":"{t}"}}"#));
+        if *nullable {
+            fields.push_str(&format!(r#"{{"name":"f{i}","type":["null","{t}"]}}"#));
+        } else {
+            fields.push_str(&format!(r#"{{"name":"f{i}","type":"{t}"}}"#));
+        }
     }
     format!(r#"{{"type":"record","name":"R","fields":[{fields}]}}"#)
 }
 
 /// Encode `rows` to a single concatenated raw-datum buffer via apache_avro.
-fn encode_rows(json: &str, rows: &[Vec<Scalar>]) -> Vec<u8> {
+/// `None` in a nullable column encodes as union branch 0 (`null`); a present
+/// value in a nullable column encodes as branch 1.
+fn encode_rows(json: &str, specs: &[ColSpec], rows: &[Vec<Option<Scalar>>]) -> Vec<u8> {
     let schema = ApacheSchema::parse_str(json).expect("apache parse_str");
     let mut body = Vec::new();
     for row in rows {
         let rec = Value::Record(
             row.iter()
                 .enumerate()
-                .map(|(i, s)| (format!("f{i}"), s.to_value()))
+                .map(|(i, cell)| {
+                    let (_, nullable) = specs[i];
+                    let v = match cell {
+                        Some(s) if nullable => Value::Union(1, Box::new(s.to_value())),
+                        Some(s) => s.to_value(),
+                        None => Value::Union(0, Box::new(Value::Null)),
+                    };
+                    (format!("f{i}"), v)
+                })
                 .collect(),
         );
         body.extend_from_slice(&to_avro_datum(&schema, rec).expect("to_avro_datum"));
@@ -191,17 +208,28 @@ fn jit_decode(arrow_schema: &SchemaRef, body: &[u8], rows: usize) -> Result<Reco
     buffers_to_batch_owned(arrow_schema, sets, rows)
 }
 
-/// The differential assertion: encode, decode both ways, require equality.
-fn assert_jit_matches_reference(col_types: &[&str], rows: &[Vec<Scalar>]) {
-    let json = record_json(col_types);
-    let body = encode_rows(&json, rows);
+/// The differential assertion (general, nullable-aware): encode, decode both
+/// ways, require equality.
+fn assert_general(specs: &[ColSpec], rows: &[Vec<Option<Scalar>>]) {
+    let json = record_json(specs);
+    let body = encode_rows(&json, specs, rows);
     let (ref_batch, schema) = reference_decode(&json, &body, rows.len());
     let jit_batch = jit_decode(&schema, &body, rows.len())
-        .unwrap_or_else(|e| panic!("JIT decode failed for {col_types:?}: {e}"));
+        .unwrap_or_else(|e| panic!("JIT decode failed for {specs:?}: {e}"));
     assert_eq!(
         ref_batch, jit_batch,
-        "JIT batch diverged from reference for columns {col_types:?}"
+        "JIT batch diverged from reference for columns {specs:?}"
     );
+}
+
+/// Back-compat non-nullable helper: all columns required, all cells present.
+fn assert_jit_matches_reference(col_types: &[&str], rows: &[Vec<Scalar>]) {
+    let specs: Vec<ColSpec> = col_types.iter().map(|t| (*t, false)).collect();
+    let rows_opt: Vec<Vec<Option<Scalar>>> = rows
+        .iter()
+        .map(|r| r.iter().cloned().map(Some).collect())
+        .collect();
+    assert_general(&specs, &rows_opt);
 }
 
 // ===========================================================================
@@ -295,6 +323,33 @@ fn diff_multi_column_mixed() {
 fn diff_empty_batch() {
     // Zero rows must still produce equal (empty) batches with the right schema.
     assert_jit_matches_reference(&["int"], &[]);
+}
+
+#[test]
+fn diff_nullable_scalars_edges() {
+    // ["null", T] unions — the most common real Avro shape. Interleave present
+    // and null values so validity bitmaps span byte boundaries.
+    let specs: Vec<ColSpec> = vec![("long", true), ("string", true), ("boolean", true)];
+    let rows: Vec<Vec<Option<Scalar>>> = vec![
+        vec![Some(Scalar::Long(1)), None, Some(Scalar::Bool(true))],
+        vec![None, Some(Scalar::Str("x".into())), None],
+        vec![Some(Scalar::Long(-9)), Some(Scalar::Str("".into())), Some(Scalar::Bool(false))],
+        vec![None, None, None],
+        vec![Some(Scalar::Long(i64::MAX)), Some(Scalar::Str("ünï".into())), Some(Scalar::Bool(true))],
+    ];
+    assert_general(&specs, &rows);
+}
+
+#[test]
+fn diff_nullable_mixed_with_required() {
+    // Mix nullable and required columns in one record.
+    let specs: Vec<ColSpec> = vec![("int", false), ("double", true), ("bytes", true)];
+    let rows: Vec<Vec<Option<Scalar>>> = vec![
+        vec![Some(Scalar::Int(7)), Some(Scalar::Double(1.5)), None],
+        vec![Some(Scalar::Int(-1)), None, Some(Scalar::Bytes(vec![1, 2, 3]))],
+        vec![Some(Scalar::Int(0)), None, None],
+    ];
+    assert_general(&specs, &rows);
 }
 
 // ===========================================================================
@@ -409,6 +464,7 @@ proptest! {
     #[test]
     fn prop_differential_supported_scalars(
         types in prop::collection::vec(col_type_strategy(), 1..=5),
+        nullable_flags in prop::collection::vec(any::<bool>(), 1..=5),
         n_rows in 0usize..=48,
         seed in any::<u64>(),
     ) {
@@ -416,24 +472,32 @@ proptest! {
         // assert_eq! on the batches fail spuriously — skip NaN by construction
         // (the edge tests cover the bit-pattern paths deterministically).
         let mut state = seed ^ 0xD1B5_4A32_D192_ED03;
-        let rows: Vec<Vec<Scalar>> = (0..n_rows)
+        let specs: Vec<ColSpec> = types
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.avro(), *nullable_flags.get(i).unwrap_or(&false)))
+            .collect();
+        let rows: Vec<Vec<Option<Scalar>>> = (0..n_rows)
             .map(|_| {
-                types
+                specs
                     .iter()
-                    .map(|ct| {
+                    .zip(types.iter())
+                    .map(|((_, nullable), ct)| {
+                        // ~1 in 4 cells null for nullable columns.
+                        if *nullable && next_u64(&mut state) % 4 == 0 {
+                            return None;
+                        }
                         let mut s = gen_scalar(ct, &mut state);
-                        // Replace NaN with a finite value for stable equality.
                         match &mut s {
                             Scalar::Float(f) if f.is_nan() => *f = 0.0,
                             Scalar::Double(d) if d.is_nan() => *d = 0.0,
                             _ => {}
                         }
-                        s
+                        Some(s)
                     })
                     .collect()
             })
             .collect();
-        let col_types: Vec<&str> = types.iter().map(|c| c.avro()).collect();
-        assert_jit_matches_reference(&col_types, &rows);
+        assert_general(&specs, &rows);
     }
 }
