@@ -558,6 +558,43 @@ fn diff_fixed_empty_batch() {
 }
 
 #[test]
+fn diff_decimal128_fixed16() {
+    // SUPPORTED decimal path: `fixed(16)`-backed decimal — raw 16 big-endian
+    // bytes, no length prefix (what emit_decimal128_decode reads).
+    use apache_avro::Decimal;
+    let json = r#"{"type":"record","name":"R","fields":[
+        {"name":"d","type":{"type":"fixed","size":16,"name":"D16","logicalType":"decimal","precision":10,"scale":2}}]}"#;
+    let schema = ApacheSchema::parse_str(json).expect("apache parse");
+    let vals: Vec<i128> = vec![0, 1, -1, 12345, -98765, 9_999_999_999, -9_999_999_999];
+    let mut body = Vec::new();
+    for v in &vals {
+        // fixed(16): exactly 16 big-endian bytes (sign-extended i128).
+        let rec = Value::Record(vec![(
+            "d".into(),
+            Value::Decimal(Decimal::from(v.to_be_bytes().to_vec())),
+        )]);
+        body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode decimal"));
+    }
+    let (ref_batch, arrow_schema) = reference_decode(json, &body, vals.len());
+    let jit_batch = jit_decode(&arrow_schema, &body, vals.len())
+        .unwrap_or_else(|e| panic!("JIT decimal(fixed16) decode failed: {e}"));
+    assert_eq!(ref_batch, jit_batch, "Decimal128(10,2) fixed(16) JIT vs reference");
+}
+
+// GAP (documented, not yet supported — found by this oracle):
+// - `bytes`-backed decimal (length-prefixed minimal two's-complement, the more
+//   common Avro decimal encoding) is mis-decoded: emit_decimal128_decode reads a
+//   fixed 16 raw bytes with NO length prefix, so it misreads the varint length
+//   byte as data → bounds violation or silent corruption. boilstream's
+//   ArrowConverter maps all decimals → Decimal128, so a bytes-backed producer
+//   would corrupt. Needs JIT support for length-prefixed decimal bytes, or a
+//   loud rejection of bytes-backed decimals at ingestion.
+// - Avro `duration` (fixed-12: months/days/MILLIS) → Arrow Interval(MonthDayNano):
+//   emit_interval_decode expects 16 Arrow-native bytes (months/days/NANOS), not
+//   the 12-byte Avro layout — incompatible. (boilstream maps Avro fixed→
+//   FixedSizeBinary, so it does not hit this Interval path.)
+
+#[test]
 fn diff_multi_column_mixed() {
     let cols = vec![
         (Kind::Bool, false),
