@@ -1396,6 +1396,12 @@ impl<'a> Maker<'a> {
                     (Some("decimal"), c @ Codec::Binary) => {
                         let (prec, sc, _) = parse_decimal_attributes(&t.attributes, None, false)?;
                         *c = Codec::Decimal(prec, Some(sc), None);
+                        // Mark this as a bytes-backed (length-prefixed) decimal so
+                        // the JIT picks the variable-length decode path. fixed(N)
+                        // decimals leave this key absent (default = fixed).
+                        field
+                            .metadata
+                            .insert("avro.decimal.encoding".to_string(), "bytes".to_string());
                     }
                     (Some("date"), c @ Codec::Int32) => *c = Codec::Date32,
                     (Some("time-millis"), c @ Codec::Int32) => *c = Codec::TimeMillis,

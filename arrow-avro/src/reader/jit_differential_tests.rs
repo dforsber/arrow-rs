@@ -557,6 +557,101 @@ fn diff_fixed_empty_batch() {
     assert_diff(&[(Kind::Fixed(1), false)], &[]);
 }
 
+/// Minimal big-endian two's-complement encoding of an i128 (what real Avro
+/// `bytes`-backed decimal producers emit — variable length, sign-significant).
+fn i128_be_min(v: i128) -> Vec<u8> {
+    let full = v.to_be_bytes();
+    let mut start = 0usize;
+    if v >= 0 {
+        while start < 15 && full[start] == 0x00 && full[start + 1] & 0x80 == 0 {
+            start += 1;
+        }
+    } else {
+        while start < 15 && full[start] == 0xFF && full[start + 1] & 0x80 != 0 {
+            start += 1;
+        }
+    }
+    full[start..].to_vec()
+}
+
+#[test]
+fn diff_decimal128_bytes() {
+    // bytes-backed decimal: zigzag length + minimal two's-complement bytes.
+    // Sign-boundary values (127/128, 255/256, ...) force length transitions in
+    // the minimal encoding, exercising the JIT's variable-length sign-extension.
+    use apache_avro::Decimal;
+    let json = r#"{"type":"record","name":"R","fields":[
+        {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}}]}"#;
+    let schema = ApacheSchema::parse_str(json).expect("apache parse");
+    let vals: Vec<i128> = vec![
+        0, 1, -1, 127, 128, -128, -129, 255, 256, -256, 32767, -32768, 65535, -65536, 12_345_678,
+        -12_345_678, 999_999_999_999_999_999, -999_999_999_999_999_999,
+    ];
+    let mut body = Vec::new();
+    for v in &vals {
+        let rec = Value::Record(vec![(
+            "d".into(),
+            Value::Decimal(Decimal::from(i128_be_min(*v))),
+        )]);
+        body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode decimal"));
+    }
+    let (ref_batch, arrow_schema) = reference_decode(json, &body, vals.len());
+    let jit_batch = jit_decode(&arrow_schema, &body, vals.len())
+        .unwrap_or_else(|e| panic!("JIT bytes-decimal decode failed: {e}"));
+    assert_eq!(ref_batch, jit_batch, "bytes-backed Decimal128(18,4) JIT vs reference");
+}
+
+#[test]
+fn diff_decimal128_bytes_nullable() {
+    use apache_avro::Decimal;
+    let json = r#"{"type":"record","name":"R","fields":[
+        {"name":"d","type":["null",{"type":"bytes","logicalType":"decimal","precision":12,"scale":2}]}]}"#;
+    let schema = ApacheSchema::parse_str(json).expect("apache parse");
+    let vals: Vec<Option<i128>> = vec![Some(1), None, Some(-12345), None, None, Some(999_999_999)];
+    let mut body = Vec::new();
+    for v in &vals {
+        let cell = match v {
+            Some(x) => Value::Union(1, Box::new(Value::Decimal(Decimal::from(i128_be_min(*x))))),
+            None => Value::Union(0, Box::new(Value::Null)),
+        };
+        let rec = Value::Record(vec![("d".into(), cell)]);
+        body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode"));
+    }
+    let (ref_batch, arrow_schema) = reference_decode(json, &body, vals.len());
+    let jit_batch = jit_decode(&arrow_schema, &body, vals.len())
+        .unwrap_or_else(|e| panic!("JIT nullable bytes-decimal decode failed: {e}"));
+    assert_eq!(ref_batch, jit_batch, "nullable bytes-backed Decimal128 JIT vs reference");
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Random bytes-backed Decimal128 values (precision 38) — exercises every
+    /// minimal-encoding byte length and sign pattern against the reference.
+    #[test]
+    fn prop_decimal128_bytes(raw in prop::collection::vec(any::<i128>(), 1..=24)) {
+        use apache_avro::Decimal;
+        // Constrain to fit precision 38 (|v| < 10^38, which is < i128::MAX).
+        let limit = 10i128.pow(38);
+        let vals: Vec<i128> = raw.iter().map(|v| v % limit).collect();
+        let json = r#"{"type":"record","name":"R","fields":[
+            {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":38,"scale":0}}]}"#;
+        let schema = ApacheSchema::parse_str(json).expect("apache parse");
+        let mut body = Vec::new();
+        for v in &vals {
+            let rec = Value::Record(vec![(
+                "d".into(),
+                Value::Decimal(Decimal::from(i128_be_min(*v))),
+            )]);
+            body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode"));
+        }
+        let (ref_batch, arrow_schema) = reference_decode(json, &body, vals.len());
+        let jit_batch = jit_decode(&arrow_schema, &body, vals.len())
+            .map_err(|e| TestCaseError::fail(format!("jit decode: {e}")))?;
+        prop_assert_eq!(ref_batch, jit_batch);
+    }
+}
+
 #[test]
 fn diff_decimal128_fixed16() {
     // SUPPORTED decimal path: `fixed(16)`-backed decimal — raw 16 big-endian
