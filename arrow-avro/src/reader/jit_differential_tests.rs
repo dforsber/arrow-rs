@@ -851,6 +851,59 @@ fn struct_with_nonscalar_child_is_loudly_rejected() {
 }
 
 #[test]
+fn list_with_nonscalar_element_is_loudly_rejected() {
+    // emit_list_decode skips non-scalar elements → the JIT must refuse to compile
+    // List<decimal|fixed|nullable|...>. (List<temporal> is fine — date/time map
+    // to int/long ops, see diff_struct_with_temporal.)
+    let cases = [
+        r#"{"type":"record","name":"R","fields":[{"name":"l","type":{"type":"array","items":
+            {"type":"bytes","logicalType":"decimal","precision":18,"scale":4}}}]}"#,
+        r#"{"type":"record","name":"R","fields":[{"name":"l","type":{"type":"array","items":
+            {"type":"fixed","name":"F","size":8}}}]}"#,
+        r#"{"type":"record","name":"R","fields":[{"name":"l","type":{"type":"array","items":
+            ["null","long"]}}]}"#,
+    ];
+    for json in cases {
+        let avro_schema: AvroSchema = serde_json::from_str(json).expect("parse");
+        let field = AvroFieldBuilder::new(&avro_schema).build().expect("build");
+        let rd = RecordDecoder::try_new_with_options(field.data_type()).expect("rd");
+        let arrow_schema = rd.schema().clone();
+        assert!(
+            JitDecoder::compile(&arrow_schema).is_err(),
+            "list with non-scalar element must be rejected by the JIT: {json}"
+        );
+    }
+}
+
+#[test]
+fn diff_struct_with_temporal() {
+    // Temporal types map to int/long ops, so they DO decode correctly inside a
+    // struct (positive coverage for the guard's allowed set).
+    let json = r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
+        {"name":"a","type":"long"},
+        {"name":"d","type":{"type":"int","logicalType":"date"}},
+        {"name":"t","type":{"type":"long","logicalType":"timestamp-micros"}}]}}]}"#;
+    let schema = ApacheSchema::parse_str(json).expect("apache parse");
+    let rows: Vec<(i64, i32, i64)> = vec![(1, 19000, 1_700_000_000_000_000), (-5, 0, -1)];
+    let mut body = Vec::new();
+    for (a, d, t) in &rows {
+        let rec = Value::Record(vec![(
+            "s".into(),
+            Value::Record(vec![
+                ("a".into(), Value::Long(*a)),
+                ("d".into(), Value::Date(*d)),
+                ("t".into(), Value::TimestampMicros(*t)),
+            ]),
+        )]);
+        body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode"));
+    }
+    let (ref_batch, arrow_schema) = reference_decode(json, &body, rows.len());
+    let jit_batch = jit_decode(&arrow_schema, &body, rows.len())
+        .unwrap_or_else(|e| panic!("Struct<long,date,timestamp> decode failed: {e}"));
+    assert_eq!(ref_batch, jit_batch, "Struct with temporal children JIT vs reference");
+}
+
+#[test]
 fn diff_multi_column_mixed() {
     let cols = vec![
         (Kind::Bool, false),

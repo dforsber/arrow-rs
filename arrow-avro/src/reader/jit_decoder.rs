@@ -594,8 +594,27 @@ impl JitDecoder {
             DataType::Dictionary(_, _) => Ok(FieldOp::Enum { nullable }),
             // List types - decode element type recursively
             DataType::List(element_field) | DataType::LargeList(element_field) => {
-                let element_op = Box::new(Self::field_to_op(element_field.as_ref())?);
-                Ok(FieldOp::List { element: element_op, nullable })
+                let element_op = Self::field_to_op(element_field.as_ref())?;
+                // SAFETY: emit_list_decode only decodes non-nullable scalar
+                // elements {bool,int,long,float,double}; other elements are
+                // silently skipped (corruption). Refuse to compile such lists.
+                let supported = matches!(
+                    element_op,
+                    FieldOp::Boolean { nullable: false }
+                        | FieldOp::Int32 { nullable: false }
+                        | FieldOp::Int64 { nullable: false }
+                        | FieldOp::Float32 { nullable: false }
+                        | FieldOp::Float64 { nullable: false }
+                );
+                if !supported {
+                    return Err(
+                        "JIT list decode supports only non-nullable scalar elements \
+                         (bool/int/long/float/double); rejecting list with an \
+                         unsupported element to avoid silent corruption"
+                            .to_string(),
+                    );
+                }
+                Ok(FieldOp::List { element: Box::new(element_op), nullable })
             }
             // Map type - keys are always strings in Avro, values are recursive
             DataType::Map(entries_field, _) => {
