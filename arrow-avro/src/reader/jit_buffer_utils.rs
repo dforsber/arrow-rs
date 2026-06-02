@@ -13,9 +13,9 @@
 //! ```
 
 use arrow_array::{
-    types::{IntervalDayTime, IntervalMonthDayNano},
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, ListArray,
-    StructArray,
+    types::{Int32Type, IntervalDayTime, IntervalMonthDayNano},
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, DictionaryArray,
+    ListArray, StructArray,
     Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray,
     DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, IntervalDayTimeArray,
@@ -233,6 +233,27 @@ impl PooledBufferSet {
 ///
 /// # Returns
 /// Arrow ArrayRef wrapping the buffer data (zero-copy)
+/// Build an Arrow `Dictionary(Int32, Utf8)` enum array from the JIT's decoded
+/// i32 index buffer and the `avro.enum.symbols` field metadata (the dictionary
+/// values). Avro `enum` is decoded by the JIT as an int index (`FieldOp::Enum`).
+fn build_enum_dictionary(
+    field: &Field,
+    keys: ScalarBuffer<i32>,
+    nulls: Option<NullBuffer>,
+) -> Result<ArrayRef, ArrowError> {
+    let symbols_json = field.metadata().get("avro.enum.symbols").ok_or_else(|| {
+        ArrowError::InvalidArgumentError(
+            "enum Dictionary requires avro.enum.symbols field metadata".into(),
+        )
+    })?;
+    let symbols: Vec<String> = serde_json::from_str(symbols_json).map_err(|e| {
+        ArrowError::InvalidArgumentError(format!("invalid avro.enum.symbols metadata: {e}"))
+    })?;
+    let values = Arc::new(StringArray::from(symbols)) as ArrayRef;
+    let keys = Int32Array::new(keys, nulls);
+    Ok(Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values)?))
+}
+
 pub fn pooled_buffer_to_array(
     field: &Field,
     buffer_set: PooledBufferSet,
@@ -556,6 +577,16 @@ pub fn pooled_buffer_to_array(
         }
 
         // Unsupported types
+        // Avro enum → Dictionary(Int32, Utf8): JIT decodes the i32 index; values
+        // come from the avro.enum.symbols field metadata.
+        DataType::Dictionary(k, v)
+            if matches!(k.as_ref(), DataType::Int32) && matches!(v.as_ref(), DataType::Utf8) =>
+        {
+            let keys = ScalarBuffer::<i32>::from(Buffer::from(buffer_set.primary.freeze()));
+            let nulls = PooledBufferSet::into_null_buffer(validity, row_count);
+            build_enum_dictionary(field, keys, nulls)
+        }
+
         _ => Err(ArrowError::NotYetImplemented(format!(
             "pooled_buffer_to_array does not yet support {:?}",
             data_type
@@ -893,6 +924,15 @@ pub fn buffer_to_array(
         }
 
         // Unsupported types
+        // Avro enum → Dictionary(Int32, Utf8): JIT decodes the i32 index; values
+        // come from the avro.enum.symbols field metadata.
+        DataType::Dictionary(k, v)
+            if matches!(k.as_ref(), DataType::Int32) && matches!(v.as_ref(), DataType::Utf8) =>
+        {
+            let keys = ScalarBuffer::<i32>::from(Buffer::from(buffer_set.primary.clone()));
+            build_enum_dictionary(field, keys, null_buffer)
+        }
+
         _ => Err(ArrowError::NotYetImplemented(format!(
             "buffer_to_array does not yet support {:?}",
             data_type
@@ -1231,6 +1271,16 @@ pub fn buffer_to_array_owned(
         }
 
         // Unsupported types
+        // Avro enum → Dictionary(Int32, Utf8): JIT decodes the i32 index; values
+        // come from the avro.enum.symbols field metadata.
+        DataType::Dictionary(k, v)
+            if matches!(k.as_ref(), DataType::Int32) && matches!(v.as_ref(), DataType::Utf8) =>
+        {
+            let keys = ScalarBuffer::<i32>::from(Buffer::from_vec(buffer_set.primary));
+            let nulls = BufferSet::into_null_buffer(validity, row_count);
+            build_enum_dictionary(field, keys, nulls)
+        }
+
         _ => Err(ArrowError::NotYetImplemented(format!(
             "buffer_to_array_owned does not yet support {:?}",
             data_type

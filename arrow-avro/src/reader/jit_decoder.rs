@@ -1186,8 +1186,8 @@ impl JitDecoder {
                 }
             }
             FieldOp::Enum { nullable } => {
-                // Enum is stored as a varint index (NOT zigzag encoded)
-                // We read it as zigzag and decode, same as other ints
+                // Avro enum is encoded as an `int` (zero-based symbol index),
+                // i.e. a zigzag varint — so decode it like any other int.
                 if *nullable {
                     let (tag, tag_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
                     builder.def_var(cursor_var, tag_cursor);
@@ -1208,8 +1208,9 @@ impl JitDecoder {
 
                     // Value block: decode enum and set validity bit
                     builder.switch_to_block(value_block);
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
-                    // Enum indices are stored directly (no zigzag)
+                    let (raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
+                    // Avro enum index is an `int` = zigzag varint (like any int).
+                    let value = Self::emit_zigzag_decode_i64(builder, raw);
                     let value_i32 = builder.ins().ireduce(types::I32, value);
                     builder.ins().store(MemFlags::trusted(), value_i32, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
@@ -1229,8 +1230,9 @@ impl JitDecoder {
                     let new_output_pos = builder.ins().iadd(output_pos, four);
                     builder.def_var(output_vars[buf_idx], new_output_pos);
                 } else {
-                    let (value, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
-                    // Enum indices are stored directly (no zigzag)
+                    let (raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
+                    // Avro enum index is an `int` = zigzag varint (like any int).
+                    let value = Self::emit_zigzag_decode_i64(builder, raw);
                     let value_i32 = builder.ins().ireduce(types::I32, value);
                     builder.ins().store(MemFlags::trusted(), value_i32, output_write_ptr, 0);
                     builder.def_var(cursor_var, new_cursor);
@@ -4200,8 +4202,11 @@ mod tests {
 
     /// Encode enum index as varint (not zigzag - just raw varint)
     fn encode_enum_index(index: u32) -> Vec<u8> {
+        // Avro enum index is an `int` = zigzag varint (matches apache_avro).
+        // For a non-negative index this is simply index * 2.
+        let zz = ((index as i64) << 1) ^ ((index as i64) >> 63);
         let mut result = Vec::new();
-        let mut v = index as u64;
+        let mut v = zz as u64;
         loop {
             if v < 0x80 {
                 result.push(v as u8);

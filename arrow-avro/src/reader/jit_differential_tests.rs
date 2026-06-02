@@ -74,6 +74,8 @@ enum Scalar {
     /// Raw two's-complement big-endian bytes passed to `Decimal::from` (the
     /// encoding — bytes-minimal or fixed-N — is decided by the generator).
     Decimal(Vec<u8>),
+    /// Avro enum symbol index (symbol name is "E{idx}" by convention here).
+    Enum(u32),
 }
 
 impl Scalar {
@@ -93,6 +95,7 @@ impl Scalar {
             Scalar::TsMicros(v) => Value::TimestampMicros(*v),
             Scalar::Fixed(v) => Value::Fixed(v.len(), v.clone()),
             Scalar::Decimal(v) => Value::Decimal(apache_avro::Decimal::from(v.clone())),
+            Scalar::Enum(idx) => Value::Enum(*idx, format!("E{idx}")),
         }
     }
 }
@@ -119,6 +122,8 @@ enum Kind {
     /// `fixed_size`: `None` = bytes-backed (length-prefixed), `Some(n)` =
     /// fixed(n)-backed (the JIT fixed path reads 16/32, so use 16/32).
     Decimal { precision: usize, scale: usize, fixed_size: Option<usize> },
+    /// Avro enum → Arrow Dictionary(Int32, Utf8). `n` symbols named E0..E{n-1}.
+    Enum { symbols: usize },
 }
 
 impl Kind {
@@ -147,6 +152,13 @@ impl Kind {
                     r#"{{"type":"fixed","name":"Dec_f{i}","size":{n},"logicalType":"decimal","precision":{precision},"scale":{scale}}}"#
                 ),
             },
+            Kind::Enum { symbols } => {
+                let syms: Vec<String> = (0..*symbols).map(|k| format!("\"E{k}\"")).collect();
+                format!(
+                    r#"{{"type":"enum","name":"Enum_f{i}","symbols":[{}]}}"#,
+                    syms.join(",")
+                )
+            }
         }
     }
 
@@ -204,6 +216,7 @@ impl Kind {
                 };
                 Scalar::Decimal(bytes)
             }
+            Kind::Enum { symbols } => Scalar::Enum((next_u64(state) % *symbols as u64) as u32),
         }
     }
 }
@@ -787,6 +800,28 @@ fn diff_decimal128_fixed16() {
 //   FixedSizeBinary, so it does not hit this Interval path.)
 
 #[test]
+fn diff_enum() {
+    // Avro enum (zigzag int index on the wire) → Arrow Dictionary(Int32, Utf8).
+    let json = r#"{"type":"record","name":"R","fields":[
+        {"name":"c","type":{"type":"enum","name":"Color","symbols":["RED","GREEN","BLUE"]}}]}"#;
+    let schema = ApacheSchema::parse_str(json).expect("apache parse");
+    let symbols = ["RED", "GREEN", "BLUE"];
+    let idxs: Vec<u32> = vec![0, 1, 2, 2, 0, 1, 0, 2, 1];
+    let mut body = Vec::new();
+    for i in &idxs {
+        let rec = Value::Record(vec![(
+            "c".into(),
+            Value::Enum(*i, symbols[*i as usize].to_string()),
+        )]);
+        body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode enum"));
+    }
+    let (ref_batch, arrow_schema) = reference_decode(json, &body, idxs.len());
+    let jit_batch = jit_decode(&arrow_schema, &body, idxs.len())
+        .unwrap_or_else(|e| panic!("JIT enum decode failed: {e}"));
+    assert_eq!(ref_batch, jit_batch, "enum → Dictionary(Int32,Utf8) JIT vs reference");
+}
+
+#[test]
 fn diff_multi_column_mixed() {
     let cols = vec![
         (Kind::Bool, false),
@@ -893,6 +928,8 @@ fn kind_strategy() -> impl Strategy<Value = Kind> {
         Just(Kind::Decimal { precision: 76, scale: 0, fixed_size: None }),
         Just(Kind::Decimal { precision: 38, scale: 0, fixed_size: Some(16) }),
         Just(Kind::Decimal { precision: 76, scale: 0, fixed_size: Some(32) }),
+        // Avro enum → Dictionary(Int32, Utf8).
+        (1usize..=6).prop_map(|symbols| Kind::Enum { symbols }),
     ]
 }
 
