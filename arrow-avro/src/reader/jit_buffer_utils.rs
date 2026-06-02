@@ -222,17 +222,6 @@ impl PooledBufferSet {
     }
 }
 
-/// Convert a single column's pooled buffers to an Arrow ArrayRef (zero-copy, consumes PooledBufferSet)
-///
-/// This version uses BytesMut.freeze() for zero-copy conversion to Arrow buffers.
-///
-/// # Arguments
-/// * `field` - Arrow field describing the column type
-/// * `buffer_set` - The decoded buffer data (consumed)
-/// * `row_count` - Number of rows decoded
-///
-/// # Returns
-/// Arrow ArrayRef wrapping the buffer data (zero-copy)
 /// Build an Arrow `Dictionary(Int32, Utf8)` enum array from the JIT's decoded
 /// i32 index buffer and the `avro.enum.symbols` field metadata (the dictionary
 /// values). Avro `enum` is decoded by the JIT as an int index (`FieldOp::Enum`).
@@ -254,6 +243,17 @@ fn build_enum_dictionary(
     Ok(Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values)?))
 }
 
+/// Convert a single column's pooled buffers to an Arrow ArrayRef (zero-copy, consumes PooledBufferSet)
+///
+/// This version uses BytesMut.freeze() for zero-copy conversion to Arrow buffers.
+///
+/// # Arguments
+/// * `field` - Arrow field describing the column type
+/// * `buffer_set` - The decoded buffer data (consumed)
+/// * `row_count` - Number of rows decoded
+///
+/// # Returns
+/// Arrow ArrayRef wrapping the buffer data (zero-copy)
 pub fn pooled_buffer_to_array(
     field: &Field,
     buffer_set: PooledBufferSet,

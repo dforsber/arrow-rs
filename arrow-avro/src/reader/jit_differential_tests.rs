@@ -76,6 +76,10 @@ enum Scalar {
     Decimal(Vec<u8>),
     /// Avro enum symbol index (symbol name is "E{idx}" by convention here).
     Enum(u32),
+    /// List element values (recursive).
+    List(Vec<Scalar>),
+    /// Struct child values (recursive); fields are "c0".."cN" by convention.
+    Struct(Vec<Scalar>),
 }
 
 impl Scalar {
@@ -96,6 +100,14 @@ impl Scalar {
             Scalar::Fixed(v) => Value::Fixed(v.len(), v.clone()),
             Scalar::Decimal(v) => Value::Decimal(apache_avro::Decimal::from(v.clone())),
             Scalar::Enum(idx) => Value::Enum(*idx, format!("E{idx}")),
+            Scalar::List(elems) => Value::Array(elems.iter().map(Scalar::to_value).collect()),
+            Scalar::Struct(children) => Value::Record(
+                children
+                    .iter()
+                    .enumerate()
+                    .map(|(j, c)| (format!("c{j}"), c.to_value()))
+                    .collect(),
+            ),
         }
     }
 }
@@ -124,12 +136,23 @@ enum Kind {
     Decimal { precision: usize, scale: usize, fixed_size: Option<usize> },
     /// Avro enum → Arrow Dictionary(Int32, Utf8). `n` symbols named E0..E{n-1}.
     Enum { symbols: usize },
+    /// Avro array → Arrow List. Element kind is recursive.
+    List(Box<Kind>),
+    /// Avro record → Arrow Struct. Child kinds are recursive; fields "c0".."cN".
+    Struct(Vec<Kind>),
 }
 
 impl Kind {
-    /// The complete Avro type-JSON fragment for field index `i`. `fixed`
-    /// requires a unique name per field.
-    fn type_json(&self, i: usize) -> String {
+    /// True for nested (List/Struct) kinds.
+    fn is_nested(&self) -> bool {
+        matches!(self, Kind::List(_) | Kind::Struct(_))
+    }
+}
+
+impl Kind {
+    /// The complete Avro type-JSON fragment. `name` is a schema-unique path used
+    /// to name Avro named types (record/enum/fixed) so nested ones don't collide.
+    fn type_json(&self, name: &str) -> String {
         match self {
             Kind::Bool => "\"boolean\"".into(),
             Kind::Int => "\"int\"".into(),
@@ -143,21 +166,34 @@ impl Kind {
             Kind::TimeMicros => r#"{"type":"long","logicalType":"time-micros"}"#.into(),
             Kind::TsMillis => r#"{"type":"long","logicalType":"timestamp-millis"}"#.into(),
             Kind::TsMicros => r#"{"type":"long","logicalType":"timestamp-micros"}"#.into(),
-            Kind::Fixed(n) => format!(r#"{{"type":"fixed","name":"Fixed_f{i}","size":{n}}}"#),
+            Kind::Fixed(n) => format!(r#"{{"type":"fixed","name":"Fx_{name}","size":{n}}}"#),
             Kind::Decimal { precision, scale, fixed_size } => match fixed_size {
                 None => format!(
                     r#"{{"type":"bytes","logicalType":"decimal","precision":{precision},"scale":{scale}}}"#
                 ),
                 Some(n) => format!(
-                    r#"{{"type":"fixed","name":"Dec_f{i}","size":{n},"logicalType":"decimal","precision":{precision},"scale":{scale}}}"#
+                    r#"{{"type":"fixed","name":"Dec_{name}","size":{n},"logicalType":"decimal","precision":{precision},"scale":{scale}}}"#
                 ),
             },
             Kind::Enum { symbols } => {
                 let syms: Vec<String> = (0..*symbols).map(|k| format!("\"E{k}\"")).collect();
                 format!(
-                    r#"{{"type":"enum","name":"Enum_f{i}","symbols":[{}]}}"#,
+                    r#"{{"type":"enum","name":"En_{name}","symbols":[{}]}}"#,
                     syms.join(",")
                 )
+            }
+            Kind::List(elem) => {
+                format!(r#"{{"type":"array","items":{}}}"#, elem.type_json(&format!("{name}I")))
+            }
+            Kind::Struct(children) => {
+                let fields: Vec<String> = children
+                    .iter()
+                    .enumerate()
+                    .map(|(j, c)| {
+                        format!(r#"{{"name":"c{j}","type":{}}}"#, c.type_json(&format!("{name}c{j}")))
+                    })
+                    .collect();
+                format!(r#"{{"type":"record","name":"Rec_{name}","fields":[{}]}}"#, fields.join(","))
             }
         }
     }
@@ -217,6 +253,13 @@ impl Kind {
                 Scalar::Decimal(bytes)
             }
             Kind::Enum { symbols } => Scalar::Enum((next_u64(state) % *symbols as u64) as u32),
+            Kind::List(elem) => {
+                let len = (next_u64(state) % 5) as usize;
+                Scalar::List((0..len).map(|_| elem.gen_value(state)).collect())
+            }
+            Kind::Struct(children) => {
+                Scalar::Struct(children.iter().map(|c| c.gen_value(state)).collect())
+            }
         }
     }
 }
@@ -232,7 +275,7 @@ fn record_json(cols: &[Col]) -> String {
         if i > 0 {
             fields.push(',');
         }
-        let frag = kind.type_json(i);
+        let frag = kind.type_json(&format!("f{i}"));
         if *nullable {
             fields.push_str(&format!(r#"{{"name":"f{i}","type":["null",{frag}]}}"#));
         } else {
@@ -1057,29 +1100,62 @@ fn gate_map_is_loudly_rejected() {
 // exactly. proptest shrinks structure (drop columns/rows) to a minimal repro.
 // ===========================================================================
 
-fn kind_strategy() -> impl Strategy<Value = Kind> {
+/// Leaves valid as Struct/List children — the JIT supports scalar/temporal/
+/// decimal/enum children, NOT string/bytes/fixed/nested.
+fn child_kind_strategy() -> impl Strategy<Value = Kind> {
     prop_oneof![
         Just(Kind::Bool),
         Just(Kind::Int),
         Just(Kind::Long),
         Just(Kind::Float),
         Just(Kind::Double),
-        Just(Kind::Str),
-        Just(Kind::Bytes),
         Just(Kind::Date),
         Just(Kind::TimeMillis),
         Just(Kind::TimeMicros),
         Just(Kind::TsMillis),
         Just(Kind::TsMicros),
-        (1usize..=20).prop_map(Kind::Fixed),
-        // Decimal: bytes-backed + fixed-backed, Decimal128 (p38) + Decimal256 (p76).
         Just(Kind::Decimal { precision: 38, scale: 0, fixed_size: None }),
         Just(Kind::Decimal { precision: 76, scale: 0, fixed_size: None }),
         Just(Kind::Decimal { precision: 38, scale: 0, fixed_size: Some(16) }),
         Just(Kind::Decimal { precision: 76, scale: 0, fixed_size: Some(32) }),
-        // Avro enum → Dictionary(Int32, Utf8).
         (1usize..=6).prop_map(|symbols| Kind::Enum { symbols }),
     ]
+}
+
+/// All top-level (leaf) kinds, including those only valid at top level.
+fn leaf_kind_strategy() -> impl Strategy<Value = Kind> {
+    prop_oneof![
+        child_kind_strategy(),
+        Just(Kind::Str),
+        Just(Kind::Bytes),
+        (1usize..=20).prop_map(Kind::Fixed),
+    ]
+}
+
+/// Top-level column kinds: leaves + List<child> + Struct<children> (one nesting
+/// level — the JIT does not support nested-in-nested). Leaves weighted higher.
+fn kind_strategy() -> impl Strategy<Value = Kind> {
+    prop_oneof![
+        4 => leaf_kind_strategy(),
+        1 => child_kind_strategy().prop_map(|c| Kind::List(Box::new(c))),
+        1 => prop::collection::vec(child_kind_strategy(), 1..=4).prop_map(Kind::Struct),
+    ]
+}
+
+/// ANY kind up to `depth` nesting, including shapes the JIT does NOT support
+/// (e.g. List<string>, Struct<fixed>, List<List<…>>, Struct<Struct<…>>). Used by
+/// the no-silent-corruption proptest, which requires such shapes to loud-reject.
+fn any_kind(depth: u32) -> BoxedStrategy<Kind> {
+    if depth == 0 {
+        leaf_kind_strategy().boxed()
+    } else {
+        prop_oneof![
+            3 => leaf_kind_strategy(),
+            1 => any_kind(depth - 1).prop_map(|c| Kind::List(Box::new(c))),
+            1 => prop::collection::vec(any_kind(depth - 1), 1..=3).prop_map(Kind::Struct),
+        ]
+        .boxed()
+    }
 }
 
 /// SplitMix64 — reproducible from the proptest-chosen seed, no rand-version dep.
@@ -1105,7 +1181,12 @@ proptest! {
         let cols: Vec<Col> = kinds
             .iter()
             .enumerate()
-            .map(|(i, k)| (k.clone(), *nullable_flags.get(i).unwrap_or(&false)))
+            .map(|(i, k)| {
+                // Nested columns stay non-nullable (nullable-nested is a separate,
+                // not-yet-supported shape); leaves get random nullability.
+                let nullable = !k.is_nested() && *nullable_flags.get(i).unwrap_or(&false);
+                (k.clone(), nullable)
+            })
             .collect();
         let rows: Vec<Vec<Option<Scalar>>> = (0..n_rows)
             .map(|_| {
@@ -1122,5 +1203,57 @@ proptest! {
             })
             .collect();
         assert_diff(&cols, &rows);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(512))]
+
+    /// No-silent-corruption invariant over the FULL type space (including shapes
+    /// the JIT doesn't support: List<string>, Struct<fixed>, nested-in-nested,
+    /// etc.). The JIT must either match the reference (supported) or loudly error
+    /// (unsupported) — it must NEVER decode silently-wrong. This is the net that
+    /// catches any future gap automatically.
+    #[test]
+    fn prop_no_silent_corruption(
+        kinds in prop::collection::vec(any_kind(2), 1..=4),
+        nullable_flags in prop::collection::vec(any::<bool>(), 1..=4),
+        n_rows in 0usize..=24,
+        seed in any::<u64>(),
+    ) {
+        let mut state = seed ^ 0x5151_5151_5151_5151;
+        let cols: Vec<Col> = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let nullable = !k.is_nested() && *nullable_flags.get(i).unwrap_or(&false);
+                (k.clone(), nullable)
+            })
+            .collect();
+        let rows: Vec<Vec<Option<Scalar>>> = (0..n_rows)
+            .map(|_| {
+                cols.iter()
+                    .map(|(kind, nullable)| {
+                        if *nullable && next_u64(&mut state) % 4 == 0 {
+                            None
+                        } else {
+                            Some(kind.gen_value(&mut state))
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let json = record_json(&cols);
+        let body = encode_rows(&json, &cols, &rows);
+        let (ref_batch, schema) = reference_decode(&json, &body, rows.len());
+        // Ok ⇒ must equal the reference; Err ⇒ loud reject (acceptable). The one
+        // thing that must NEVER happen: Ok with values != reference.
+        if let Ok(jit) = jit_decode(&schema, &body, rows.len()) {
+            prop_assert_eq!(
+                ref_batch, jit,
+                "JIT produced a batch that diverges from the reference (silent corruption)"
+            );
+        }
     }
 }
