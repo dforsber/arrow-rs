@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc b3b25a91ace9ca2b21ec49d0f4314b414ac51564d12b65174ba241e4ada313ec # shrinks to kinds = [Fixed(1)], nullable_flags = [false], n_rows = 0, seed = 0
+cc f30c0eb02d716350d3205c1b15047c972a36899dd626a5b9c454c01099d33fca # shrinks to kinds = [Enum { symbols: 2 }], nullable_flags = [false], n_rows = 3, seed = 9090696705145802
