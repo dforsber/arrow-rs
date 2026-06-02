@@ -562,11 +562,33 @@ impl JitDecoder {
             DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => Ok(FieldOp::Bytes { nullable }),
             DataType::FixedSizeBinary(size) => Ok(FieldOp::Fixed { size: *size as usize, nullable }),
             DataType::Struct(fields) => {
-                let child_ops: Result<Vec<FieldOp>, String> = fields
+                let child_ops: Vec<FieldOp> = fields
                     .iter()
                     .map(|f| Self::field_to_op(f.as_ref()))
-                    .collect();
-                Ok(FieldOp::Struct { fields: child_ops?, nullable })
+                    .collect::<Result<Vec<_>, _>>()?;
+                // SAFETY: emit_struct_decode only decodes non-nullable scalar
+                // children {bool,int,long,float,double}. Any other child is
+                // silently skipped (no wire read → desync → corruption). Refuse
+                // to compile such a struct so the caller loud-rejects instead.
+                for op in &child_ops {
+                    let supported = matches!(
+                        op,
+                        FieldOp::Boolean { nullable: false }
+                            | FieldOp::Int32 { nullable: false }
+                            | FieldOp::Int64 { nullable: false }
+                            | FieldOp::Float32 { nullable: false }
+                            | FieldOp::Float64 { nullable: false }
+                    );
+                    if !supported {
+                        return Err(
+                            "JIT struct decode supports only non-nullable scalar children \
+                             (bool/int/long/float/double); rejecting struct with an \
+                             unsupported child to avoid silent corruption"
+                                .to_string(),
+                        );
+                    }
+                }
+                Ok(FieldOp::Struct { fields: child_ops, nullable })
             }
             // Dictionary/Enum - store indices as i32
             DataType::Dictionary(_, _) => Ok(FieldOp::Enum { nullable }),

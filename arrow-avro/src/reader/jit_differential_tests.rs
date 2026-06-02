@@ -822,6 +822,35 @@ fn diff_enum() {
 }
 
 #[test]
+fn struct_with_nonscalar_child_is_loudly_rejected() {
+    // emit_struct_decode only handles non-nullable {bool,i32,i64,f32,f64}
+    // children; decimal/enum/temporal/fixed/nullable children would be silently
+    // skipped → corruption. The JIT must now REFUSE to compile such structs.
+    let cases = [
+        // Struct<long, decimal>
+        r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
+            {"name":"a","type":"long"},
+            {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}}]}}]}"#,
+        // Struct<enum>
+        r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
+            {"name":"c","type":{"type":"enum","name":"E","symbols":["A","B"]}}]}}]}"#,
+        // Struct<nullable long>
+        r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
+            {"name":"a","type":["null","long"]}]}}]}"#,
+    ];
+    for json in cases {
+        let avro_schema: AvroSchema = serde_json::from_str(json).expect("parse");
+        let field = AvroFieldBuilder::new(&avro_schema).build().expect("build");
+        let rd = RecordDecoder::try_new_with_options(field.data_type()).expect("rd");
+        let arrow_schema = rd.schema().clone();
+        assert!(
+            JitDecoder::compile(&arrow_schema).is_err(),
+            "struct with non-scalar child must be rejected by the JIT: {json}"
+        );
+    }
+}
+
+#[test]
 fn diff_multi_column_mixed() {
     let cols = vec![
         (Kind::Bool, false),
