@@ -71,6 +71,9 @@ enum Scalar {
     TsMillis(i64),
     TsMicros(i64),
     Fixed(Vec<u8>),
+    /// Raw two's-complement big-endian bytes passed to `Decimal::from` (the
+    /// encoding — bytes-minimal or fixed-N — is decided by the generator).
+    Decimal(Vec<u8>),
 }
 
 impl Scalar {
@@ -89,6 +92,7 @@ impl Scalar {
             Scalar::TsMillis(v) => Value::TimestampMillis(*v),
             Scalar::TsMicros(v) => Value::TimestampMicros(*v),
             Scalar::Fixed(v) => Value::Fixed(v.len(), v.clone()),
+            Scalar::Decimal(v) => Value::Decimal(apache_avro::Decimal::from(v.clone())),
         }
     }
 }
@@ -111,6 +115,10 @@ enum Kind {
     TsMicros,
     /// Avro `fixed` of the given size → Arrow FixedSizeBinary.
     Fixed(usize),
+    /// Avro decimal → Arrow Decimal128 (precision ≤38) / Decimal256 (>38).
+    /// `fixed_size`: `None` = bytes-backed (length-prefixed), `Some(n)` =
+    /// fixed(n)-backed (the JIT fixed path reads 16/32, so use 16/32).
+    Decimal { precision: usize, scale: usize, fixed_size: Option<usize> },
 }
 
 impl Kind {
@@ -131,6 +139,14 @@ impl Kind {
             Kind::TsMillis => r#"{"type":"long","logicalType":"timestamp-millis"}"#.into(),
             Kind::TsMicros => r#"{"type":"long","logicalType":"timestamp-micros"}"#.into(),
             Kind::Fixed(n) => format!(r#"{{"type":"fixed","name":"Fixed_f{i}","size":{n}}}"#),
+            Kind::Decimal { precision, scale, fixed_size } => match fixed_size {
+                None => format!(
+                    r#"{{"type":"bytes","logicalType":"decimal","precision":{precision},"scale":{scale}}}"#
+                ),
+                Some(n) => format!(
+                    r#"{{"type":"fixed","name":"Dec_f{i}","size":{n},"logicalType":"decimal","precision":{precision},"scale":{scale}}}"#
+                ),
+            },
         }
     }
 
@@ -168,6 +184,26 @@ impl Kind {
             Kind::TsMillis => Scalar::TsMillis(r as i64),
             Kind::TsMicros => Scalar::TsMicros(r as i64),
             Kind::Fixed(n) => Scalar::Fixed((0..*n).map(|_| next_u64(state) as u8).collect()),
+            Kind::Decimal { precision, fixed_size, .. } => {
+                // Random i128 within precision (capped at 38 digits → fits i128;
+                // true >i128 Decimal256 values are covered by prop_decimal256_bytes).
+                let hi = next_u64(state) as u128;
+                let lo = next_u64(state) as u128;
+                let raw = ((hi << 64) | lo) as i128;
+                let digits = (*precision).min(38) as u32;
+                let v = raw % 10i128.pow(digits);
+                let bytes = match fixed_size {
+                    None => i128_be_min(v),
+                    Some(n) => {
+                        // sign-extend the 16-byte i128 rep to n bytes (16 or 32).
+                        let fill = if v < 0 { 0xFFu8 } else { 0x00u8 };
+                        let mut b = vec![fill; n.saturating_sub(16)];
+                        b.extend_from_slice(&v.to_be_bytes());
+                        b
+                    }
+                };
+                Scalar::Decimal(bytes)
+            }
         }
     }
 }
@@ -684,6 +720,35 @@ proptest! {
     }
 }
 
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Random bytes-backed Decimal256 (precision 76), including true >16-byte
+    /// (i256-range) values — exercises the full 32-byte sign-extension path.
+    /// Byte length ≤30 keeps the magnitude (≈2^239) within precision 76.
+    #[test]
+    fn prop_decimal256_bytes(
+        rows in prop::collection::vec(prop::collection::vec(any::<u8>(), 1..=30), 1..=16)
+    ) {
+        use apache_avro::Decimal;
+        let json = r#"{"type":"record","name":"R","fields":[
+            {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":76,"scale":0}}]}"#;
+        let schema = ApacheSchema::parse_str(json).expect("apache parse");
+        let mut body = Vec::new();
+        for bytes in &rows {
+            let rec = Value::Record(vec![(
+                "d".into(),
+                Value::Decimal(Decimal::from(bytes.clone())),
+            )]);
+            body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode"));
+        }
+        let (ref_batch, arrow_schema) = reference_decode(json, &body, rows.len());
+        let jit_batch = jit_decode(&arrow_schema, &body, rows.len())
+            .map_err(|e| TestCaseError::fail(format!("jit decode: {e}")))?;
+        prop_assert_eq!(ref_batch, jit_batch);
+    }
+}
+
 #[test]
 fn diff_decimal128_fixed16() {
     // SUPPORTED decimal path: `fixed(16)`-backed decimal — raw 16 big-endian
@@ -823,6 +888,11 @@ fn kind_strategy() -> impl Strategy<Value = Kind> {
         Just(Kind::TsMillis),
         Just(Kind::TsMicros),
         (1usize..=20).prop_map(Kind::Fixed),
+        // Decimal: bytes-backed + fixed-backed, Decimal128 (p38) + Decimal256 (p76).
+        Just(Kind::Decimal { precision: 38, scale: 0, fixed_size: None }),
+        Just(Kind::Decimal { precision: 76, scale: 0, fixed_size: None }),
+        Just(Kind::Decimal { precision: 38, scale: 0, fixed_size: Some(16) }),
+        Just(Kind::Decimal { precision: 76, scale: 0, fixed_size: Some(32) }),
     ]
 }
 
