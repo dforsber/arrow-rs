@@ -29,7 +29,7 @@
 //! Run with: cargo bench --features jit --bench jit_vs_apache_benchmark
 
 use apache_avro::types::Value;
-use apache_avro::{to_avro_datum, Schema as ApacheSchema, Writer};
+use apache_avro::{to_avro_datum, Decimal, Schema as ApacheSchema, Writer};
 use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_avro::reader::ReaderBuilder;
 use arrow_schema::{DataType, Field, Fields, Schema, UnionFields, UnionMode};
@@ -754,6 +754,60 @@ fn bench_enum(c: &mut Criterion) {
     group.finish();
 }
 
+const DECIMAL_SCHEMA: &str = r#"{"type":"record","name":"DecRec","fields":[{"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}}]}"#;
+
+fn decimal_arrow_schema() -> Arc<Schema> {
+    let mut meta = std::collections::HashMap::new();
+    meta.insert("avro.decimal.encoding".to_string(), "bytes".to_string());
+    Arc::new(Schema::new(vec![
+        Field::new("d", DataType::Decimal128(18, 4), false).with_metadata(meta),
+    ]))
+}
+
+fn gen_decimal_data(n: usize) -> TestData {
+    let schema = ApacheSchema::parse_str(DECIMAL_SCHEMA).expect("invalid schema");
+    let val = |i: usize| Value::Decimal(Decimal::from(((i as i128) * 100 - 5000).to_be_bytes().to_vec()));
+    let mut writer = Writer::new(&schema, Vec::new());
+    for i in 0..n {
+        writer
+            .append(Value::Record(vec![("d".into(), val(i))]))
+            .expect("append failed");
+    }
+    let container = writer.into_inner().expect("flush failed");
+    let mut raw_datum = Vec::new();
+    for i in 0..n {
+        raw_datum.extend_from_slice(
+            &to_avro_datum(&schema, Value::Record(vec![("d".into(), val(i))])).expect("encode failed"),
+        );
+    }
+    TestData { container, raw_datum }
+}
+
+fn bench_decimal(c: &mut Criterion) {
+    let arrow_schema = decimal_arrow_schema();
+    let row_counts = [1000, 2000, 10000];
+    let mut group = c.benchmark_group("jit_vs_apache_decimal");
+    for &row_count in &row_counts {
+        let test_data = gen_decimal_data(row_count);
+        group.throughput(Throughput::Elements(row_count as u64));
+        group.bench_with_input(BenchmarkId::new("apache", row_count), &row_count, |b, _| {
+            b.iter(|| run_apache_benchmark(&test_data.container));
+        });
+        let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
+        group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
+            b.iter(|| {
+                let mut output = vec![0u8; row_count * 16]; // Decimal128 = 16 bytes
+                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                let result = jit_decoder
+                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
+                    .expect("decode");
+                black_box(result);
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_array(c: &mut Criterion) {
     let arrow_schema = array_arrow_schema();
     let row_count = 10000;
@@ -970,6 +1024,7 @@ criterion_group!(
     bench_bytes,
     bench_fixed,
     bench_enum,
+    bench_decimal,
     bench_array,
     bench_map,
     bench_struct,
