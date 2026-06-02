@@ -623,6 +623,38 @@ fn diff_decimal128_bytes_nullable() {
     assert_eq!(ref_batch, jit_batch, "nullable bytes-backed Decimal128 JIT vs reference");
 }
 
+#[test]
+fn diff_decimal256_bytes() {
+    // bytes-backed Decimal256 (precision 76): sub-i128 values (sign-extended to
+    // 32) plus crafted >16-byte values to exercise the full 32-byte path.
+    use apache_avro::Decimal;
+    let json = r#"{"type":"record","name":"R","fields":[
+        {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":76,"scale":0}}]}"#;
+    let schema = ApacheSchema::parse_str(json).expect("apache parse");
+    let mut bodies: Vec<Vec<u8>> = vec![0i128, 1, -1, 255, -256, i128::MAX, i128::MIN]
+        .iter()
+        .map(|v| i128_be_min(*v))
+        .collect();
+    // 20-byte positive (leading 0x01, MSB clear) and negative (leading 0xFE, MSB set).
+    let mut big_pos = vec![0x01u8];
+    big_pos.extend(std::iter::repeat(0xABu8).take(19));
+    bodies.push(big_pos);
+    let mut big_neg = vec![0xFEu8];
+    big_neg.extend(std::iter::repeat(0x01u8).take(19));
+    bodies.push(big_neg);
+
+    let rows = bodies.len();
+    let mut body = Vec::new();
+    for bytes in &bodies {
+        let rec = Value::Record(vec![("d".into(), Value::Decimal(Decimal::from(bytes.clone())))]);
+        body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode"));
+    }
+    let (ref_batch, arrow_schema) = reference_decode(json, &body, rows);
+    let jit_batch = jit_decode(&arrow_schema, &body, rows)
+        .unwrap_or_else(|e| panic!("JIT bytes-decimal256 decode failed: {e}"));
+    assert_eq!(ref_batch, jit_batch, "bytes-backed Decimal256(76,0) JIT vs reference");
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(256))]
 

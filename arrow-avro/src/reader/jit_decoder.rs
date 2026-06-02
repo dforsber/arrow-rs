@@ -110,7 +110,7 @@ enum FieldOp {
     /// Decimal128 - read fixed bytes and decode as 128-bit decimal
     Decimal128 { _precision: u8, _scale: i8, nullable: bool, bytes_backed: bool },
     /// Decimal256 - read fixed bytes and decode as 256-bit decimal
-    Decimal256 { _precision: u8, _scale: i8, nullable: bool },
+    Decimal256 { _precision: u8, _scale: i8, nullable: bool, bytes_backed: bool },
     /// Duration - read as i64
     Duration { nullable: bool },
     /// Interval - read as fixed bytes
@@ -620,7 +620,17 @@ impl JitDecoder {
                 })
             }
             DataType::Decimal256(precision, scale) => {
-                Ok(FieldOp::Decimal256 { _precision: *precision, _scale: *scale, nullable })
+                let bytes_backed = field
+                    .metadata()
+                    .get("avro.decimal.encoding")
+                    .map(|v| v == "bytes")
+                    .unwrap_or(false);
+                Ok(FieldOp::Decimal256 {
+                    _precision: *precision,
+                    _scale: *scale,
+                    nullable,
+                    bytes_backed,
+                })
             }
             // Duration - encoded as i64
             DataType::Duration(_) => Ok(FieldOp::Duration { nullable }),
@@ -1445,8 +1455,9 @@ impl JitDecoder {
                 let new_output_pos = builder.ins().iadd(output_pos, size_const);
                 builder.def_var(output_vars[buf_idx], new_output_pos);
             }
-            FieldOp::Decimal256 { nullable, .. } => {
-                // Avro decimal: read as fixed 32 bytes (big-endian), convert to little-endian for Arrow
+            FieldOp::Decimal256 { nullable, bytes_backed, .. } => {
+                // Avro decimal: fixed(32) reads 32 raw big-endian bytes; bytes-backed
+                // reads a zigzag length + that many bytes (sign-extended to 32).
                 let byte_size: i64 = 32;
 
                 if *nullable {
@@ -1473,7 +1484,11 @@ impl JitDecoder {
 
                     // Value block: decode and set validity bit
                     builder.switch_to_block(value_block);
-                    Self::emit_decimal256_decode(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
+                    if *bytes_backed {
+                        Self::emit_decimal256_decode_bytes(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
+                    } else {
+                        Self::emit_decimal256_decode(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
+                    }
                     // Set validity bit to 1 for non-null value
                     if let Some(validity_idx) = buffer_slot.validity {
                         let row_idx = builder.use_var(row_var);
@@ -1485,6 +1500,8 @@ impl JitDecoder {
                     builder.seal_block(value_block);
                     builder.seal_block(continue_block);
                     builder.switch_to_block(continue_block);
+                } else if *bytes_backed {
+                    Self::emit_decimal256_decode_bytes(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
                 } else {
                     Self::emit_decimal256_decode(builder, input_ptr, input_len, cursor_var, output_write_ptr, error_block);
                 }
@@ -2570,6 +2587,63 @@ impl JitDecoder {
         // Update cursor
         let thirty_two = builder.ins().iconst(types::I64, 32);
         let new_cursor = builder.ins().iadd(cursor, thirty_two);
+        builder.def_var(cursor_var, new_cursor);
+    }
+
+    /// Emit Cranelift IR for bytes-backed Decimal256 decoding (zigzag length +
+    /// minimal big-endian two's-complement bytes → 32-byte little-endian).
+    fn emit_decimal256_decode_bytes(
+        builder: &mut FunctionBuilder,
+        input_ptr: Value,
+        input_len: Value,
+        cursor_var: Variable,
+        output_write_ptr: Value,
+        error_block: Block,
+    ) {
+        let (raw_len, after_len) =
+            Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
+        builder.def_var(cursor_var, after_len);
+        let len = Self::emit_zigzag_decode_i64(builder, raw_len);
+
+        let cursor = builder.use_var(cursor_var);
+        let end_pos = builder.ins().iadd(cursor, len);
+        let in_bounds = builder
+            .ins()
+            .icmp(IntCC::UnsignedLessThanOrEqual, end_pos, input_len);
+        let ok_block = builder.create_block();
+        builder.ins().brif(in_bounds, ok_block, &[], error_block, &[]);
+        builder.switch_to_block(ok_block);
+        builder.seal_block(ok_block);
+
+        let zero = builder.ins().iconst(types::I64, 0);
+        let base_ptr = builder.ins().iadd(input_ptr, cursor);
+
+        let msb = builder.ins().load(types::I8, MemFlags::trusted(), base_ptr, 0);
+        let msb_i64 = builder.ins().uextend(types::I64, msb);
+        let high_bit = builder.ins().iconst(types::I64, 0x80);
+        let masked = builder.ins().band(msb_i64, high_bit);
+        let is_neg = builder.ins().icmp(IntCC::NotEqual, masked, zero);
+        let len_pos = builder.ins().icmp(IntCC::SignedGreaterThan, len, zero);
+        let neg_and_len = builder.ins().band(is_neg, len_pos);
+        let fill_ff = builder.ins().iconst(types::I8, 0xFF);
+        let fill_00 = builder.ins().iconst(types::I8, 0);
+        let sign_fill = builder.ins().select(neg_and_len, fill_ff, fill_00);
+
+        for j in 0..32i64 {
+            let jc = builder.ins().iconst(types::I64, j);
+            let j_lt = builder.ins().icmp(IntCC::SignedLessThan, jc, len);
+            let jp1 = builder.ins().iconst(types::I64, j + 1);
+            let off = builder.ins().isub(len, jp1);
+            let safe_off = builder.ins().select(j_lt, off, zero);
+            let addr = builder.ins().iadd(base_ptr, safe_off);
+            let loaded = builder.ins().load(types::I8, MemFlags::trusted(), addr, 0);
+            let byte = builder.ins().select(j_lt, loaded, sign_fill);
+            builder
+                .ins()
+                .store(MemFlags::trusted(), byte, output_write_ptr, j as i32);
+        }
+
+        let new_cursor = builder.ins().iadd(cursor, len);
         builder.def_var(cursor_var, new_cursor);
     }
 
