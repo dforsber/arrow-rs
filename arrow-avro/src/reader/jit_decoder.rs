@@ -537,9 +537,12 @@ impl JitDecoder {
         }
     }
 
-    /// Get byte size of element type
+    /// Get byte size of element type (must match emit_list_decode's element_size
+    /// and emit_struct_decode's field_size — used for offset element counts).
     fn element_op_size(op: &FieldOp) -> i64 {
         match op {
+            FieldOp::Decimal256 { .. } => 32,
+            FieldOp::Decimal128 { .. } => 16,
             FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
             FieldOp::Int32 { .. } | FieldOp::Float32 { .. } | FieldOp::Enum { .. } => 4,
             FieldOp::Boolean { .. } => 1,
@@ -566,10 +569,10 @@ impl JitDecoder {
                     .iter()
                     .map(|f| Self::field_to_op(f.as_ref()))
                     .collect::<Result<Vec<_>, _>>()?;
-                // SAFETY: emit_struct_decode only decodes non-nullable scalar
-                // children {bool,int,long,float,double}. Any other child is
-                // silently skipped (no wire read → desync → corruption). Refuse
-                // to compile such a struct so the caller loud-rejects instead.
+                // emit_struct_decode handles non-nullable scalars (incl. temporal,
+                // which map to int/long), decimal128/256, and enum. Any other
+                // child (string/bytes/fixed/nullable/nested) is silently skipped
+                // → reject at compile time so the caller loud-rejects instead.
                 for op in &child_ops {
                     let supported = matches!(
                         op,
@@ -578,12 +581,15 @@ impl JitDecoder {
                             | FieldOp::Int64 { nullable: false }
                             | FieldOp::Float32 { nullable: false }
                             | FieldOp::Float64 { nullable: false }
+                            | FieldOp::Decimal128 { nullable: false, .. }
+                            | FieldOp::Decimal256 { nullable: false, .. }
+                            | FieldOp::Enum { nullable: false }
                     );
                     if !supported {
                         return Err(
-                            "JIT struct decode supports only non-nullable scalar children \
-                             (bool/int/long/float/double); rejecting struct with an \
-                             unsupported child to avoid silent corruption"
+                            "JIT struct decode supports non-nullable scalar/decimal/enum \
+                             children only; rejecting struct with an unsupported child to \
+                             avoid silent corruption"
                                 .to_string(),
                         );
                     }
@@ -595,9 +601,9 @@ impl JitDecoder {
             // List types - decode element type recursively
             DataType::List(element_field) | DataType::LargeList(element_field) => {
                 let element_op = Self::field_to_op(element_field.as_ref())?;
-                // SAFETY: emit_list_decode only decodes non-nullable scalar
-                // elements {bool,int,long,float,double}; other elements are
-                // silently skipped (corruption). Refuse to compile such lists.
+                // emit_list_decode handles non-nullable scalars (incl. temporal),
+                // decimal128/256, and enum elements. Others (string/bytes/fixed/
+                // nullable/nested) are silently skipped → reject at compile time.
                 let supported = matches!(
                     element_op,
                     FieldOp::Boolean { nullable: false }
@@ -605,12 +611,15 @@ impl JitDecoder {
                         | FieldOp::Int64 { nullable: false }
                         | FieldOp::Float32 { nullable: false }
                         | FieldOp::Float64 { nullable: false }
+                        | FieldOp::Decimal128 { nullable: false, .. }
+                        | FieldOp::Decimal256 { nullable: false, .. }
+                        | FieldOp::Enum { nullable: false }
                 );
                 if !supported {
                     return Err(
-                        "JIT list decode supports only non-nullable scalar elements \
-                         (bool/int/long/float/double); rejecting list with an \
-                         unsupported element to avoid silent corruption"
+                        "JIT list decode supports non-nullable scalar/decimal/enum elements \
+                         only; rejecting list with an unsupported element to avoid silent \
+                         corruption"
                             .to_string(),
                     );
                 }
@@ -1684,8 +1693,10 @@ impl JitDecoder {
             let struct_bytes = builder.use_var(struct_bytes_var);
             let field_write_ptr = builder.ins().iadd(output_write_ptr, struct_bytes);
 
-            // Get field size
+            // Get field size (output bytes for this child)
             let field_size: i64 = match child_op {
+                FieldOp::Decimal256 { .. } => 32,
+                FieldOp::Decimal128 { .. } => 16,
                 FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
                 FieldOp::Int32 { .. } | FieldOp::Float32 { .. } | FieldOp::Enum { .. } => 4,
                 FieldOp::Boolean { .. } => 1,
@@ -1736,8 +1747,31 @@ impl JitDecoder {
                     let new_cursor = builder.ins().iadd(cursor, one);
                     builder.def_var(cursor_var, new_cursor);
                 }
+                FieldOp::Decimal128 { nullable: false, bytes_backed, .. } => {
+                    if *bytes_backed {
+                        Self::emit_decimal128_decode_bytes(builder, input_ptr, input_len, cursor_var, field_write_ptr, error_block);
+                    } else {
+                        Self::emit_decimal128_decode(builder, input_ptr, input_len, cursor_var, field_write_ptr, error_block);
+                    }
+                }
+                FieldOp::Decimal256 { nullable: false, bytes_backed, .. } => {
+                    if *bytes_backed {
+                        Self::emit_decimal256_decode_bytes(builder, input_ptr, input_len, cursor_var, field_write_ptr, error_block);
+                    } else {
+                        Self::emit_decimal256_decode(builder, input_ptr, input_len, cursor_var, field_write_ptr, error_block);
+                    }
+                }
+                FieldOp::Enum { nullable: false } => {
+                    // Avro enum index = zigzag varint → i32 dictionary key.
+                    let (raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
+                    let value = Self::emit_zigzag_decode_i64(builder, raw);
+                    let value_i32 = builder.ins().ireduce(types::I32, value);
+                    builder.ins().store(MemFlags::trusted(), value_i32, field_write_ptr, 0);
+                    builder.def_var(cursor_var, new_cursor);
+                }
                 _ => {
-                    // Skip complex/nullable child types for now
+                    // Unsupported child types are rejected at compile time
+                    // (field_to_op), so this is unreachable.
                 }
             }
 
@@ -2016,6 +2050,8 @@ impl JitDecoder {
 
         // Get element size based on type
         let element_size: i64 = match element_op {
+            FieldOp::Decimal256 { .. } => 32,
+            FieldOp::Decimal128 { .. } => 16,
             FieldOp::Int64 { .. } | FieldOp::Float64 { .. } => 8,
             FieldOp::Int32 { .. } | FieldOp::Float32 { .. } | FieldOp::Enum { .. } => 4,
             FieldOp::Boolean { .. } => 1,
@@ -2161,8 +2197,30 @@ impl JitDecoder {
                 let new_cursor = builder.ins().iadd(cursor, one);
                 builder.def_var(cursor_var, new_cursor);
             }
+            FieldOp::Decimal128 { nullable: false, bytes_backed, .. } => {
+                if *bytes_backed {
+                    Self::emit_decimal128_decode_bytes(builder, input_ptr, input_len, cursor_var, elem_write_ptr, error_block);
+                } else {
+                    Self::emit_decimal128_decode(builder, input_ptr, input_len, cursor_var, elem_write_ptr, error_block);
+                }
+            }
+            FieldOp::Decimal256 { nullable: false, bytes_backed, .. } => {
+                if *bytes_backed {
+                    Self::emit_decimal256_decode_bytes(builder, input_ptr, input_len, cursor_var, elem_write_ptr, error_block);
+                } else {
+                    Self::emit_decimal256_decode(builder, input_ptr, input_len, cursor_var, elem_write_ptr, error_block);
+                }
+            }
+            FieldOp::Enum { nullable: false } => {
+                let (raw, new_cursor) = Self::emit_varint_decode(builder, input_ptr, input_len, cursor_var, error_block);
+                let value = Self::emit_zigzag_decode_i64(builder, raw);
+                let value_i32 = builder.ins().ireduce(types::I32, value);
+                builder.ins().store(MemFlags::trusted(), value_i32, elem_write_ptr, 0);
+                builder.def_var(cursor_var, new_cursor);
+            }
             _ => {
-                // For other types, skip for now (no decode)
+                // Unsupported element types are rejected at compile time
+                // (field_to_op), so this is unreachable.
             }
         }
 

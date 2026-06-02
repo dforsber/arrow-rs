@@ -311,7 +311,9 @@ fn jit_decode(arrow_schema: &SchemaRef, body: &[u8], rows: usize) -> Result<Reco
         return Ok(RecordBatch::new_empty(arrow_schema.clone()));
     }
 
-    let var_data_cap = (body.len() + 64).max(64);
+    // Generous: a list element can expand vs its wire size (e.g. a ~3-byte
+    // bytes-decimal → 16 output bytes), so size for the worst case.
+    let var_data_cap = (body.len() * 32 + 4096).max(64);
     let mut sets: Vec<BufferSet> = Vec::with_capacity(arrow_schema.fields().len());
     for (ci, field) in arrow_schema.fields().iter().enumerate() {
         let slot = decoder
@@ -822,21 +824,48 @@ fn diff_enum() {
 }
 
 #[test]
-fn struct_with_nonscalar_child_is_loudly_rejected() {
-    // emit_struct_decode only handles non-nullable {bool,i32,i64,f32,f64}
-    // children; decimal/enum/temporal/fixed/nullable children would be silently
-    // skipped → corruption. The JIT must now REFUSE to compile such structs.
+fn diff_struct_with_decimal_and_enum() {
+    // Struct with decimal + enum children now decode correctly (reuse the
+    // per-type decoders inside the struct loop).
+    use apache_avro::Decimal;
+    let json = r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
+        {"name":"a","type":"long"},
+        {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}},
+        {"name":"f","type":{"type":"fixed","size":16,"name":"FD","logicalType":"decimal","precision":20,"scale":2}},
+        {"name":"c","type":{"type":"enum","name":"E","symbols":["X","Y","Z"]}}]}}]}"#;
+    let schema = ApacheSchema::parse_str(json).expect("apache parse");
+    let syms = ["X", "Y", "Z"];
+    let rows: Vec<(i64, i128, i128, u32)> = vec![(1, 12345, 7, 0), (-9, -98765, -1, 2), (0, 0, 0, 1)];
+    let mut body = Vec::new();
+    for (a, d, f, c) in &rows {
+        let rec = Value::Record(vec![(
+            "s".into(),
+            Value::Record(vec![
+                ("a".into(), Value::Long(*a)),
+                ("d".into(), Value::Decimal(Decimal::from(i128_be_min(*d)))),
+                ("f".into(), Value::Decimal(Decimal::from(f.to_be_bytes().to_vec()))),
+                ("c".into(), Value::Enum(*c, syms[*c as usize].to_string())),
+            ]),
+        )]);
+        body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode"));
+    }
+    let (ref_batch, arrow_schema) = reference_decode(json, &body, rows.len());
+    let jit_batch = jit_decode(&arrow_schema, &body, rows.len())
+        .unwrap_or_else(|e| panic!("Struct<decimal,enum> decode failed: {e}"));
+    assert_eq!(ref_batch, jit_batch, "Struct<long,decimal,fixed-decimal,enum> JIT vs reference");
+}
+
+#[test]
+fn struct_with_unsupported_child_is_loudly_rejected() {
+    // Still unsupported as struct children: nullable, string/bytes, fixed (raw),
+    // nested. Must reject (silent-skip otherwise).
     let cases = [
-        // Struct<long, decimal>
-        r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
-            {"name":"a","type":"long"},
-            {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}}]}}]}"#,
-        // Struct<enum>
-        r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
-            {"name":"c","type":{"type":"enum","name":"E","symbols":["A","B"]}}]}}]}"#,
-        // Struct<nullable long>
         r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
             {"name":"a","type":["null","long"]}]}}]}"#,
+        r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
+            {"name":"a","type":"string"}]}}]}"#,
+        r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
+            {"name":"a","type":{"type":"fixed","size":8,"name":"F8"}}]}}]}"#,
     ];
     for json in cases {
         let avro_schema: AvroSchema = serde_json::from_str(json).expect("parse");
@@ -845,23 +874,61 @@ fn struct_with_nonscalar_child_is_loudly_rejected() {
         let arrow_schema = rd.schema().clone();
         assert!(
             JitDecoder::compile(&arrow_schema).is_err(),
-            "struct with non-scalar child must be rejected by the JIT: {json}"
+            "struct with unsupported child must be rejected by the JIT: {json}"
         );
     }
 }
 
 #[test]
-fn list_with_nonscalar_element_is_loudly_rejected() {
-    // emit_list_decode skips non-scalar elements → the JIT must refuse to compile
-    // List<decimal|fixed|nullable|...>. (List<temporal> is fine — date/time map
-    // to int/long ops, see diff_struct_with_temporal.)
+fn diff_list_decimal_and_enum() {
+    use apache_avro::Decimal;
+    // List<bytes-decimal>
+    let json_d = r#"{"type":"record","name":"R","fields":[{"name":"l","type":{"type":"array","items":
+        {"type":"bytes","logicalType":"decimal","precision":18,"scale":4}}}]}"#;
+    let schema_d = ApacheSchema::parse_str(json_d).expect("parse");
+    let lists: Vec<Vec<i128>> = vec![vec![], vec![1, -2, 12345], vec![999; 3]];
+    let mut body = Vec::new();
+    for l in &lists {
+        let arr =
+            Value::Array(l.iter().map(|v| Value::Decimal(Decimal::from(i128_be_min(*v)))).collect());
+        body.extend_from_slice(
+            &to_avro_datum(&schema_d, Value::Record(vec![("l".into(), arr)])).expect("encode"),
+        );
+    }
+    let (ref_b, sch) = reference_decode(json_d, &body, lists.len());
+    let jit_b = jit_decode(&sch, &body, lists.len()).unwrap_or_else(|e| panic!("List<decimal>: {e}"));
+    assert_eq!(ref_b, jit_b, "List<decimal> JIT vs reference");
+
+    // List<enum>
+    let json_e = r#"{"type":"record","name":"R","fields":[{"name":"l","type":{"type":"array","items":
+        {"type":"enum","name":"E","symbols":["A","B","C"]}}}]}"#;
+    let schema_e = ApacheSchema::parse_str(json_e).expect("parse");
+    let syms = ["A", "B", "C"];
+    let elists: Vec<Vec<u32>> = vec![vec![], vec![0, 1, 2], vec![2, 2]];
+    let mut body2 = Vec::new();
+    for l in &elists {
+        let arr = Value::Array(
+            l.iter().map(|i| Value::Enum(*i, syms[*i as usize].to_string())).collect(),
+        );
+        body2.extend_from_slice(
+            &to_avro_datum(&schema_e, Value::Record(vec![("l".into(), arr)])).expect("encode"),
+        );
+    }
+    let (ref_e, sch_e) = reference_decode(json_e, &body2, elists.len());
+    let jit_e = jit_decode(&sch_e, &body2, elists.len()).unwrap_or_else(|e| panic!("List<enum>: {e}"));
+    assert_eq!(ref_e, jit_e, "List<enum> JIT vs reference");
+}
+
+#[test]
+fn list_with_unsupported_element_is_loudly_rejected() {
+    // Still unsupported as list elements: fixed (raw), nullable, string/nested.
     let cases = [
-        r#"{"type":"record","name":"R","fields":[{"name":"l","type":{"type":"array","items":
-            {"type":"bytes","logicalType":"decimal","precision":18,"scale":4}}}]}"#,
         r#"{"type":"record","name":"R","fields":[{"name":"l","type":{"type":"array","items":
             {"type":"fixed","name":"F","size":8}}}]}"#,
         r#"{"type":"record","name":"R","fields":[{"name":"l","type":{"type":"array","items":
             ["null","long"]}}]}"#,
+        r#"{"type":"record","name":"R","fields":[{"name":"l","type":{"type":"array","items":
+            "string"}}]}"#,
     ];
     for json in cases {
         let avro_schema: AvroSchema = serde_json::from_str(json).expect("parse");
@@ -870,7 +937,7 @@ fn list_with_nonscalar_element_is_loudly_rejected() {
         let arrow_schema = rd.schema().clone();
         assert!(
             JitDecoder::compile(&arrow_schema).is_err(),
-            "list with non-scalar element must be rejected by the JIT: {json}"
+            "list with unsupported element must be rejected by the JIT: {json}"
         );
     }
 }
