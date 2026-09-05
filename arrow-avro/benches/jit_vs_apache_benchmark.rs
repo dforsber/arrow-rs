@@ -15,25 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Benchmark comparing JIT decoder vs Apache Avro decoder (via Vec-based arrow-avro)
-//!
-//! This benchmark measures:
-//! - Apache Avro decoder (Vec-based ReaderBuilder)
-//! - JIT compiled (JitDecoder)
-//!
-//! Types covered:
-//! - Primitives: Int32, Int64, Float32, Float64, Boolean
-//! - Variable-length: String, Bytes, Fixed
-//! - Complex: Enum, Array (List), Map, Record (Struct), Union
-//!
-//! Run with: cargo bench --features jit --bench jit_vs_apache_benchmark
+//! Separate microbenchmarks, NOT an end-to-end speedup comparison.
+//! `jit_raw_kernel` stops at decoded buffers; `ocf_reader_including_schema`
+//! includes header parsing and Arrow assembly. Compare each series against its
+//! own baseline only. The equivalent production-pipeline comparison lives in
+//! ingestion-agent/benches/jit_avro_ingestion_bench.rs.
 
 use apache_avro::types::Value;
-use apache_avro::{to_avro_datum, Decimal, Schema as ApacheSchema, Writer};
-use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
+use apache_avro::{Decimal, Schema as ApacheSchema, Writer, to_avro_datum};
 use arrow_avro::reader::ReaderBuilder;
-use arrow_schema::{DataType, Field, Fields, Schema, UnionFields, UnionMode};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
+use arrow_schema::{DataType, Field, Fields, Schema};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -106,13 +99,6 @@ const ARRAY_SCHEMA: &str = r#"{
 }"#;
 
 // Map schema
-const MAP_SCHEMA: &str = r#"{
-    "type": "record",
-    "name": "MapRecord",
-    "fields": [
-        {"name": "metadata", "type": {"type": "map", "values": "long"}}
-    ]
-}"#;
 
 // Nested Record (Struct) schema
 const STRUCT_SCHEMA: &str = r#"{
@@ -132,13 +118,6 @@ const STRUCT_SCHEMA: &str = r#"{
 }"#;
 
 // Union schema (nullable long)
-const UNION_SCHEMA: &str = r#"{
-    "type": "record",
-    "name": "UnionRecord",
-    "fields": [
-        {"name": "optional_value", "type": ["null", "long"]}
-    ]
-}"#;
 
 // Multi-int schema for JIT comparison
 const MULTI_INT_SCHEMA: &str = r#"{
@@ -164,7 +143,11 @@ fn flat_arrow_schema() -> Arc<Schema> {
 }
 
 fn boolean_arrow_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![Field::new("flag", DataType::Boolean, false)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "flag",
+        DataType::Boolean,
+        false,
+    )]))
 }
 
 fn string_arrow_schema() -> Arc<Schema> {
@@ -172,7 +155,11 @@ fn string_arrow_schema() -> Arc<Schema> {
 }
 
 fn bytes_arrow_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![Field::new("data", DataType::Binary, false)]))
+    Arc::new(Schema::new(vec![Field::new(
+        "data",
+        DataType::Binary,
+        false,
+    )]))
 }
 
 fn fixed_arrow_schema() -> Arc<Schema> {
@@ -199,24 +186,6 @@ fn array_arrow_schema() -> Arc<Schema> {
     )]))
 }
 
-fn map_arrow_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![Field::new(
-        "metadata",
-        DataType::Map(
-            Arc::new(Field::new(
-                "entries",
-                DataType::Struct(Fields::from(vec![
-                    Field::new("key", DataType::Utf8, false),
-                    Field::new("value", DataType::Int64, false),
-                ])),
-                false,
-            )),
-            false,
-        ),
-        false,
-    )]))
-}
-
 fn struct_arrow_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -229,22 +198,6 @@ fn struct_arrow_schema() -> Arc<Schema> {
             false,
         ),
     ]))
-}
-
-fn union_arrow_schema() -> Arc<Schema> {
-    // Union of null and long - represented as sparse union in Arrow
-    let union_fields = UnionFields::new(
-        vec![0, 1],
-        vec![
-            Field::new("null", DataType::Null, true),
-            Field::new("long", DataType::Int64, false),
-        ],
-    );
-    Arc::new(Schema::new(vec![Field::new(
-        "optional_value",
-        DataType::Union(union_fields, UnionMode::Sparse),
-        false,
-    )]))
 }
 
 fn multi_int_arrow_schema() -> Arc<Schema> {
@@ -290,7 +243,10 @@ fn gen_flat_data(n: usize) -> TestData {
         raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
     }
 
-    TestData { container, raw_datum }
+    TestData {
+        container,
+        raw_datum,
+    }
 }
 
 fn gen_boolean_data(n: usize) -> TestData {
@@ -309,7 +265,10 @@ fn gen_boolean_data(n: usize) -> TestData {
         raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
     }
 
-    TestData { container, raw_datum }
+    TestData {
+        container,
+        raw_datum,
+    }
 }
 
 fn gen_string_data(n: usize, avg_len: usize) -> TestData {
@@ -330,7 +289,10 @@ fn gen_string_data(n: usize, avg_len: usize) -> TestData {
         raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
     }
 
-    TestData { container, raw_datum }
+    TestData {
+        container,
+        raw_datum,
+    }
 }
 
 fn gen_bytes_data(n: usize, avg_len: usize) -> TestData {
@@ -351,7 +313,10 @@ fn gen_bytes_data(n: usize, avg_len: usize) -> TestData {
         raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
     }
 
-    TestData { container, raw_datum }
+    TestData {
+        container,
+        raw_datum,
+    }
 }
 
 fn gen_fixed_data(n: usize) -> TestData {
@@ -378,7 +343,10 @@ fn gen_fixed_data(n: usize) -> TestData {
         raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
     }
 
-    TestData { container, raw_datum }
+    TestData {
+        container,
+        raw_datum,
+    }
 }
 
 fn gen_enum_data(n: usize) -> TestData {
@@ -406,7 +374,10 @@ fn gen_enum_data(n: usize) -> TestData {
         raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
     }
 
-    TestData { container, raw_datum }
+    TestData {
+        container,
+        raw_datum,
+    }
 }
 
 fn gen_array_data(n: usize, avg_len: usize) -> TestData {
@@ -427,34 +398,10 @@ fn gen_array_data(n: usize, avg_len: usize) -> TestData {
         raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
     }
 
-    TestData { container, raw_datum }
-}
-
-fn gen_map_data(n: usize, avg_entries: usize) -> TestData {
-    let schema = ApacheSchema::parse_str(MAP_SCHEMA).expect("invalid schema");
-
-    let mut writer = Writer::new(&schema, Vec::new());
-    for i in 0..n {
-        let mut map = Vec::new();
-        for j in 0..avg_entries {
-            map.push((format!("key_{}", j), Value::Long((i + j) as i64)));
-        }
-        let record = Value::Record(vec![("metadata".into(), Value::Map(map.into_iter().collect()))]);
-        writer.append(record).expect("append failed");
+    TestData {
+        container,
+        raw_datum,
     }
-    let container = writer.into_inner().expect("flush failed");
-
-    let mut raw_datum = Vec::new();
-    for i in 0..n {
-        let mut map = Vec::new();
-        for j in 0..avg_entries {
-            map.push((format!("key_{}", j), Value::Long((i + j) as i64)));
-        }
-        let record = Value::Record(vec![("metadata".into(), Value::Map(map.into_iter().collect()))]);
-        raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
-    }
-
-    TestData { container, raw_datum }
 }
 
 fn gen_struct_data(n: usize) -> TestData {
@@ -466,7 +413,10 @@ fn gen_struct_data(n: usize) -> TestData {
             ("x".into(), Value::Int(i as i32)),
             ("y".into(), Value::Int((i * 2) as i32)),
         ]);
-        let record = Value::Record(vec![("id".into(), Value::Long(i as i64)), ("nested".into(), nested)]);
+        let record = Value::Record(vec![
+            ("id".into(), Value::Long(i as i64)),
+            ("nested".into(), nested),
+        ]);
         writer.append(record).expect("append failed");
     }
     let container = writer.into_inner().expect("flush failed");
@@ -477,40 +427,17 @@ fn gen_struct_data(n: usize) -> TestData {
             ("x".into(), Value::Int(i as i32)),
             ("y".into(), Value::Int((i * 2) as i32)),
         ]);
-        let record = Value::Record(vec![("id".into(), Value::Long(i as i64)), ("nested".into(), nested)]);
+        let record = Value::Record(vec![
+            ("id".into(), Value::Long(i as i64)),
+            ("nested".into(), nested),
+        ]);
         raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
     }
 
-    TestData { container, raw_datum }
-}
-
-fn gen_union_data(n: usize) -> TestData {
-    let schema = ApacheSchema::parse_str(UNION_SCHEMA).expect("invalid schema");
-
-    let mut writer = Writer::new(&schema, Vec::new());
-    for i in 0..n {
-        let value = if i % 3 == 0 {
-            Value::Union(0, Box::new(Value::Null))
-        } else {
-            Value::Union(1, Box::new(Value::Long(i as i64)))
-        };
-        let record = Value::Record(vec![("optional_value".into(), value)]);
-        writer.append(record).expect("append failed");
+    TestData {
+        container,
+        raw_datum,
     }
-    let container = writer.into_inner().expect("flush failed");
-
-    let mut raw_datum = Vec::new();
-    for i in 0..n {
-        let value = if i % 3 == 0 {
-            Value::Union(0, Box::new(Value::Null))
-        } else {
-            Value::Union(1, Box::new(Value::Long(i as i64)))
-        };
-        let record = Value::Record(vec![("optional_value".into(), value)]);
-        raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
-    }
-
-    TestData { container, raw_datum }
 }
 
 fn gen_multi_int_data(n: usize) -> TestData {
@@ -539,7 +466,10 @@ fn gen_multi_int_data(n: usize) -> TestData {
         raw_datum.extend_from_slice(&to_avro_datum(&schema, record).expect("encode failed"));
     }
 
-    TestData { container, raw_datum }
+    TestData {
+        container,
+        raw_datum,
+    }
 }
 
 // === Benchmark Helper ===
@@ -563,35 +493,44 @@ fn bench_flat_schema(c: &mut Criterion) {
     let arrow_schema = flat_arrow_schema();
     let row_counts = [1000, 2000, 10000];
 
-    let mut group = c.benchmark_group("jit_vs_apache_flat");
+    let mut group = c.benchmark_group("kernel_and_ocf_flat");
 
     for &row_count in &row_counts {
         let test_data = gen_flat_data(row_count);
         group.throughput(Throughput::Elements(row_count as u64));
 
-        group.bench_with_input(BenchmarkId::new("apache", row_count), &row_count, |b, _| {
-            b.iter(|| run_apache_benchmark(&test_data.container));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ocf_reader_including_schema", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| run_apache_benchmark(&test_data.container));
+            },
+        );
 
         let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-        group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
-            b.iter(|| {
-                let mut output0 = vec![0u8; row_count * 8];
-                let mut output1 = vec![0u8; row_count * 8];
-                let mut output2 = vec![0u8; row_count * 4];
-                let mut output3 = vec![0u8; row_count * 4];
-                let buffers = vec![
-                    OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
-                    OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
-                    OutputBuffer::new(output2.as_mut_ptr(), output2.len()),
-                    OutputBuffer::new(output3.as_mut_ptr(), output3.len()),
-                ];
-                let result = jit_decoder
-                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
+        group.bench_with_input(
+            BenchmarkId::new("jit_raw_kernel", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| {
+                    let mut output0 = vec![0u8; row_count * 8];
+                    let mut output1 = vec![0u8; row_count * 8];
+                    let mut output2 = vec![0u8; row_count * 4];
+                    let mut output3 = vec![0u8; row_count * 4];
+                    let buffers = vec![
+                        OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
+                        OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
+                        OutputBuffer::new(output2.as_mut_ptr(), output2.len()),
+                        OutputBuffer::new(output3.as_mut_ptr(), output3.len()),
+                    ];
+                    let result = unsafe {
+                        jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count)
+                    }
                     .expect("decode");
-                black_box(result);
-            });
-        });
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -601,28 +540,37 @@ fn bench_boolean(c: &mut Criterion) {
     let arrow_schema = boolean_arrow_schema();
     let row_counts = [1000, 2000, 10000];
 
-    let mut group = c.benchmark_group("jit_vs_apache_boolean");
+    let mut group = c.benchmark_group("kernel_and_ocf_boolean");
 
     for &row_count in &row_counts {
         let test_data = gen_boolean_data(row_count);
         group.throughput(Throughput::Elements(row_count as u64));
 
-        group.bench_with_input(BenchmarkId::new("apache", row_count), &row_count, |b, _| {
-            b.iter(|| run_apache_benchmark(&test_data.container));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ocf_reader_including_schema", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| run_apache_benchmark(&test_data.container));
+            },
+        );
 
         let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-        group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
-            b.iter(|| {
-                // JIT stores booleans as 1 byte per value
-                let mut output = vec![0u8; row_count];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = jit_decoder
-                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
+        group.bench_with_input(
+            BenchmarkId::new("jit_raw_kernel", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| {
+                    // JIT stores booleans as 1 byte per value
+                    let mut output = vec![0u8; row_count];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result = unsafe {
+                        jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count)
+                    }
                     .expect("decode");
-                black_box(result);
-            });
-        });
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -633,16 +581,16 @@ fn bench_string(c: &mut Criterion) {
     let row_count = 10000;
     let avg_len = 20;
 
-    let mut group = c.benchmark_group("jit_vs_apache_string");
+    let mut group = c.benchmark_group("kernel_and_ocf_string");
     let test_data = gen_string_data(row_count, avg_len);
     group.throughput(Throughput::Elements(row_count as u64));
 
-    group.bench_function("apache", |b| {
+    group.bench_function("ocf_reader_including_schema", |b| {
         b.iter(|| run_apache_benchmark(&test_data.container));
     });
 
     let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-    group.bench_function("jit", |b| {
+    group.bench_function("jit_raw_kernel", |b| {
         b.iter(|| {
             // String needs 2 buffers: offsets (i32) + data
             let mut offsets = vec![0u8; (row_count + 1) * 4];
@@ -651,9 +599,9 @@ fn bench_string(c: &mut Criterion) {
                 OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
                 OutputBuffer::new(data.as_mut_ptr(), data.len()),
             ];
-            let result = jit_decoder
-                .decode_checked(&test_data.raw_datum, &buffers, row_count)
-                .expect("decode");
+            let result =
+                unsafe { jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count) }
+                    .expect("decode");
             black_box(result);
         });
     });
@@ -666,16 +614,16 @@ fn bench_bytes(c: &mut Criterion) {
     let row_count = 10000;
     let avg_len = 50;
 
-    let mut group = c.benchmark_group("jit_vs_apache_bytes");
+    let mut group = c.benchmark_group("kernel_and_ocf_bytes");
     let test_data = gen_bytes_data(row_count, avg_len);
     group.throughput(Throughput::Elements(row_count as u64));
 
-    group.bench_function("apache", |b| {
+    group.bench_function("ocf_reader_including_schema", |b| {
         b.iter(|| run_apache_benchmark(&test_data.container));
     });
 
     let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-    group.bench_function("jit", |b| {
+    group.bench_function("jit_raw_kernel", |b| {
         b.iter(|| {
             // Bytes needs 2 buffers: offsets (i32) + data
             let mut offsets = vec![0u8; (row_count + 1) * 4];
@@ -684,9 +632,9 @@ fn bench_bytes(c: &mut Criterion) {
                 OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
                 OutputBuffer::new(data.as_mut_ptr(), data.len()),
             ];
-            let result = jit_decoder
-                .decode_checked(&test_data.raw_datum, &buffers, row_count)
-                .expect("decode");
+            let result =
+                unsafe { jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count) }
+                    .expect("decode");
             black_box(result);
         });
     });
@@ -698,27 +646,36 @@ fn bench_fixed(c: &mut Criterion) {
     let arrow_schema = fixed_arrow_schema();
     let row_counts = [1000, 2000, 10000];
 
-    let mut group = c.benchmark_group("jit_vs_apache_fixed");
+    let mut group = c.benchmark_group("kernel_and_ocf_fixed");
 
     for &row_count in &row_counts {
         let test_data = gen_fixed_data(row_count);
         group.throughput(Throughput::Elements(row_count as u64));
 
-        group.bench_with_input(BenchmarkId::new("apache", row_count), &row_count, |b, _| {
-            b.iter(|| run_apache_benchmark(&test_data.container));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ocf_reader_including_schema", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| run_apache_benchmark(&test_data.container));
+            },
+        );
 
         let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-        group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
-            b.iter(|| {
-                let mut output = vec![0u8; row_count * 16];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = jit_decoder
-                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
+        group.bench_with_input(
+            BenchmarkId::new("jit_raw_kernel", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| {
+                    let mut output = vec![0u8; row_count * 16];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result = unsafe {
+                        jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count)
+                    }
                     .expect("decode");
-                black_box(result);
-            });
-        });
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -728,27 +685,36 @@ fn bench_enum(c: &mut Criterion) {
     let arrow_schema = enum_arrow_schema();
     let row_counts = [1000, 2000, 10000];
 
-    let mut group = c.benchmark_group("jit_vs_apache_enum");
+    let mut group = c.benchmark_group("kernel_and_ocf_enum");
 
     for &row_count in &row_counts {
         let test_data = gen_enum_data(row_count);
         group.throughput(Throughput::Elements(row_count as u64));
 
-        group.bench_with_input(BenchmarkId::new("apache", row_count), &row_count, |b, _| {
-            b.iter(|| run_apache_benchmark(&test_data.container));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ocf_reader_including_schema", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| run_apache_benchmark(&test_data.container));
+            },
+        );
 
         let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-        group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
-            b.iter(|| {
-                let mut output = vec![0u8; row_count * 4]; // i32 indices
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = jit_decoder
-                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
+        group.bench_with_input(
+            BenchmarkId::new("jit_raw_kernel", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| {
+                    let mut output = vec![0u8; row_count * 4]; // i32 indices
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result = unsafe {
+                        jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count)
+                    }
                     .expect("decode");
-                black_box(result);
-            });
-        });
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -766,7 +732,11 @@ fn decimal_arrow_schema() -> Arc<Schema> {
 
 fn gen_decimal_data(n: usize) -> TestData {
     let schema = ApacheSchema::parse_str(DECIMAL_SCHEMA).expect("invalid schema");
-    let val = |i: usize| Value::Decimal(Decimal::from(((i as i128) * 100 - 5000).to_be_bytes().to_vec()));
+    let val = |i: usize| {
+        Value::Decimal(Decimal::from(
+            ((i as i128) * 100 - 5000).to_be_bytes().to_vec(),
+        ))
+    };
     let mut writer = Writer::new(&schema, Vec::new());
     for i in 0..n {
         writer
@@ -777,33 +747,46 @@ fn gen_decimal_data(n: usize) -> TestData {
     let mut raw_datum = Vec::new();
     for i in 0..n {
         raw_datum.extend_from_slice(
-            &to_avro_datum(&schema, Value::Record(vec![("d".into(), val(i))])).expect("encode failed"),
+            &to_avro_datum(&schema, Value::Record(vec![("d".into(), val(i))]))
+                .expect("encode failed"),
         );
     }
-    TestData { container, raw_datum }
+    TestData {
+        container,
+        raw_datum,
+    }
 }
 
 fn bench_decimal(c: &mut Criterion) {
     let arrow_schema = decimal_arrow_schema();
     let row_counts = [1000, 2000, 10000];
-    let mut group = c.benchmark_group("jit_vs_apache_decimal");
+    let mut group = c.benchmark_group("kernel_and_ocf_decimal");
     for &row_count in &row_counts {
         let test_data = gen_decimal_data(row_count);
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("apache", row_count), &row_count, |b, _| {
-            b.iter(|| run_apache_benchmark(&test_data.container));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ocf_reader_including_schema", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| run_apache_benchmark(&test_data.container));
+            },
+        );
         let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-        group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
-            b.iter(|| {
-                let mut output = vec![0u8; row_count * 16]; // Decimal128 = 16 bytes
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = jit_decoder
-                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
+        group.bench_with_input(
+            BenchmarkId::new("jit_raw_kernel", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| {
+                    let mut output = vec![0u8; row_count * 16]; // Decimal128 = 16 bytes
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result = unsafe {
+                        jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count)
+                    }
                     .expect("decode");
-                black_box(result);
-            });
-        });
+                    black_box(result);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -813,16 +796,16 @@ fn bench_array(c: &mut Criterion) {
     let row_count = 10000;
     let avg_len = 5;
 
-    let mut group = c.benchmark_group("jit_vs_apache_array");
+    let mut group = c.benchmark_group("kernel_and_ocf_array");
     let test_data = gen_array_data(row_count, avg_len);
     group.throughput(Throughput::Elements(row_count as u64));
 
-    group.bench_function("apache", |b| {
+    group.bench_function("ocf_reader_including_schema", |b| {
         b.iter(|| run_apache_benchmark(&test_data.container));
     });
 
     let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-    group.bench_function("jit", |b| {
+    group.bench_function("jit_raw_kernel", |b| {
         b.iter(|| {
             // List<Int64> needs 2 buffers: offsets (i32) + values (i64)
             let mut offsets = vec![0u8; (row_count + 1) * 4]; // i32 offsets
@@ -831,42 +814,9 @@ fn bench_array(c: &mut Criterion) {
                 OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
                 OutputBuffer::new(values.as_mut_ptr(), values.len()),
             ];
-            let result = jit_decoder
-                .decode_checked(&test_data.raw_datum, &buffers, row_count)
-                .expect("decode");
-            black_box(result);
-        });
-    });
-
-    group.finish();
-}
-
-fn bench_map(c: &mut Criterion) {
-    let arrow_schema = map_arrow_schema();
-    let row_count = 10000;
-    let avg_entries = 3;
-
-    let mut group = c.benchmark_group("jit_vs_apache_map");
-    let test_data = gen_map_data(row_count, avg_entries);
-    group.throughput(Throughput::Elements(row_count as u64));
-
-    group.bench_function("apache", |b| {
-        b.iter(|| run_apache_benchmark(&test_data.container));
-    });
-
-    let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-    group.bench_function("jit", |b| {
-        b.iter(|| {
-            // Map<String, Int64> needs 2 buffers: offsets + combined key/value data
-            let mut offsets = vec![0u8; (row_count + 1) * 4]; // i32 offsets
-            let mut data = vec![0u8; row_count * avg_entries * 50]; // keys (strings) + values (i64)
-            let buffers = vec![
-                OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
-                OutputBuffer::new(data.as_mut_ptr(), data.len()),
-            ];
-            let result = jit_decoder
-                .decode_checked(&test_data.raw_datum, &buffers, row_count)
-                .expect("decode");
+            let result =
+                unsafe { jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count) }
+                    .expect("decode");
             black_box(result);
         });
     });
@@ -878,64 +828,42 @@ fn bench_struct(c: &mut Criterion) {
     let arrow_schema = struct_arrow_schema();
     let row_counts = [1000, 2000, 10000];
 
-    let mut group = c.benchmark_group("jit_vs_apache_struct");
+    let mut group = c.benchmark_group("kernel_and_ocf_struct");
 
     for &row_count in &row_counts {
         let test_data = gen_struct_data(row_count);
         group.throughput(Throughput::Elements(row_count as u64));
 
-        group.bench_with_input(BenchmarkId::new("apache", row_count), &row_count, |b, _| {
-            b.iter(|| run_apache_benchmark(&test_data.container));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ocf_reader_including_schema", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| run_apache_benchmark(&test_data.container));
+            },
+        );
 
         let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-        group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
-            b.iter(|| {
-                // JIT uses top-level field count: id (i64) + nested (struct flattened to single buffer)
-                // nested contains x (i32) + y (i32) = 8 bytes per row
-                let mut output0 = vec![0u8; row_count * 8]; // id
-                let mut output1 = vec![0u8; row_count * 8]; // nested (x + y concatenated)
-                let buffers = vec![
-                    OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
-                    OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
-                ];
-                let result = jit_decoder
-                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
+        group.bench_with_input(
+            BenchmarkId::new("jit_raw_kernel", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| {
+                    // JIT uses top-level field count: id (i64) + nested (struct flattened to single buffer)
+                    // nested contains x (i32) + y (i32) = 8 bytes per row
+                    let mut output0 = vec![0u8; row_count * 8]; // id
+                    let mut output1 = vec![0u8; row_count * 8]; // nested (x + y concatenated)
+                    let buffers = vec![
+                        OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
+                        OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
+                    ];
+                    let result = unsafe {
+                        jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count)
+                    }
                     .expect("decode");
-                black_box(result);
-            });
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_union(c: &mut Criterion) {
-    let arrow_schema = union_arrow_schema();
-    let row_counts = [1000, 2000, 10000];
-
-    let mut group = c.benchmark_group("jit_vs_apache_union");
-
-    for &row_count in &row_counts {
-        let test_data = gen_union_data(row_count);
-        group.throughput(Throughput::Elements(row_count as u64));
-
-        group.bench_with_input(BenchmarkId::new("apache", row_count), &row_count, |b, _| {
-            b.iter(|| run_apache_benchmark(&test_data.container));
-        });
-
-        let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-        group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
-            b.iter(|| {
-                // Union needs type_ids (i8) + values for each variant
-                let mut output = vec![0u8; row_count * 16];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = jit_decoder
-                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
-                    .expect("decode");
-                black_box(result);
-            });
-        });
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -945,35 +873,44 @@ fn bench_multi_int(c: &mut Criterion) {
     let arrow_schema = multi_int_arrow_schema();
     let row_counts = [1000, 2000, 10000];
 
-    let mut group = c.benchmark_group("jit_vs_apache_multi_int");
+    let mut group = c.benchmark_group("kernel_and_ocf_multi_int");
 
     for &row_count in &row_counts {
         let test_data = gen_multi_int_data(row_count);
         group.throughput(Throughput::Elements(row_count as u64));
 
-        group.bench_with_input(BenchmarkId::new("apache", row_count), &row_count, |b, _| {
-            b.iter(|| run_apache_benchmark(&test_data.container));
-        });
+        group.bench_with_input(
+            BenchmarkId::new("ocf_reader_including_schema", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| run_apache_benchmark(&test_data.container));
+            },
+        );
 
         let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-        group.bench_with_input(BenchmarkId::new("jit", row_count), &row_count, |b, _| {
-            b.iter(|| {
-                let mut output0 = vec![0u8; row_count * 8];
-                let mut output1 = vec![0u8; row_count * 8];
-                let mut output2 = vec![0u8; row_count * 8];
-                let mut output3 = vec![0u8; row_count * 8];
-                let buffers = vec![
-                    OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
-                    OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
-                    OutputBuffer::new(output2.as_mut_ptr(), output2.len()),
-                    OutputBuffer::new(output3.as_mut_ptr(), output3.len()),
-                ];
-                let result = jit_decoder
-                    .decode_checked(&test_data.raw_datum, &buffers, row_count)
+        group.bench_with_input(
+            BenchmarkId::new("jit_raw_kernel", row_count),
+            &row_count,
+            |b, _| {
+                b.iter(|| {
+                    let mut output0 = vec![0u8; row_count * 8];
+                    let mut output1 = vec![0u8; row_count * 8];
+                    let mut output2 = vec![0u8; row_count * 8];
+                    let mut output3 = vec![0u8; row_count * 8];
+                    let buffers = vec![
+                        OutputBuffer::new(output0.as_mut_ptr(), output0.len()),
+                        OutputBuffer::new(output1.as_mut_ptr(), output1.len()),
+                        OutputBuffer::new(output2.as_mut_ptr(), output2.len()),
+                        OutputBuffer::new(output3.as_mut_ptr(), output3.len()),
+                    ];
+                    let result = unsafe {
+                        jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count)
+                    }
                     .expect("decode");
-                black_box(result);
-            });
-        });
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -985,16 +922,16 @@ fn bench_throughput_1m(c: &mut Criterion) {
 
     let test_data = gen_multi_int_data(row_count);
 
-    let mut group = c.benchmark_group("jit_vs_apache_1M_rows");
+    let mut group = c.benchmark_group("kernel_and_ocf_1M_rows");
     group.throughput(Throughput::Elements(row_count as u64));
     group.sample_size(20);
 
-    group.bench_function("apache", |b| {
+    group.bench_function("ocf_reader_including_schema", |b| {
         b.iter(|| run_apache_benchmark(&test_data.container));
     });
 
     let jit_decoder = JitDecoder::compile(&arrow_schema).expect("JIT compile");
-    group.bench_function("jit", |b| {
+    group.bench_function("jit_raw_kernel", |b| {
         b.iter(|| {
             let mut output0 = vec![0u8; row_count * 8];
             let mut output1 = vec![0u8; row_count * 8];
@@ -1006,9 +943,9 @@ fn bench_throughput_1m(c: &mut Criterion) {
                 OutputBuffer::new(output2.as_mut_ptr(), output2.len()),
                 OutputBuffer::new(output3.as_mut_ptr(), output3.len()),
             ];
-            let result = jit_decoder
-                .decode_checked(&test_data.raw_datum, &buffers, row_count)
-                .expect("decode");
+            let result =
+                unsafe { jit_decoder.decode_checked(&test_data.raw_datum, &buffers, row_count) }
+                    .expect("decode");
             black_box(result);
         });
     });
@@ -1026,9 +963,7 @@ criterion_group!(
     bench_enum,
     bench_decimal,
     bench_array,
-    bench_map,
     bench_struct,
-    bench_union,
     bench_multi_int,
     bench_throughput_1m
 );

@@ -26,7 +26,7 @@
 
 use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -101,14 +101,19 @@ fn bench_int32(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 4];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 4];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -123,14 +128,19 @@ fn bench_int64(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 8];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 8];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -145,14 +155,19 @@ fn bench_float32(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 4];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 4];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -167,14 +182,19 @@ fn bench_float64(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 8];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 8];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -194,22 +214,27 @@ fn bench_combined_primitives(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut out0 = vec![0u8; n * 4];
-                let mut out1 = vec![0u8; n * 8];
-                let mut out2 = vec![0u8; n * 4];
-                let mut out3 = vec![0u8; n * 8];
-                let buffers = vec![
-                    OutputBuffer::new(out0.as_mut_ptr(), out0.len()),
-                    OutputBuffer::new(out1.as_mut_ptr(), out1.len()),
-                    OutputBuffer::new(out2.as_mut_ptr(), out2.len()),
-                    OutputBuffer::new(out3.as_mut_ptr(), out3.len()),
-                ];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut out0 = vec![0u8; n * 4];
+                    let mut out1 = vec![0u8; n * 8];
+                    let mut out2 = vec![0u8; n * 4];
+                    let mut out3 = vec![0u8; n * 8];
+                    let buffers = vec![
+                        OutputBuffer::new(out0.as_mut_ptr(), out0.len()),
+                        OutputBuffer::new(out1.as_mut_ptr(), out1.len()),
+                        OutputBuffer::new(out2.as_mut_ptr(), out2.len()),
+                        OutputBuffer::new(out3.as_mut_ptr(), out3.len()),
+                    ];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();

@@ -13,19 +13,18 @@
 //! ```
 
 use arrow_array::{
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array,
+    Decimal256Array, DictionaryArray, DurationMicrosecondArray, DurationMillisecondArray,
+    DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray,
+    IntervalYearMonthArray, LargeBinaryArray, LargeStringArray, ListArray, RecordBatch,
+    StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+    Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
     types::{Int32Type, IntervalDayTime, IntervalMonthDayNano},
-    ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, DictionaryArray,
-    ListArray, StructArray,
-    Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray,
-    DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, Float32Array,
-    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, IntervalDayTimeArray,
-    IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray, LargeStringArray,
-    RecordBatch, StringArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
-    UInt32Array, UInt64Array, UInt8Array,
 };
-use arrow_buffer::{i256, BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
 use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, SchemaRef, TimeUnit};
 use bytes::BytesMut;
 use std::sync::Arc;
@@ -240,7 +239,71 @@ fn build_enum_dictionary(
     })?;
     let values = Arc::new(StringArray::from(symbols)) as ArrayRef;
     let keys = Int32Array::new(keys, nulls);
-    Ok(Arc::new(DictionaryArray::<Int32Type>::try_new(keys, values)?))
+    Ok(Arc::new(DictionaryArray::<Int32Type>::try_new(
+        keys, values,
+    )?))
+}
+
+/// Validate and trim the initialized portion of a column. Allocation capacity is
+/// deliberately independent of the number of successfully decoded rows.
+fn used_lengths(
+    field: &Field,
+    primary: &[u8],
+    secondary: Option<&[u8]>,
+    validity: Option<&[u8]>,
+    rows: usize,
+) -> Result<(usize, Option<usize>), ArrowError> {
+    let invalid =
+        || ArrowError::InvalidArgumentError(format!("Invalid JIT buffers for '{}'", field.name()));
+    if validity.is_some_and(|v| v.len() < rows.div_ceil(8)) {
+        return Err(invalid());
+    }
+    if let Some(size) = JitDecoder::fixed_size_for_type(field.data_type()) {
+        let len = rows.checked_mul(size).ok_or_else(invalid)?;
+        if primary.len() < len {
+            return Err(invalid());
+        }
+        return Ok((len, None));
+    }
+    let (offset_size, element_size) = match field.data_type() {
+        DataType::Utf8 | DataType::Binary => (4, 1),
+        DataType::LargeUtf8 | DataType::LargeBinary => (8, 1),
+        DataType::List(child) => (
+            4,
+            JitDecoder::fixed_size_for_type(child.data_type()).ok_or_else(invalid)?,
+        ),
+        _ => {
+            return Err(ArrowError::NotYetImplemented(format!(
+                "JIT array conversion for {:?}",
+                field.data_type()
+            )));
+        }
+    };
+    let len = rows
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(offset_size))
+        .ok_or_else(invalid)?;
+    let offsets = primary.get(..len).ok_or_else(invalid)?;
+    let mut last = 0i64;
+    for offset in offsets.chunks_exact(offset_size) {
+        let value = if offset_size == 4 {
+            i32::from_ne_bytes(offset.try_into().unwrap()) as i64
+        } else {
+            i64::from_ne_bytes(offset.try_into().unwrap())
+        };
+        if value < last {
+            return Err(invalid());
+        }
+        last = value;
+    }
+    let data_len = usize::try_from(last)
+        .ok()
+        .and_then(|n| n.checked_mul(element_size))
+        .ok_or_else(invalid)?;
+    if secondary.is_none_or(|data| data.len() < data_len) {
+        return Err(invalid());
+    }
+    Ok((len, Some(data_len)))
 }
 
 /// Convert a single column's pooled buffers to an Arrow ArrayRef (zero-copy, consumes PooledBufferSet)
@@ -256,9 +319,20 @@ fn build_enum_dictionary(
 /// Arrow ArrayRef wrapping the buffer data (zero-copy)
 pub fn pooled_buffer_to_array(
     field: &Field,
-    buffer_set: PooledBufferSet,
+    mut buffer_set: PooledBufferSet,
     row_count: usize,
 ) -> Result<ArrayRef, ArrowError> {
+    let (primary_len, data_len) = used_lengths(
+        field,
+        &buffer_set.primary,
+        buffer_set.secondary.as_deref(),
+        buffer_set.validity.as_deref(),
+        row_count,
+    )?;
+    buffer_set.primary.truncate(primary_len);
+    if let (Some(data), Some(len)) = (&mut buffer_set.secondary, data_len) {
+        data.truncate(len);
+    }
     let data_type = field.data_type();
 
     // Extract validity first (before consuming other buffers)
@@ -371,22 +445,30 @@ pub fn pooled_buffer_to_array(
         DataType::Timestamp(TimeUnit::Second, tz) => {
             let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.freeze()));
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(TimestampSecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+            Ok(Arc::new(
+                TimestampSecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone()),
+            ))
         }
         DataType::Timestamp(TimeUnit::Millisecond, tz) => {
             let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.freeze()));
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(TimestampMillisecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+            Ok(Arc::new(
+                TimestampMillisecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone()),
+            ))
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.freeze()));
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(TimestampMicrosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+            Ok(Arc::new(
+                TimestampMicrosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone()),
+            ))
         }
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
             let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.freeze()));
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(TimestampNanosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+            Ok(Arc::new(
+                TimestampNanosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone()),
+            ))
         }
 
         // Duration types
@@ -418,14 +500,20 @@ pub fn pooled_buffer_to_array(
             Ok(Arc::new(IntervalYearMonthArray::new(buffer, null_buffer)))
         }
         DataType::Interval(IntervalUnit::DayTime) => {
-            let buffer = ScalarBuffer::<IntervalDayTime>::from(Buffer::from(buffer_set.primary.freeze()));
+            let buffer =
+                ScalarBuffer::<IntervalDayTime>::from(Buffer::from(buffer_set.primary.freeze()));
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
             Ok(Arc::new(IntervalDayTimeArray::new(buffer, null_buffer)))
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
-            let buffer = ScalarBuffer::<IntervalMonthDayNano>::from(Buffer::from(buffer_set.primary.freeze()));
+            let buffer = ScalarBuffer::<IntervalMonthDayNano>::from(Buffer::from(
+                buffer_set.primary.freeze(),
+            ));
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(IntervalMonthDayNanoArray::new(buffer, null_buffer)))
+            Ok(Arc::new(IntervalMonthDayNanoArray::new(
+                buffer,
+                null_buffer,
+            )))
         }
 
         // Decimal types
@@ -450,7 +538,11 @@ pub fn pooled_buffer_to_array(
         DataType::FixedSizeBinary(size) => {
             let buffer = Buffer::from(buffer_set.primary.freeze());
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(FixedSizeBinaryArray::new(*size, buffer, null_buffer)))
+            Ok(Arc::new(FixedSizeBinaryArray::try_new(
+                *size,
+                buffer,
+                null_buffer,
+            )?))
         }
 
         // Variable-length string (UTF-8)
@@ -459,12 +551,18 @@ pub fn pooled_buffer_to_array(
             let data_buffer = Buffer::from(
                 buffer_set
                     .secondary
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("Utf8 requires data buffer".into()))?
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError("Utf8 requires data buffer".into())
+                    })?
                     .freeze(),
             );
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
             let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
-            Ok(Arc::new(StringArray::new(offsets, data_buffer, null_buffer)))
+            Ok(Arc::new(StringArray::try_new(
+                offsets,
+                data_buffer,
+                null_buffer,
+            )?))
         }
 
         // Large string (i64 offsets)
@@ -473,12 +571,18 @@ pub fn pooled_buffer_to_array(
             let data_buffer = Buffer::from(
                 buffer_set
                     .secondary
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("LargeUtf8 requires data buffer".into()))?
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError("LargeUtf8 requires data buffer".into())
+                    })?
                     .freeze(),
             );
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
             let offsets = OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets_buffer));
-            Ok(Arc::new(LargeStringArray::new(offsets, data_buffer, null_buffer)))
+            Ok(Arc::new(LargeStringArray::try_new(
+                offsets,
+                data_buffer,
+                null_buffer,
+            )?))
         }
 
         // Variable-length binary
@@ -487,12 +591,18 @@ pub fn pooled_buffer_to_array(
             let data_buffer = Buffer::from(
                 buffer_set
                     .secondary
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("Binary requires data buffer".into()))?
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError("Binary requires data buffer".into())
+                    })?
                     .freeze(),
             );
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
             let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
-            Ok(Arc::new(BinaryArray::new(offsets, data_buffer, null_buffer)))
+            Ok(Arc::new(BinaryArray::try_new(
+                offsets,
+                data_buffer,
+                null_buffer,
+            )?))
         }
 
         // Large binary (i64 offsets)
@@ -501,12 +611,18 @@ pub fn pooled_buffer_to_array(
             let data_buffer = Buffer::from(
                 buffer_set
                     .secondary
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("LargeBinary requires data buffer".into()))?
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError("LargeBinary requires data buffer".into())
+                    })?
                     .freeze(),
             );
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
             let offsets = OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets_buffer));
-            Ok(Arc::new(LargeBinaryArray::new(offsets, data_buffer, null_buffer)))
+            Ok(Arc::new(LargeBinaryArray::try_new(
+                offsets,
+                data_buffer,
+                null_buffer,
+            )?))
         }
 
         // List<scalar>: i32 element-indexed offsets (primary) + element data
@@ -532,12 +648,12 @@ pub fn pooled_buffer_to_array(
                 total_elems,
             )?;
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(ListArray::new(
+            Ok(Arc::new(ListArray::try_new(
                 child_field.clone(),
                 OffsetBuffer::new(offsets_sb),
                 child,
                 null_buffer,
-            )))
+            )?))
         }
 
         // Struct<scalar children>: de-interleave the JIT's row-major packed buffer
@@ -573,7 +689,11 @@ pub fn pooled_buffer_to_array(
                 field_off += s;
             }
             let null_buffer = PooledBufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(StructArray::new(child_fields.clone(), children, null_buffer)))
+            Ok(Arc::new(StructArray::try_new(
+                child_fields.clone(),
+                children,
+                null_buffer,
+            )?))
         }
 
         // Unsupported types
@@ -621,7 +741,7 @@ pub fn pooled_buffers_to_batch_owned(
     let arrays: Result<Vec<ArrayRef>, ArrowError> = schema
         .fields()
         .iter()
-        .zip(buffer_sets.into_iter())
+        .zip(buffer_sets)
         .map(|(field, buffer_set)| pooled_buffer_to_array(field, buffer_set, row_count))
         .collect();
 
@@ -648,7 +768,7 @@ pub fn allocate_pooled_buffer_sets(
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let slot = decoder.buffer_slot(col_idx).unwrap();
         let nullable = field.is_nullable();
-        let validity_bytes = if nullable { (row_count + 7) / 8 } else { 0 };
+        let validity_bytes = if nullable { row_count.div_ceil(8) } else { 0 };
 
         let buffer_set = if slot.secondary.is_some() {
             // Variable-length column
@@ -689,255 +809,17 @@ pub fn buffer_to_array(
     buffer_set: &BufferSet,
     row_count: usize,
 ) -> Result<ArrayRef, ArrowError> {
-    let data_type = field.data_type();
-    let nullable = field.is_nullable();
-
-    // Build validity buffer if nullable
-    let null_buffer = if nullable {
-        buffer_set.validity.as_ref().map(|v| {
-            let buffer = Buffer::from(v.clone());
-            NullBuffer::new(BooleanBuffer::new(buffer, 0, row_count))
-        })
-    } else {
-        None
-    };
-
-    match data_type {
-        // Boolean: JIT writes one byte per value; pack into a bit-packed
-        // BooleanBuffer (see the detailed note in `buffers_to_batch_owned`).
-        DataType::Boolean => {
-            let bytes = &buffer_set.primary[..];
-            let bool_buffer = BooleanBuffer::from_iter((0..row_count).map(|i| bytes[i] != 0));
-            Ok(Arc::new(BooleanArray::new(bool_buffer, null_buffer)))
-        }
-
-        // Signed integers
-        DataType::Int8 => {
-            let buffer = ScalarBuffer::<i8>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Int8Array::new(buffer, null_buffer)))
-        }
-        DataType::Int16 => {
-            let buffer = ScalarBuffer::<i16>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Int16Array::new(buffer, null_buffer)))
-        }
-        DataType::Int32 => {
-            let buffer = ScalarBuffer::<i32>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Int32Array::new(buffer, null_buffer)))
-        }
-        DataType::Int64 => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Int64Array::new(buffer, null_buffer)))
-        }
-
-        // Unsigned integers
-        DataType::UInt8 => {
-            let buffer = ScalarBuffer::<u8>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(UInt8Array::new(buffer, null_buffer)))
-        }
-        DataType::UInt16 => {
-            let buffer = ScalarBuffer::<u16>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(UInt16Array::new(buffer, null_buffer)))
-        }
-        DataType::UInt32 => {
-            let buffer = ScalarBuffer::<u32>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(UInt32Array::new(buffer, null_buffer)))
-        }
-        DataType::UInt64 => {
-            let buffer = ScalarBuffer::<u64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(UInt64Array::new(buffer, null_buffer)))
-        }
-
-        // Floating point
-        DataType::Float32 => {
-            let buffer = ScalarBuffer::<f32>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Float32Array::new(buffer, null_buffer)))
-        }
-        DataType::Float64 => {
-            let buffer = ScalarBuffer::<f64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Float64Array::new(buffer, null_buffer)))
-        }
-
-        // Date types
-        DataType::Date32 => {
-            let buffer = ScalarBuffer::<i32>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Date32Array::new(buffer, null_buffer)))
-        }
-        DataType::Date64 => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Date64Array::new(buffer, null_buffer)))
-        }
-
-        // Time types
-        DataType::Time32(TimeUnit::Second) => {
-            let buffer = ScalarBuffer::<i32>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Time32SecondArray::new(buffer, null_buffer)))
-        }
-        DataType::Time32(TimeUnit::Millisecond) => {
-            let buffer = ScalarBuffer::<i32>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Time32MillisecondArray::new(buffer, null_buffer)))
-        }
-        DataType::Time64(TimeUnit::Microsecond) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Time64MicrosecondArray::new(buffer, null_buffer)))
-        }
-        DataType::Time64(TimeUnit::Nanosecond) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(Time64NanosecondArray::new(buffer, null_buffer)))
-        }
-
-        // Timestamp types
-        DataType::Timestamp(TimeUnit::Second, tz) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(TimestampSecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
-        }
-        DataType::Timestamp(TimeUnit::Millisecond, tz) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(TimestampMillisecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(TimestampMicrosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(TimestampNanosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
-        }
-
-        // Duration types
-        DataType::Duration(TimeUnit::Second) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(DurationSecondArray::new(buffer, null_buffer)))
-        }
-        DataType::Duration(TimeUnit::Millisecond) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(DurationMillisecondArray::new(buffer, null_buffer)))
-        }
-        DataType::Duration(TimeUnit::Microsecond) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(DurationMicrosecondArray::new(buffer, null_buffer)))
-        }
-        DataType::Duration(TimeUnit::Nanosecond) => {
-            let buffer = ScalarBuffer::<i64>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(DurationNanosecondArray::new(buffer, null_buffer)))
-        }
-
-        // Interval types
-        DataType::Interval(IntervalUnit::YearMonth) => {
-            let buffer = ScalarBuffer::<i32>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(IntervalYearMonthArray::new(buffer, null_buffer)))
-        }
-        DataType::Interval(IntervalUnit::DayTime) => {
-            let buffer = ScalarBuffer::<IntervalDayTime>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(IntervalDayTimeArray::new(buffer, null_buffer)))
-        }
-        DataType::Interval(IntervalUnit::MonthDayNano) => {
-            // MonthDayNano is 16 bytes: i32 months, i32 days, i64 nanoseconds
-            let buffer = ScalarBuffer::<IntervalMonthDayNano>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(IntervalMonthDayNanoArray::new(buffer, null_buffer)))
-        }
-
-        // Decimal types
-        DataType::Decimal128(precision, scale) => {
-            let buffer = ScalarBuffer::<i128>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(
-                Decimal128Array::new(buffer, null_buffer)
-                    .with_precision_and_scale(*precision, *scale)?,
-            ))
-        }
-        DataType::Decimal256(precision, scale) => {
-            let buffer = ScalarBuffer::<i256>::from(Buffer::from(buffer_set.primary.clone()));
-            Ok(Arc::new(
-                Decimal256Array::new(buffer, null_buffer)
-                    .with_precision_and_scale(*precision, *scale)?,
-            ))
-        }
-
-        // Fixed-size binary
-        DataType::FixedSizeBinary(size) => {
-            let buffer = Buffer::from(buffer_set.primary.clone());
-            Ok(Arc::new(FixedSizeBinaryArray::new(*size, buffer, null_buffer)))
-        }
-
-        // Variable-length string (UTF-8)
-        DataType::Utf8 => {
-            let offsets_buffer = Buffer::from(buffer_set.primary.clone());
-            let data_buffer = Buffer::from(
-                buffer_set
-                    .secondary
-                    .as_ref()
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("Utf8 requires data buffer".into()))?
-                    .clone(),
-            );
-
-            // Build OffsetBuffer from i32 offsets
-            let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
-
-            Ok(Arc::new(StringArray::new(offsets, data_buffer, null_buffer)))
-        }
-
-        // Large string (i64 offsets)
-        DataType::LargeUtf8 => {
-            let offsets_buffer = Buffer::from(buffer_set.primary.clone());
-            let data_buffer = Buffer::from(
-                buffer_set
-                    .secondary
-                    .as_ref()
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("LargeUtf8 requires data buffer".into()))?
-                    .clone(),
-            );
-
-            let offsets = OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets_buffer));
-
-            Ok(Arc::new(LargeStringArray::new(offsets, data_buffer, null_buffer)))
-        }
-
-        // Variable-length binary
-        DataType::Binary => {
-            let offsets_buffer = Buffer::from(buffer_set.primary.clone());
-            let data_buffer = Buffer::from(
-                buffer_set
-                    .secondary
-                    .as_ref()
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("Binary requires data buffer".into()))?
-                    .clone(),
-            );
-
-            let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
-
-            Ok(Arc::new(BinaryArray::new(offsets, data_buffer, null_buffer)))
-        }
-
-        // Large binary (i64 offsets)
-        DataType::LargeBinary => {
-            let offsets_buffer = Buffer::from(buffer_set.primary.clone());
-            let data_buffer = Buffer::from(
-                buffer_set
-                    .secondary
-                    .as_ref()
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("LargeBinary requires data buffer".into()))?
-                    .clone(),
-            );
-
-            let offsets = OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets_buffer));
-
-            Ok(Arc::new(LargeBinaryArray::new(offsets, data_buffer, null_buffer)))
-        }
-
-        // Unsupported types
-        // Avro enum → Dictionary(Int32, Utf8): JIT decodes the i32 index; values
-        // come from the avro.enum.symbols field metadata.
-        DataType::Dictionary(k, v)
-            if matches!(k.as_ref(), DataType::Int32) && matches!(v.as_ref(), DataType::Utf8) =>
-        {
-            let keys = ScalarBuffer::<i32>::from(Buffer::from(buffer_set.primary.clone()));
-            build_enum_dictionary(field, keys, null_buffer)
-        }
-
-        _ => Err(ArrowError::NotYetImplemented(format!(
-            "buffer_to_array does not yet support {:?}",
-            data_type
-        ))),
-    }
+    buffer_to_array_owned(
+        field,
+        BufferSet {
+            primary: buffer_set.primary.clone(),
+            secondary: buffer_set.secondary.clone(),
+            validity: buffer_set.validity.clone(),
+            primary_len: buffer_set.primary_len,
+            secondary_len: buffer_set.secondary_len,
+        },
+        row_count,
+    )
 }
 
 /// Convert a single column's buffers to an Arrow ArrayRef (zero-copy, consumes BufferSet)
@@ -954,9 +836,20 @@ pub fn buffer_to_array(
 /// Arrow ArrayRef wrapping the buffer data (zero-copy)
 pub fn buffer_to_array_owned(
     field: &Field,
-    buffer_set: BufferSet,
+    mut buffer_set: BufferSet,
     row_count: usize,
 ) -> Result<ArrayRef, ArrowError> {
+    let (primary_len, data_len) = used_lengths(
+        field,
+        &buffer_set.primary,
+        buffer_set.secondary.as_deref(),
+        buffer_set.validity.as_deref(),
+        row_count,
+    )?;
+    buffer_set.primary.truncate(primary_len);
+    if let (Some(data), Some(len)) = (&mut buffer_set.secondary, data_len) {
+        data.truncate(len);
+    }
     let data_type = field.data_type();
 
     // Extract validity first (before consuming other buffers)
@@ -1066,22 +959,30 @@ pub fn buffer_to_array_owned(
         DataType::Timestamp(TimeUnit::Second, tz) => {
             let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(TimestampSecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+            Ok(Arc::new(
+                TimestampSecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone()),
+            ))
         }
         DataType::Timestamp(TimeUnit::Millisecond, tz) => {
             let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(TimestampMillisecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+            Ok(Arc::new(
+                TimestampMillisecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone()),
+            ))
         }
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(TimestampMicrosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+            Ok(Arc::new(
+                TimestampMicrosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone()),
+            ))
         }
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
             let buffer = ScalarBuffer::<i64>::from(Buffer::from_vec(buffer_set.primary));
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(TimestampNanosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone())))
+            Ok(Arc::new(
+                TimestampNanosecondArray::new(buffer, null_buffer).with_timezone_opt(tz.clone()),
+            ))
         }
 
         // Duration types
@@ -1113,14 +1014,19 @@ pub fn buffer_to_array_owned(
             Ok(Arc::new(IntervalYearMonthArray::new(buffer, null_buffer)))
         }
         DataType::Interval(IntervalUnit::DayTime) => {
-            let buffer = ScalarBuffer::<IntervalDayTime>::from(Buffer::from_vec(buffer_set.primary));
+            let buffer =
+                ScalarBuffer::<IntervalDayTime>::from(Buffer::from_vec(buffer_set.primary));
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
             Ok(Arc::new(IntervalDayTimeArray::new(buffer, null_buffer)))
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
-            let buffer = ScalarBuffer::<IntervalMonthDayNano>::from(Buffer::from_vec(buffer_set.primary));
+            let buffer =
+                ScalarBuffer::<IntervalMonthDayNano>::from(Buffer::from_vec(buffer_set.primary));
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(IntervalMonthDayNanoArray::new(buffer, null_buffer)))
+            Ok(Arc::new(IntervalMonthDayNanoArray::new(
+                buffer,
+                null_buffer,
+            )))
         }
 
         // Decimal types
@@ -1145,59 +1051,71 @@ pub fn buffer_to_array_owned(
         DataType::FixedSizeBinary(size) => {
             let buffer = Buffer::from_vec(buffer_set.primary);
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(FixedSizeBinaryArray::new(*size, buffer, null_buffer)))
+            Ok(Arc::new(FixedSizeBinaryArray::try_new(
+                *size,
+                buffer,
+                null_buffer,
+            )?))
         }
 
         // Variable-length string (UTF-8)
         DataType::Utf8 => {
             let offsets_buffer = Buffer::from_vec(buffer_set.primary);
-            let data_buffer = Buffer::from_vec(
-                buffer_set
-                    .secondary
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("Utf8 requires data buffer".into()))?,
-            );
+            let data_buffer = Buffer::from_vec(buffer_set.secondary.ok_or_else(|| {
+                ArrowError::InvalidArgumentError("Utf8 requires data buffer".into())
+            })?);
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
             let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
-            Ok(Arc::new(StringArray::new(offsets, data_buffer, null_buffer)))
+            Ok(Arc::new(StringArray::try_new(
+                offsets,
+                data_buffer,
+                null_buffer,
+            )?))
         }
 
         // Large string (i64 offsets)
         DataType::LargeUtf8 => {
             let offsets_buffer = Buffer::from_vec(buffer_set.primary);
-            let data_buffer = Buffer::from_vec(
-                buffer_set
-                    .secondary
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("LargeUtf8 requires data buffer".into()))?,
-            );
+            let data_buffer = Buffer::from_vec(buffer_set.secondary.ok_or_else(|| {
+                ArrowError::InvalidArgumentError("LargeUtf8 requires data buffer".into())
+            })?);
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
             let offsets = OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets_buffer));
-            Ok(Arc::new(LargeStringArray::new(offsets, data_buffer, null_buffer)))
+            Ok(Arc::new(LargeStringArray::try_new(
+                offsets,
+                data_buffer,
+                null_buffer,
+            )?))
         }
 
         // Variable-length binary
         DataType::Binary => {
             let offsets_buffer = Buffer::from_vec(buffer_set.primary);
-            let data_buffer = Buffer::from_vec(
-                buffer_set
-                    .secondary
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("Binary requires data buffer".into()))?,
-            );
+            let data_buffer = Buffer::from_vec(buffer_set.secondary.ok_or_else(|| {
+                ArrowError::InvalidArgumentError("Binary requires data buffer".into())
+            })?);
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
             let offsets = OffsetBuffer::new(ScalarBuffer::<i32>::from(offsets_buffer));
-            Ok(Arc::new(BinaryArray::new(offsets, data_buffer, null_buffer)))
+            Ok(Arc::new(BinaryArray::try_new(
+                offsets,
+                data_buffer,
+                null_buffer,
+            )?))
         }
 
         // Large binary (i64 offsets)
         DataType::LargeBinary => {
             let offsets_buffer = Buffer::from_vec(buffer_set.primary);
-            let data_buffer = Buffer::from_vec(
-                buffer_set
-                    .secondary
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("LargeBinary requires data buffer".into()))?,
-            );
+            let data_buffer = Buffer::from_vec(buffer_set.secondary.ok_or_else(|| {
+                ArrowError::InvalidArgumentError("LargeBinary requires data buffer".into())
+            })?);
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
             let offsets = OffsetBuffer::new(ScalarBuffer::<i64>::from(offsets_buffer));
-            Ok(Arc::new(LargeBinaryArray::new(offsets, data_buffer, null_buffer)))
+            Ok(Arc::new(LargeBinaryArray::try_new(
+                offsets,
+                data_buffer,
+                null_buffer,
+            )?))
         }
 
         // List<scalar>: the JIT writes i32 element-indexed offsets (primary) and
@@ -1220,16 +1138,22 @@ pub fn buffer_to_array_owned(
             data.truncate(total_elems * elem_size);
             let child = buffer_to_array_owned(
                 child_field,
-                BufferSet { primary: data, secondary: None, validity: None, primary_len: 0, secondary_len: 0 },
+                BufferSet {
+                    primary: data,
+                    secondary: None,
+                    validity: None,
+                    primary_len: 0,
+                    secondary_len: 0,
+                },
                 total_elems,
             )?;
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(ListArray::new(
+            Ok(Arc::new(ListArray::try_new(
                 child_field.clone(),
                 OffsetBuffer::new(offsets_sb),
                 child,
                 null_buffer,
-            )))
+            )?))
         }
 
         // Struct<scalar children>: the JIT packs children row-major into ONE
@@ -1261,13 +1185,23 @@ pub fn buffer_to_array_owned(
                 }
                 children.push(buffer_to_array_owned(
                     f,
-                    BufferSet { primary: child_buf, secondary: None, validity: None, primary_len: 0, secondary_len: 0 },
+                    BufferSet {
+                        primary: child_buf,
+                        secondary: None,
+                        validity: None,
+                        primary_len: 0,
+                        secondary_len: 0,
+                    },
                     row_count,
                 )?);
                 field_off += s;
             }
             let null_buffer = BufferSet::into_null_buffer(validity, row_count);
-            Ok(Arc::new(StructArray::new(child_fields.clone(), children, null_buffer)))
+            Ok(Arc::new(StructArray::try_new(
+                child_fields.clone(),
+                children,
+                null_buffer,
+            )?))
         }
 
         // Unsupported types
@@ -1348,7 +1282,7 @@ pub fn buffers_to_batch_owned(
     let arrays: Result<Vec<ArrayRef>, ArrowError> = schema
         .fields()
         .iter()
-        .zip(buffer_sets.into_iter())
+        .zip(buffer_sets)
         .map(|(field, buffer_set)| buffer_to_array_owned(field, buffer_set, row_count))
         .collect();
 
@@ -1375,7 +1309,7 @@ pub fn allocate_buffer_sets(
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let slot = decoder.buffer_slot(col_idx).unwrap();
         let nullable = field.is_nullable();
-        let validity_bytes = if nullable { (row_count + 7) / 8 } else { 0 };
+        let validity_bytes = if nullable { row_count.div_ceil(8) } else { 0 };
 
         let buffer_set = if slot.secondary.is_some() {
             // Variable-length column
@@ -1606,12 +1540,20 @@ mod tests {
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 2);
 
-        let id_array = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let id_array = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
         assert_eq!(id_array.value(0), 10);
         assert_eq!(id_array.value(1), 20);
         assert_eq!(id_array.value(2), 30);
 
-        let score_array = batch.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
+        let score_array = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
         assert!((score_array.value(0) - 1.1).abs() < f64::EPSILON);
         assert!((score_array.value(1) - 2.2).abs() < f64::EPSILON);
         assert!((score_array.value(2) - 3.3).abs() < f64::EPSILON);

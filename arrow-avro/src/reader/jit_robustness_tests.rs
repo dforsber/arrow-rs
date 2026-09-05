@@ -56,8 +56,12 @@ fn test_empty_input_int64() {
     let mut ptrs = vec![output.as_mut_ptr()];
 
     // Trying to decode 1 row from empty input should fail
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for empty input, got {:?}", result);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for empty input, got {:?}",
+        result
+    );
 }
 
 #[test]
@@ -70,8 +74,12 @@ fn test_empty_input_zero_rows() {
     let mut ptrs = vec![output.as_mut_ptr()];
 
     // Decoding 0 rows from empty input should succeed
-    let result = decoder.decode(&data, &mut ptrs, 0);
-    assert!(result.is_ok(), "Expected success for zero rows, got {:?}", result);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 0) };
+    assert!(
+        result.is_ok(),
+        "Expected success for zero rows, got {:?}",
+        result
+    );
     assert_eq!(result.unwrap(), 0);
 }
 
@@ -89,7 +97,7 @@ fn test_truncated_varint_single_byte_missing() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated varint");
 }
 
@@ -103,8 +111,11 @@ fn test_truncated_varint_multi_byte() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated multi-byte varint");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated multi-byte varint"
+    );
 }
 
 #[test]
@@ -117,7 +128,7 @@ fn test_varint_max_bytes_exceeded() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for overlong varint");
 }
 
@@ -135,7 +146,7 @@ fn test_truncated_float32() {
     let mut output = vec![0u8; 4];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated Float32");
 }
 
@@ -149,7 +160,7 @@ fn test_truncated_float64() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated Float64");
 }
 
@@ -163,7 +174,7 @@ fn test_truncated_boolean() {
     let mut output = vec![0u8; 1];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated Boolean");
 }
 
@@ -184,8 +195,11 @@ fn test_truncated_bytes_length_only() {
     let mut output = vec![0u8; 128];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated bytes (length only)");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated bytes (length only)"
+    );
 }
 
 #[test]
@@ -201,8 +215,11 @@ fn test_truncated_bytes_partial_data() {
     let mut output = vec![0u8; 128];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated bytes (partial data)");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated bytes (partial data)"
+    );
 }
 
 #[test]
@@ -217,7 +234,7 @@ fn test_negative_bytes_length() {
     let mut output = vec![0u8; 128];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for negative bytes length");
 }
 
@@ -234,7 +251,7 @@ fn test_truncated_string() {
     let mut output = vec![0u8; 128];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated string");
 }
 
@@ -244,9 +261,11 @@ fn test_truncated_string() {
 
 #[test]
 fn test_truncated_fixed_binary() {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("v", DataType::FixedSizeBinary(16), false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "v",
+        DataType::FixedSizeBinary(16),
+        false,
+    )]));
     let decoder = JitDecoder::compile(&schema).expect("compile");
 
     // Fixed 16 bytes, provide only 10
@@ -254,8 +273,11 @@ fn test_truncated_fixed_binary() {
     let mut output = vec![0u8; 16];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated FixedSizeBinary");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated FixedSizeBinary"
+    );
 }
 
 // =============================================================================
@@ -275,7 +297,7 @@ fn test_truncated_second_row() {
     let mut output = vec![0u8; 16]; // Space for 2 rows
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 2);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 2) };
     assert!(result.is_err(), "Expected error for truncated second row");
 }
 
@@ -294,7 +316,7 @@ fn test_truncated_middle_of_many_rows() {
     let mut output = vec![0u8; 48]; // Space for 6 rows
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 6);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 6) };
     assert!(result.is_err(), "Expected error for truncated 6th row");
 }
 
@@ -317,7 +339,7 @@ fn test_truncated_multi_column_first_field() {
     let mut output_b = vec![0u8; 8];
     let mut ptrs = vec![output_a.as_mut_ptr(), output_b.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated first field");
 }
 
@@ -338,7 +360,7 @@ fn test_truncated_multi_column_second_field() {
     let mut output_b = vec![0u8; 8];
     let mut ptrs = vec![output_a.as_mut_ptr(), output_b.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated second field");
 }
 
@@ -352,7 +374,11 @@ fn test_unsupported_type_int8() {
     let result = JitDecoder::compile(&schema);
     assert!(result.is_err(), "Expected compile error for Int8");
     let err = result.err().unwrap();
-    assert!(err.contains("Unsupported"), "Error should mention 'Unsupported': {}", err);
+    assert!(
+        err.contains("Unsupported"),
+        "Error should mention 'Unsupported': {}",
+        err
+    );
 }
 
 #[test]
@@ -385,7 +411,10 @@ fn test_unsupported_nested_type() {
         false,
     )]));
     let result = JitDecoder::compile(&schema);
-    assert!(result.is_err(), "Expected compile error for nested unsupported type");
+    assert!(
+        result.is_err(),
+        "Expected compile error for nested unsupported type"
+    );
 }
 
 // =============================================================================
@@ -403,7 +432,7 @@ fn test_valid_single_int64() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid Int64");
 
     let value = i64::from_le_bytes(output[..8].try_into().unwrap());
@@ -415,16 +444,16 @@ fn test_valid_float64() {
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
     let decoder = JitDecoder::compile(&schema).expect("compile");
 
-    let data = 3.14159f64.to_le_bytes().to_vec();
+    let data = 3.125f64.to_le_bytes().to_vec();
 
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid Float64");
 
     let value = f64::from_le_bytes(output[..8].try_into().unwrap());
-    assert!((value - 3.14159).abs() < 1e-10);
+    assert!((value - 3.125).abs() < 1e-10);
 }
 
 #[test]
@@ -440,7 +469,7 @@ fn test_valid_bytes() {
     let mut output = vec![0u8; 128];
     let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid Binary");
 }
 
@@ -457,7 +486,7 @@ fn test_valid_multi_row() {
     let mut output = vec![0u8; 800]; // 100 rows * 8 bytes
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 100);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 100) };
     assert!(result.is_ok(), "Expected success for 100 valid rows");
 
     // Verify all values
@@ -473,7 +502,7 @@ fn test_valid_multi_row() {
 // =============================================================================
 
 #[test]
-fn test_union_truncated_type_tag() {
+fn test_reject_union_schema() {
     use arrow_schema::UnionFields;
 
     let union_fields = UnionFields::new(
@@ -488,75 +517,7 @@ fn test_union_truncated_type_tag() {
         DataType::Union(union_fields, arrow_schema::UnionMode::Dense),
         false,
     )]));
-    let decoder = JitDecoder::compile(&schema).expect("compile");
-
-    // Truncated type tag varint
-    let data: Vec<u8> = vec![0x80];
-    let mut output = vec![0u8; 16];
-    let mut ptrs = vec![output.as_mut_ptr()];
-
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated union type tag");
-}
-
-#[test]
-fn test_union_truncated_value() {
-    use arrow_schema::UnionFields;
-
-    let union_fields = UnionFields::new(
-        vec![0, 1],
-        vec![
-            Field::new("int", DataType::Int64, false),
-            Field::new("float", DataType::Float64, false),
-        ],
-    );
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "u",
-        DataType::Union(union_fields, arrow_schema::UnionMode::Dense),
-        false,
-    )]));
-    let decoder = JitDecoder::compile(&schema).expect("compile");
-
-    // Type tag says Float64 (index 1), but value is truncated
-    let mut data = Vec::new();
-    encode_raw_varint(&mut data, 1); // Select Float64 variant (raw varint, no zigzag)
-    data.extend_from_slice(&[0x00; 4]); // Only 4 bytes, need 8
-
-    let mut output = vec![0u8; 16];
-    let mut ptrs = vec![output.as_mut_ptr()];
-
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated union value");
-}
-
-#[test]
-fn test_union_valid() {
-    use arrow_schema::UnionFields;
-
-    let union_fields = UnionFields::new(
-        vec![0, 1],
-        vec![
-            Field::new("int", DataType::Int64, false),
-            Field::new("float", DataType::Float64, false),
-        ],
-    );
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "u",
-        DataType::Union(union_fields, arrow_schema::UnionMode::Dense),
-        false,
-    )]));
-    let decoder = JitDecoder::compile(&schema).expect("compile");
-
-    // Type tag = 0 (Int64), followed by varint value
-    let mut data = Vec::new();
-    encode_raw_varint(&mut data, 0); // Select Int64 variant (raw varint, no zigzag)
-    encode_varint(&mut data, 42); // Value (zigzag encoded)
-
-    let mut output = vec![0u8; 16];
-    let mut ptrs = vec![output.as_mut_ptr()];
-
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_ok(), "Expected success for valid union");
+    assert!(JitDecoder::compile(&schema).is_err());
 }
 
 // =============================================================================
@@ -564,43 +525,13 @@ fn test_union_valid() {
 // =============================================================================
 
 #[test]
-fn test_fixed_size_list_truncated() {
+fn test_reject_fixed_size_list_schema() {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "l",
         DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, false)), 3),
         false,
     )]));
-    let decoder = JitDecoder::compile(&schema).expect("compile");
-
-    // Need 3 * 8 = 24 bytes, provide only 16
-    let data: Vec<u8> = vec![0x00; 16];
-    let mut output = vec![0u8; 24];
-    let mut ptrs = vec![output.as_mut_ptr()];
-
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated FixedSizeList");
-}
-
-#[test]
-fn test_fixed_size_list_valid() {
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "l",
-        DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float64, false)), 3),
-        false,
-    )]));
-    let decoder = JitDecoder::compile(&schema).expect("compile");
-
-    // 3 Float64 values = 24 bytes
-    let mut data = Vec::new();
-    data.extend_from_slice(&1.0f64.to_le_bytes());
-    data.extend_from_slice(&2.0f64.to_le_bytes());
-    data.extend_from_slice(&3.0f64.to_le_bytes());
-
-    let mut output = vec![0u8; 24];
-    let mut ptrs = vec![output.as_mut_ptr()];
-
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_ok(), "Expected success for valid FixedSizeList");
+    assert!(JitDecoder::compile(&schema).is_err());
 }
 
 // =============================================================================
@@ -621,7 +552,7 @@ fn test_enum_truncated_index() {
     let mut output = vec![0u8; 4];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated enum index");
 }
 
@@ -641,7 +572,7 @@ fn test_enum_valid() {
     let mut output = vec![0u8; 4];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid enum");
 }
 
@@ -663,7 +594,7 @@ fn test_duration_truncated() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated Duration");
 }
 
@@ -683,7 +614,7 @@ fn test_duration_valid() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid Duration");
 }
 
@@ -705,8 +636,11 @@ fn test_interval_year_month_truncated() {
     let mut output = vec![0u8; 4];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated YearMonth Interval");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated YearMonth Interval"
+    );
 }
 
 #[test]
@@ -723,8 +657,11 @@ fn test_interval_day_time_truncated() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated DayTime Interval");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated DayTime Interval"
+    );
 }
 
 #[test]
@@ -741,8 +678,11 @@ fn test_interval_month_day_nano_truncated() {
     let mut output = vec![0u8; 16];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated MonthDayNano Interval");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated MonthDayNano Interval"
+    );
 }
 
 #[test]
@@ -759,7 +699,7 @@ fn test_interval_valid() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid Interval");
 }
 
@@ -778,7 +718,7 @@ fn test_nullable_truncated_tag() {
     let mut validity = vec![0u8; 1]; // validity buffer for nullable field
     let mut ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated nullable tag");
 }
 
@@ -795,7 +735,7 @@ fn test_nullable_valid_null() {
     let mut validity = vec![0u8; 1]; // validity buffer for nullable field
     let mut ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid null");
 }
 
@@ -813,7 +753,7 @@ fn test_nullable_valid_value() {
     let mut validity = vec![0u8; 1]; // validity buffer for nullable field
     let mut ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid nullable value");
 }
 
@@ -831,8 +771,11 @@ fn test_nullable_truncated_value_after_tag() {
     let mut validity = vec![0u8; 1]; // validity buffer for nullable field
     let mut ptrs = vec![output.as_mut_ptr(), validity.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated value after null tag");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated value after null tag"
+    );
 }
 
 // =============================================================================
@@ -856,8 +799,11 @@ fn test_struct_truncated_first_field() {
     let mut output = vec![0u8; 16];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated struct first field");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated struct first field"
+    );
 }
 
 #[test]
@@ -880,8 +826,11 @@ fn test_struct_truncated_second_field() {
     let mut output = vec![0u8; 16];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated struct second field");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated struct second field"
+    );
 }
 
 #[test]
@@ -898,12 +847,12 @@ fn test_struct_valid() {
 
     let mut data = Vec::new();
     encode_varint(&mut data, 123); // Field 'a'
-    data.extend_from_slice(&3.14f64.to_le_bytes()); // Field 'b'
+    data.extend_from_slice(&3.125f64.to_le_bytes()); // Field 'b'
 
     let mut output = vec![0u8; 16];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid struct");
 }
 
@@ -925,8 +874,11 @@ fn test_list_truncated_block_count() {
     let mut output = vec![0u8; 128];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated list block count");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated list block count"
+    );
 }
 
 #[test]
@@ -948,8 +900,11 @@ fn test_list_truncated_elements() {
     let mut output = vec![0u8; 256];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated list elements");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated list elements"
+    );
 }
 
 #[test]
@@ -970,7 +925,7 @@ fn test_list_empty_valid() {
     let mut output = vec![0u8; 128];
     let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for empty list");
 }
 
@@ -979,7 +934,7 @@ fn test_list_empty_valid() {
 // =============================================================================
 
 #[test]
-fn test_map_truncated_block_count() {
+fn test_reject_map_schema() {
     let map_field = Field::new(
         "entries",
         DataType::Struct(Fields::from(vec![
@@ -993,75 +948,7 @@ fn test_map_truncated_block_count() {
         DataType::Map(Arc::new(map_field), false),
         false,
     )]));
-    let decoder = JitDecoder::compile(&schema).expect("compile");
-
-    // Incomplete block count
-    let data: Vec<u8> = vec![0x80];
-    let mut output = vec![0u8; 256];
-    let mut ptrs = vec![output.as_mut_ptr()];
-
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated map block count");
-}
-
-#[test]
-fn test_map_truncated_key() {
-    let map_field = Field::new(
-        "entries",
-        DataType::Struct(Fields::from(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ])),
-        false,
-    );
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "m",
-        DataType::Map(Arc::new(map_field), false),
-        false,
-    )]));
-    let decoder = JitDecoder::compile(&schema).expect("compile");
-
-    // Block count = 1, but key is truncated
-    let mut data = Vec::new();
-    encode_varint(&mut data, 1); // 1 entry
-    encode_varint(&mut data, 10); // Key length = 10
-    data.extend_from_slice(b"short"); // Only 5 bytes, need 10
-
-    let mut output = vec![0u8; 256];
-    let mut ptrs = vec![output.as_mut_ptr()];
-
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated map key");
-}
-
-#[test]
-fn test_map_empty_valid() {
-    let map_field = Field::new(
-        "entries",
-        DataType::Struct(Fields::from(vec![
-            Field::new("key", DataType::Utf8, false),
-            Field::new("value", DataType::Int64, false),
-        ])),
-        false,
-    );
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "m",
-        DataType::Map(Arc::new(map_field), false),
-        false,
-    )]));
-    let decoder = JitDecoder::compile(&schema).expect("compile");
-
-    // Empty map
-    let mut data = Vec::new();
-    encode_varint(&mut data, 0); // 0 entries
-
-    // Variable-length types require 2 buffers: offsets + data
-    let mut offsets = vec![0u8; 8]; // 2 offsets (row_count + 1) * 4
-    let mut output = vec![0u8; 256];
-    let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
-
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_ok(), "Expected success for empty map");
+    assert!(JitDecoder::compile(&schema).is_err());
 }
 
 // =============================================================================
@@ -1082,7 +969,7 @@ fn test_decimal128_truncated() {
     let mut output = vec![0u8; 16];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated Decimal128");
 }
 
@@ -1100,7 +987,7 @@ fn test_decimal256_truncated() {
     let mut output = vec![0u8; 32];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for truncated Decimal256");
 }
 
@@ -1118,7 +1005,7 @@ fn test_decimal128_valid() {
     let mut output = vec![0u8; 16];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for valid Decimal128");
 }
 
@@ -1140,7 +1027,7 @@ fn test_zero_length_string() {
     let mut output = vec![0u8; 64];
     let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for zero-length string");
 }
 
@@ -1158,7 +1045,7 @@ fn test_zero_length_bytes() {
     let mut output = vec![0u8; 64];
     let mut ptrs = vec![offsets.as_mut_ptr(), output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for zero-length bytes");
 }
 
@@ -1174,7 +1061,7 @@ fn test_max_varint_value() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for max varint value");
 
     let value = i64::from_le_bytes(output[..8].try_into().unwrap());
@@ -1193,7 +1080,7 @@ fn test_min_varint_value() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for min varint value");
 
     let value = i64::from_le_bytes(output[..8].try_into().unwrap());
@@ -1215,7 +1102,7 @@ fn test_exact_input_length() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for exact input length");
     assert_eq!(result.unwrap(), 8);
 }
@@ -1231,7 +1118,7 @@ fn test_one_byte_short() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for one byte short");
 }
 
@@ -1248,7 +1135,7 @@ fn test_large_row_count_insufficient_data() {
     let mut ptrs = vec![output.as_mut_ptr()];
 
     // Try to decode 1000 rows from 1 row of data
-    let result = decoder.decode(&data, &mut ptrs, 1000);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1000) };
     assert!(result.is_err(), "Expected error for insufficient data");
 }
 
@@ -1271,7 +1158,7 @@ fn test_timestamp_empty_input() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_err(), "Expected error for empty timestamp input");
 }
 
@@ -1289,8 +1176,11 @@ fn test_timestamp_truncated_varint() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated timestamp varint");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated timestamp varint"
+    );
 }
 
 #[test]
@@ -1308,7 +1198,7 @@ fn test_timestamp_max_value() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for max timestamp value");
 
     let value = i64::from_le_bytes(output[..8].try_into().unwrap());
@@ -1330,7 +1220,7 @@ fn test_timestamp_min_value() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
     assert!(result.is_ok(), "Expected success for min timestamp value");
 
     let value = i64::from_le_bytes(output[..8].try_into().unwrap());
@@ -1351,8 +1241,11 @@ fn test_timestamp_millisecond_truncated() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_err(), "Expected error for truncated millisecond timestamp");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_err(),
+        "Expected error for truncated millisecond timestamp"
+    );
 }
 
 #[test]
@@ -1378,8 +1271,12 @@ fn test_timestamp_nanosecond_large_values() {
         let mut output = vec![0u8; 8];
         let mut ptrs = vec![output.as_mut_ptr()];
 
-        let result = decoder.decode(&data, &mut ptrs, 1);
-        assert!(result.is_ok(), "Expected success for nanosecond timestamp {}", expected);
+        let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+        assert!(
+            result.is_ok(),
+            "Expected success for nanosecond timestamp {}",
+            expected
+        );
 
         let value = i64::from_le_bytes(output[..8].try_into().unwrap());
         assert_eq!(value, expected, "Nanosecond value mismatch");
@@ -1402,8 +1299,11 @@ fn test_timestamp_with_timezone_robustness() {
     let mut output = vec![0u8; 8];
     let mut ptrs = vec![output.as_mut_ptr()];
 
-    let result = decoder.decode(&data, &mut ptrs, 1);
-    assert!(result.is_ok(), "Expected success for timestamp with timezone");
+    let result = unsafe { decoder.decode(&data, &mut ptrs, 1) };
+    assert!(
+        result.is_ok(),
+        "Expected success for timestamp with timezone"
+    );
 
     let value = i64::from_le_bytes(output[..8].try_into().unwrap());
     assert_eq!(value, 1704067200000000);
@@ -1435,8 +1335,12 @@ fn test_timestamp_all_units_insufficient_data() {
         let mut ptrs = vec![output.as_mut_ptr()];
 
         // Try to decode 100 rows
-        let result = decoder.decode(&data, &mut ptrs, 100);
-        assert!(result.is_err(), "Expected error for {:?} with insufficient data", unit);
+        let result = unsafe { decoder.decode(&data, &mut ptrs, 100) };
+        assert!(
+            result.is_err(),
+            "Expected error for {:?} with insufficient data",
+            unit
+        );
     }
 }
 
@@ -1462,10 +1366,12 @@ fn test_nullable_timestamp_truncated_union_tag() {
         OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
     ];
 
-    let result = decoder.decode_chunked(&data, &output_buffers, 1);
+    let result = unsafe { decoder.decode_chunked(&data, &output_buffers, 1) };
     // Should fail - no data for union tag
-    assert!(!result.is_ok() || result.rows_decoded == 0,
-        "Expected failure or zero rows for truncated nullable timestamp");
+    assert!(
+        !result.is_ok() || result.rows_decoded == 0,
+        "Expected failure or zero rows for truncated nullable timestamp"
+    );
 }
 
 #[test]
@@ -1491,7 +1397,7 @@ fn test_nullable_timestamp_null_value_handling() {
         OutputBuffer::new(validity_buf.as_mut_ptr(), validity_buf.len()),
     ];
 
-    let result = decoder.decode_chunked(&data, &output_buffers, 1);
+    let result = unsafe { decoder.decode_chunked(&data, &output_buffers, 1) };
     assert!(result.is_ok(), "Expected success decoding null timestamp");
     assert_eq!(result.rows_decoded, 1);
 
@@ -1511,7 +1417,7 @@ fn test_nullable_timestamp_null_value_handling() {
 
 #[test]
 fn test_boolean_decode_not_corrupted_byte_vs_bit() {
-    use super::jit_buffer_utils::{buffers_to_batch_owned, BufferSet};
+    use super::jit_buffer_utils::{BufferSet, buffers_to_batch_owned};
     use super::jit_decoder::OutputBuffer;
     use arrow_array::{Array, BooleanArray};
 
@@ -1526,7 +1432,7 @@ fn test_boolean_decode_not_corrupted_byte_vs_bit() {
     let elem = JitDecoder::fixed_size_for_type(&DataType::Boolean).unwrap_or(1);
     let mut bs = BufferSet::new_fixed(row_count * elem);
     let outs = vec![OutputBuffer::new(bs.primary_ptr(), bs.primary.len())];
-    decoder.decode_checked(&data, &outs, row_count).expect("decode");
+    unsafe { decoder.decode_checked(&data, &outs, row_count) }.expect("decode");
 
     let batch = buffers_to_batch_owned(&schema, vec![bs], row_count).expect("to_batch");
     let col = batch
@@ -1536,7 +1442,11 @@ fn test_boolean_decode_not_corrupted_byte_vs_bit() {
         .expect("bool column");
     assert_eq!(col.len(), row_count);
     for (i, &v) in vals.iter().enumerate() {
-        assert_eq!(col.value(i), v, "boolean row {i} corrupted (byte-vs-bit regression)");
+        assert_eq!(
+            col.value(i),
+            v,
+            "boolean row {i} corrupted (byte-vs-bit regression)"
+        );
     }
 }
 
@@ -1547,7 +1457,7 @@ fn test_boolean_decode_not_corrupted_byte_vs_bit() {
 
 #[test]
 fn test_pooled_nested_list_and_struct_roundtrip() {
-    use super::jit_buffer_utils::{pooled_buffers_to_batch_owned, PooledBufferSet};
+    use super::jit_buffer_utils::{PooledBufferSet, pooled_buffers_to_batch_owned};
     use super::jit_decoder::OutputBuffer;
     use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, ListArray, StructArray};
     use arrow_schema::Fields;
@@ -1576,10 +1486,13 @@ fn test_pooled_nested_list_and_struct_roundtrip() {
             let slot = dec.buffer_slot(ci).unwrap();
             outs.push(OutputBuffer::new(bs.primary_ptr(), bs.primary_capacity()));
             if slot.secondary.is_some() {
-                outs.push(OutputBuffer::new(bs.secondary_ptr(), bs.secondary_capacity()));
+                outs.push(OutputBuffer::new(
+                    bs.secondary_ptr(),
+                    bs.secondary_capacity(),
+                ));
             }
         }
-        dec.decode_checked(data, &outs, rows).expect("decode");
+        unsafe { dec.decode_checked(data, &outs, rows) }.expect("decode");
         pooled_buffers_to_batch_owned(schema, sets, rows).expect("convert")
     }
 
@@ -1601,7 +1514,11 @@ fn test_pooled_nested_list_and_struct_roundtrip() {
         encode_varint(&mut d, 0);
     }
     let batch = decode_pooled(&lschema, &d, lists.len());
-    let la = batch.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+    let la = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap();
     for (i, list) in lists.iter().enumerate() {
         let v = la.value(i);
         assert_eq!(
@@ -1617,7 +1534,11 @@ fn test_pooled_nested_list_and_struct_roundtrip() {
         Field::new("b", DataType::Float64, false),
         Field::new("c", DataType::Boolean, false),
     ]);
-    let sschema = Arc::new(Schema::new(vec![Field::new("s", DataType::Struct(sfields), false)]));
+    let sschema = Arc::new(Schema::new(vec![Field::new(
+        "s",
+        DataType::Struct(sfields),
+        false,
+    )]));
     let srows: Vec<(i64, f64, bool)> = vec![(1, 1.5, true), (-9, -2.5, false)];
     let mut sd = Vec::new();
     for (a, b, c) in &srows {
@@ -1626,10 +1547,22 @@ fn test_pooled_nested_list_and_struct_roundtrip() {
         sd.push(if *c { 1 } else { 0 });
     }
     let batch = decode_pooled(&sschema, &sd, srows.len());
-    let sa = batch.column(0).as_any().downcast_ref::<StructArray>().unwrap();
+    let sa = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
     let ac = sa.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    let bc = sa.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
-    let cc = sa.column(2).as_any().downcast_ref::<BooleanArray>().unwrap();
+    let bc = sa
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let cc = sa
+        .column(2)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .unwrap();
     for (i, (a, b, c)) in srows.iter().enumerate() {
         assert_eq!(ac.value(i), *a, "pooled struct.a {i}");
         assert_eq!(bc.value(i), *b, "pooled struct.b {i}");

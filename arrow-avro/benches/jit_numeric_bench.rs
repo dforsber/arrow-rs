@@ -25,7 +25,7 @@
 
 use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -49,7 +49,7 @@ fn gen_decimal128_data(row_count: usize) -> Vec<u8> {
     for i in 0..row_count {
         // Create a 16-byte decimal value
         let val = i as i128;
-        data.extend_from_slice(&val.to_le_bytes());
+        data.extend_from_slice(&val.to_be_bytes());
     }
     data
 }
@@ -106,14 +106,19 @@ fn bench_decimal128(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 16];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 16];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -138,14 +143,19 @@ fn bench_duration(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", unit_name), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 8];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", unit_name),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 8];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -164,14 +174,19 @@ fn bench_interval_year_month(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 4];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 4];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -190,14 +205,19 @@ fn bench_interval_day_time(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 8];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 8];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -216,14 +236,19 @@ fn bench_interval_month_day_nano(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 16];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 16];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();

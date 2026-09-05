@@ -43,7 +43,7 @@ fn test_sequential_creation() {
         let data: Vec<u8> = vec![0]; // Single varint-encoded 0
         let mut output = vec![0u8; 8];
         let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-        if let Err(e) = decoder.decode_checked(&data, &buffers, 1) {
+        if let Err(e) = unsafe { decoder.decode_checked(&data, &buffers, 1) } {
             panic!("Decoder {} failed to decode: {}", i, e);
         }
     }
@@ -59,9 +59,8 @@ fn test_concurrent_creation() {
             thread::spawn(move || {
                 let mut decoders = Vec::new();
                 for i in 0..decoders_per_thread {
-                    let schema = Arc::new(Schema::new(vec![
-                        Field::new("v", DataType::Int64, false),
-                    ]));
+                    let schema =
+                        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
                     match JitDecoder::compile(&schema) {
                         Ok(decoder) => {
                             decoders.push(decoder);
@@ -101,13 +100,20 @@ fn test_concurrent_decode_single_decoder() {
 
                     let mut output = vec![0u8; 8];
                     let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                    decoder.decode_checked(&data, &buffers, 1).expect("decode");
+                    unsafe { decoder.decode_checked(&data, &buffers, 1) }.expect("decode");
 
                     // Verify the result
                     let result = i64::from_le_bytes(output[..8].try_into().unwrap());
-                    assert_eq!(result, value, "Thread {} iteration {} mismatch", thread_id, i);
+                    assert_eq!(
+                        result, value,
+                        "Thread {} iteration {} mismatch",
+                        thread_id, i
+                    );
                 }
-                println!("Thread {} completed {} iterations", thread_id, iterations_per_thread);
+                println!(
+                    "Thread {} completed {} iterations",
+                    thread_id, iterations_per_thread
+                );
             })
         })
         .collect();
@@ -115,7 +121,10 @@ fn test_concurrent_decode_single_decoder() {
     for h in handles {
         h.join().unwrap();
     }
-    println!("Single decoder used from {} threads successfully", num_threads);
+    println!(
+        "Single decoder used from {} threads successfully",
+        num_threads
+    );
 }
 
 fn test_concurrent_decode_multiple_decoders() {
@@ -147,23 +156,28 @@ fn test_concurrent_decode_multiple_decoders() {
 
                     // Generate appropriate test data
                     let (data, output_size) = match decoder_idx {
-                        0 => { // Int32
+                        0 => {
+                            // Int32
                             let mut d = Vec::new();
                             encode_varint(&mut d, i as i64);
                             (d, 4)
                         }
-                        1 => { // Int64
+                        1 => {
+                            // Int64
                             let mut d = Vec::new();
                             encode_varint(&mut d, i as i64);
                             (d, 8)
                         }
-                        2 => { // Float32
+                        2 => {
+                            // Float32
                             ((i as f32).to_le_bytes().to_vec(), 4)
                         }
-                        3 => { // Float64
+                        3 => {
+                            // Float64
                             ((i as f64).to_le_bytes().to_vec(), 8)
                         }
-                        4 => { // Boolean
+                        4 => {
+                            // Boolean
                             (vec![if i % 2 == 0 { 1u8 } else { 0u8 }], 1)
                         }
                         _ => unreachable!(),
@@ -171,10 +185,14 @@ fn test_concurrent_decode_multiple_decoders() {
 
                     let mut output = vec![0u8; output_size];
                     let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                    decoder.decode_checked(&data, &buffers, 1).expect("decode");
+                    unsafe { decoder.decode_checked(&data, &buffers, 1) }.expect("decode");
                 }
-                println!("Thread {} completed {} iterations across {} decoders",
-                         thread_id, iterations_per_thread, decoders.len());
+                println!(
+                    "Thread {} completed {} iterations across {} decoders",
+                    thread_id,
+                    iterations_per_thread,
+                    decoders.len()
+                );
             })
         })
         .collect();
@@ -182,7 +200,10 @@ fn test_concurrent_decode_multiple_decoders() {
     for h in handles {
         h.join().unwrap();
     }
-    println!("Multiple decoders used from {} threads successfully", num_threads);
+    println!(
+        "Multiple decoders used from {} threads successfully",
+        num_threads
+    );
 }
 
 /// Encode a varint (zig-zag + variable length)

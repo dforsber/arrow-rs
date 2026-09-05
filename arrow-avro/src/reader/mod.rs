@@ -8719,3 +8719,6 @@ mod test {
         );
     }
 }
+
+#[cfg(all(test, feature = "jit"))]
+mod jit_regression_tests;

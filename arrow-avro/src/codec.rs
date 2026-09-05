@@ -556,6 +556,7 @@ pub(crate) struct AvroFieldBuilder<'a> {
     reader_schema: Option<&'a Schema<'a>>,
     use_utf8view: bool,
     strict_mode: bool,
+    jit_metadata: bool,
 }
 
 impl<'a> AvroFieldBuilder<'a> {
@@ -566,6 +567,7 @@ impl<'a> AvroFieldBuilder<'a> {
             reader_schema: None,
             use_utf8view: false,
             strict_mode: false,
+            jit_metadata: false,
         }
     }
 
@@ -591,11 +593,18 @@ impl<'a> AvroFieldBuilder<'a> {
         self
     }
 
+    #[cfg(feature = "jit")]
+    pub(crate) fn with_jit_metadata(mut self) -> Self {
+        self.jit_metadata = true;
+        self
+    }
+
     /// Build an [`AvroField`] from the builder
     pub(crate) fn build(self) -> Result<AvroField, ArrowError> {
         match self.writer_schema {
             Schema::Complex(ComplexType::Record(r)) => {
                 let mut resolver = Maker::new(self.use_utf8view, self.strict_mode);
+                resolver.jit_metadata = self.jit_metadata;
                 let data_type =
                     resolver.make_data_type(self.writer_schema, self.reader_schema, None)?;
                 Ok(AvroField {
@@ -1165,6 +1174,7 @@ struct Maker<'a> {
     resolver: Resolver<'a>,
     use_utf8view: bool,
     strict_mode: bool,
+    jit_metadata: bool,
 }
 
 impl<'a> Maker<'a> {
@@ -1173,6 +1183,7 @@ impl<'a> Maker<'a> {
             resolver: Default::default(),
             use_utf8view,
             strict_mode,
+            jit_metadata: false,
         }
     }
 
@@ -1230,6 +1241,11 @@ impl<'a> Maker<'a> {
                     (true, Some(0)) => {
                         let mut field = self.parse_type(&f[1], namespace)?;
                         field.nullability = Some(Nullability::NullFirst);
+                        if self.jit_metadata {
+                            field
+                                .metadata
+                                .insert("avro.union.null_index".into(), "0".into());
+                        }
                         #[cfg(feature = "avro_custom_types")]
                         Self::propagate_nullability_into_ree(&mut field, Nullability::NullFirst);
                         return Ok(field);
@@ -1243,6 +1259,11 @@ impl<'a> Maker<'a> {
                         }
                         let mut field = self.parse_type(&f[0], namespace)?;
                         field.nullability = Some(Nullability::NullSecond);
+                        if self.jit_metadata {
+                            field
+                                .metadata
+                                .insert("avro.union.null_index".into(), "1".into());
+                        }
                         #[cfg(feature = "avro_custom_types")]
                         Self::propagate_nullability_into_ree(&mut field, Nullability::NullSecond);
                         return Ok(field);
@@ -1311,7 +1332,7 @@ impl<'a> Maker<'a> {
                     })
                 }
                 ComplexType::Fixed(f) => {
-                    let size = f.size.try_into().map_err(|e| {
+                    let size: i32 = f.size.try_into().map_err(|e| {
                         ArrowError::ParseError(format!("Overflow converting size to i32: {e}"))
                     })?;
                     let namespace = f.namespace.or(namespace);
@@ -1322,6 +1343,9 @@ impl<'a> Maker<'a> {
                     }
                     let field = match f.attributes.logical_type {
                         Some("decimal") => {
+                            if self.jit_metadata {
+                                metadata.insert("avro.decimal.fixed_size".into(), size.to_string());
+                            }
                             let (precision, scale, _) =
                                 parse_decimal_attributes(&f.attributes, Some(size as usize), true)?;
                             AvroDataType {
@@ -1332,6 +1356,9 @@ impl<'a> Maker<'a> {
                             }
                         }
                         Some("duration") => {
+                            if self.jit_metadata {
+                                metadata.insert("avro.duration".into(), "true".into());
+                            }
                             if size != 12 {
                                 return Err(ArrowError::ParseError(format!(
                                     "Invalid fixed size for Duration: {size}, must be 12"
@@ -1399,9 +1426,11 @@ impl<'a> Maker<'a> {
                         // Mark this as a bytes-backed (length-prefixed) decimal so
                         // the JIT picks the variable-length decode path. fixed(N)
                         // decimals leave this key absent (default = fixed).
-                        field
-                            .metadata
-                            .insert("avro.decimal.encoding".to_string(), "bytes".to_string());
+                        if self.jit_metadata {
+                            field
+                                .metadata
+                                .insert("avro.decimal.encoding".into(), "bytes".into());
+                        }
                     }
                     (Some("date"), c @ Codec::Int32) => *c = Codec::Date32,
                     (Some("time-millis"), c @ Codec::Int32) => *c = Codec::TimeMillis,

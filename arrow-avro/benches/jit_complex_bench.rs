@@ -17,15 +17,15 @@
 
 //! JIT Decoder Benchmark: Complex Types
 //!
-//! Tests: List, Struct, Union, Map
+//! Tests: supported List and Struct layouts
 //! - Single column benchmarks for each type
 //! - Various configurations (list lengths, struct fields, union variants)
 //!
 //! Run with: cargo bench --features jit --bench jit_complex_bench
 
 use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
-use arrow_schema::{DataType, Field, Fields, Schema, UnionFields, UnionMode};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use arrow_schema::{DataType, Field, Fields, Schema};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -44,30 +44,11 @@ fn encode_varint(buf: &mut Vec<u8>, value: i64) {
 }
 
 /// Encode unsigned varint (for union type index)
-fn encode_uvarint(buf: &mut Vec<u8>, value: u64) {
-    let mut v = value;
-    loop {
-        if v < 0x80 {
-            buf.push(v as u8);
-            break;
-        }
-        buf.push((v as u8) | 0x80);
-        v >>= 7;
-    }
-}
-
-/// Encode Avro block count (zigzag-encoded)
 fn encode_block_count(buf: &mut Vec<u8>, count: i64) {
     encode_varint(buf, count);
 }
 
 /// Encode Avro bytes (length + data)
-fn encode_avro_bytes(buf: &mut Vec<u8>, data: &[u8]) {
-    encode_varint(buf, data.len() as i64);
-    buf.extend_from_slice(data);
-}
-
-// Generate list test data with varying list lengths
 fn gen_list_data(row_count: usize, avg_len: usize) -> Vec<u8> {
     let mut data = Vec::new();
     for i in 0..row_count {
@@ -92,36 +73,6 @@ fn gen_struct_data(row_count: usize) -> Vec<u8> {
 }
 
 // Generate union test data (Int64 | Float64)
-fn gen_union_data(row_count: usize) -> Vec<u8> {
-    let mut data = Vec::new();
-    for i in 0..row_count {
-        let variant = (i % 2) as u64;
-        encode_uvarint(&mut data, variant);
-        if variant == 0 {
-            encode_varint(&mut data, i as i64);
-        } else {
-            data.extend_from_slice(&(i as f64).to_le_bytes());
-        }
-    }
-    data
-}
-
-// Generate map test data (string keys -> int64 values)
-fn gen_map_data(row_count: usize, avg_entries: usize) -> Vec<u8> {
-    let mut data = Vec::new();
-    for i in 0..row_count {
-        let num_entries = (avg_entries + (i % 3)) as i64;
-        encode_block_count(&mut data, num_entries);
-        for j in 0..num_entries as usize {
-            let key = format!("key_{}_{}", i, j);
-            encode_avro_bytes(&mut data, key.as_bytes());
-            encode_varint(&mut data, (i * 100 + j) as i64);
-        }
-        encode_block_count(&mut data, 0); // End of map
-    }
-    data
-}
-
 fn bench_list(c: &mut Criterion) {
     let mut group = c.benchmark_group("jit_list");
 
@@ -149,7 +100,7 @@ fn bench_list(c: &mut Criterion) {
                     OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
                     OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
                 ];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
+                let result = unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
                 black_box(result);
             });
         });
@@ -174,104 +125,23 @@ fn bench_struct(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                let mut output = vec![0u8; n * 16];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
-    }
-
-    group.finish();
-}
-
-fn bench_union(c: &mut Criterion) {
-    let mut group = c.benchmark_group("jit_union");
-
-    for row_count in [1_000, 10_000, 100_000] {
-        let union_fields = UnionFields::new(
-            vec![0, 1],
-            vec![
-                Field::new("int_val", DataType::Int64, false),
-                Field::new("float_val", DataType::Float64, false),
-            ],
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    let mut output = vec![0u8; n * 16];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
         );
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "v",
-            DataType::Union(union_fields, UnionMode::Dense),
-            false,
-        )]));
-        let data = gen_union_data(row_count);
-        let decoder = JitDecoder::compile(&schema).expect("compile");
-
-        group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                // Union needs: type_id (1 byte) + offset (4 bytes) + max data (8 bytes)
-                let mut output = vec![0u8; n * 16];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
     }
 
     group.finish();
 }
 
-fn bench_map(c: &mut Criterion) {
-    let mut group = c.benchmark_group("jit_map");
-
-    // Test with different average map sizes
-    for avg_entries in [1, 3, 5] {
-        let row_count = 5_000; // Smaller for maps due to complexity
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "v",
-            DataType::Map(
-                Arc::new(Field::new(
-                    "entries",
-                    DataType::Struct(Fields::from(vec![
-                        Field::new("key", DataType::Utf8, false),
-                        Field::new("value", DataType::Int64, false),
-                    ])),
-                    false,
-                )),
-                false, // keys_sorted
-            ),
-            false,
-        )]));
-        let data = gen_map_data(row_count, avg_entries);
-        let decoder = JitDecoder::compile(&schema).expect("compile");
-
-        group.throughput(Throughput::Elements(row_count as u64));
-        let id = format!("avg_entries_{}", avg_entries);
-        group.bench_with_input(BenchmarkId::new("decode", id), &row_count, |b, &n| {
-            b.iter(|| {
-                // Map requires 2 buffers: offsets (row_count+1 i32s) + data
-                let offsets_size = (n + 1) * 4;
-                let mut offsets = vec![0u8; offsets_size];
-                let data_size = n * (avg_entries + 5) * 64;
-                let mut data_buf = vec![0u8; data_size];
-                let buffers = vec![
-                    OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
-                    OutputBuffer::new(data_buf.as_mut_ptr(), data_buf.len()),
-                ];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
-    }
-
-    group.finish();
-}
-
-criterion_group!(
-    benches,
-    bench_list,
-    bench_struct,
-    bench_union,
-    bench_map,
-);
+criterion_group!(benches, bench_list, bench_struct,);
 criterion_main!(benches);

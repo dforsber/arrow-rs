@@ -25,7 +25,7 @@
 
 use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -51,7 +51,9 @@ fn encode_avro_bytes(buf: &mut Vec<u8>, data: &[u8]) {
 
 // Generate boolean test data
 fn gen_boolean_data(row_count: usize) -> Vec<u8> {
-    (0..row_count).map(|i| if i % 2 == 0 { 1u8 } else { 0u8 }).collect()
+    (0..row_count)
+        .map(|i| if i % 2 == 0 { 1u8 } else { 0u8 })
+        .collect()
 }
 
 // Generate bytes test data with varying lengths
@@ -94,15 +96,20 @@ fn bench_boolean(c: &mut Criterion) {
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
         group.throughput(Throughput::Elements(row_count as u64));
-        group.bench_with_input(BenchmarkId::new("decode", row_count), &row_count, |b, &n| {
-            b.iter(|| {
-                // JIT decoder stores booleans as 1 byte per value (not bit-packed)
-                let mut output = vec![0u8; n];
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
-                black_box(result);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("decode", row_count),
+            &row_count,
+            |b, &n| {
+                b.iter(|| {
+                    // JIT decoder stores booleans as 1 byte per value (not bit-packed)
+                    let mut output = vec![0u8; n];
+                    let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
+                    let result =
+                        unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
+                    black_box(result);
+                });
+            },
+        );
     }
 
     group.finish();
@@ -121,8 +128,12 @@ fn bench_bytes(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new(&id, row_count), &row_count, |b, &n| {
             b.iter(|| {
                 let mut output = vec![0u8; n * (avg_len + 20)]; // Extra space for varying lengths
-                let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
+                let mut offsets = vec![0u8; (n + 1) * 4];
+                let buffers = vec![
+                    OutputBuffer::new(offsets.as_mut_ptr(), offsets.len()),
+                    OutputBuffer::new(output.as_mut_ptr(), output.len()),
+                ];
+                let result = unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
                 black_box(result);
             });
         });
@@ -136,9 +147,11 @@ fn bench_fixed(c: &mut Criterion) {
 
     for fixed_size in [4, 16, 32, 128] {
         let row_count = 10_000;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("v", DataType::FixedSizeBinary(fixed_size), false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::FixedSizeBinary(fixed_size),
+            false,
+        )]));
         let data = gen_fixed_data(row_count, fixed_size as usize);
         let decoder = JitDecoder::compile(&schema).expect("compile");
 
@@ -148,7 +161,7 @@ fn bench_fixed(c: &mut Criterion) {
             b.iter(|| {
                 let mut output = vec![0u8; n * fixed_size as usize];
                 let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
+                let result = unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
                 black_box(result);
             });
         });
@@ -176,7 +189,7 @@ fn bench_enum(c: &mut Criterion) {
             b.iter(|| {
                 let mut output = vec![0u8; n * 4];
                 let buffers = vec![OutputBuffer::new(output.as_mut_ptr(), output.len())];
-                let result = decoder.decode_checked(&data, &buffers, n).expect("decode");
+                let result = unsafe { decoder.decode_checked(&data, &buffers, n) }.expect("decode");
                 black_box(result);
             });
         });
@@ -185,11 +198,5 @@ fn bench_enum(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_boolean,
-    bench_bytes,
-    bench_fixed,
-    bench_enum,
-);
+criterion_group!(benches, bench_boolean, bench_bytes, bench_fixed, bench_enum,);
 criterion_main!(benches);

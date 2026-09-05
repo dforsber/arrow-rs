@@ -44,15 +44,17 @@
 //! Deferred (need richer encoding plumbing, tracked for the next increment):
 //! Decimal128/256 (`apache_avro::Decimal`), Duration (Avro `duration` fixed-12).
 
-use super::jit_buffer_utils::{buffers_to_batch_owned, BufferSet};
+use super::jit_buffer_utils::{BufferSet, buffers_to_batch_owned};
 use super::jit_decoder::{JitDecoder, OutputBuffer};
 use super::record::RecordDecoder;
 use crate::codec::AvroFieldBuilder;
 use crate::schema::Schema as AvroSchema;
-use apache_avro::{to_avro_datum, types::Value, Schema as ApacheSchema};
+use apache_avro::{Schema as ApacheSchema, to_avro_datum, types::Value};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, SchemaRef};
 use proptest::prelude::*;
+#[cfg(feature = "small_decimals")]
+use std::sync::Arc;
 
 /// A generated Avro value. Each variant maps 1:1 to a [`Kind`] and to the Arrow
 /// type the decoders must produce.
@@ -133,20 +135,19 @@ enum Kind {
     /// Avro decimal → Arrow Decimal128 (precision ≤38) / Decimal256 (>38).
     /// `fixed_size`: `None` = bytes-backed (length-prefixed), `Some(n)` =
     /// fixed(n)-backed (the JIT fixed path reads 16/32, so use 16/32).
-    Decimal { precision: usize, scale: usize, fixed_size: Option<usize> },
+    Decimal {
+        precision: usize,
+        scale: usize,
+        fixed_size: Option<usize>,
+    },
     /// Avro enum → Arrow Dictionary(Int32, Utf8). `n` symbols named E0..E{n-1}.
-    Enum { symbols: usize },
+    Enum {
+        symbols: usize,
+    },
     /// Avro array → Arrow List. Element kind is recursive.
     List(Box<Kind>),
     /// Avro record → Arrow Struct. Child kinds are recursive; fields "c0".."cN".
     Struct(Vec<Kind>),
-}
-
-impl Kind {
-    /// True for nested (List/Struct) kinds.
-    fn is_nested(&self) -> bool {
-        matches!(self, Kind::List(_) | Kind::Struct(_))
-    }
 }
 
 impl Kind {
@@ -167,7 +168,11 @@ impl Kind {
             Kind::TsMillis => r#"{"type":"long","logicalType":"timestamp-millis"}"#.into(),
             Kind::TsMicros => r#"{"type":"long","logicalType":"timestamp-micros"}"#.into(),
             Kind::Fixed(n) => format!(r#"{{"type":"fixed","name":"Fx_{name}","size":{n}}}"#),
-            Kind::Decimal { precision, scale, fixed_size } => match fixed_size {
+            Kind::Decimal {
+                precision,
+                scale,
+                fixed_size,
+            } => match fixed_size {
                 None => format!(
                     r#"{{"type":"bytes","logicalType":"decimal","precision":{precision},"scale":{scale}}}"#
                 ),
@@ -183,17 +188,26 @@ impl Kind {
                 )
             }
             Kind::List(elem) => {
-                format!(r#"{{"type":"array","items":{}}}"#, elem.type_json(&format!("{name}I")))
+                format!(
+                    r#"{{"type":"array","items":{}}}"#,
+                    elem.type_json(&format!("{name}I"))
+                )
             }
             Kind::Struct(children) => {
                 let fields: Vec<String> = children
                     .iter()
                     .enumerate()
                     .map(|(j, c)| {
-                        format!(r#"{{"name":"c{j}","type":{}}}"#, c.type_json(&format!("{name}c{j}")))
+                        format!(
+                            r#"{{"name":"c{j}","type":{}}}"#,
+                            c.type_json(&format!("{name}c{j}"))
+                        )
                     })
                     .collect();
-                format!(r#"{{"type":"record","name":"Rec_{name}","fields":[{}]}}"#, fields.join(","))
+                format!(
+                    r#"{{"type":"record","name":"Rec_{name}","fields":[{}]}}"#,
+                    fields.join(",")
+                )
             }
         }
     }
@@ -232,7 +246,11 @@ impl Kind {
             Kind::TsMillis => Scalar::TsMillis(r as i64),
             Kind::TsMicros => Scalar::TsMicros(r as i64),
             Kind::Fixed(n) => Scalar::Fixed((0..*n).map(|_| next_u64(state) as u8).collect()),
-            Kind::Decimal { precision, fixed_size, .. } => {
+            Kind::Decimal {
+                precision,
+                fixed_size,
+                ..
+            } => {
                 // Random i128 within precision (capped at 38 digits → fits i128;
                 // true >i128 Decimal256 values are covered by prop_decimal256_bytes).
                 let hi = next_u64(state) as u128;
@@ -317,6 +335,7 @@ fn encode_rows(json: &str, cols: &[Col], rows: &[Vec<Option<Scalar>>]) -> Vec<u8
 fn reference_decode(json: &str, body: &[u8], rows: usize) -> (RecordBatch, SchemaRef) {
     let avro_schema: AvroSchema = serde_json::from_str(json).expect("serde parse avro schema");
     let field = AvroFieldBuilder::new(&avro_schema)
+        .with_jit_metadata()
         .build()
         .expect("AvroFieldBuilder::build");
     let mut rd = RecordDecoder::try_new_with_options(field.data_type()).expect("RecordDecoder");
@@ -324,6 +343,41 @@ fn reference_decode(json: &str, body: &[u8], rows: usize) -> (RecordBatch, Schem
         rd.decode(body, rows).expect("reference decode");
     }
     let batch = rd.flush().expect("reference flush");
+    #[cfg(feature = "small_decimals")]
+    let batch = {
+        // Compare the same logical values in the JIT's declared 128/256-bit
+        // decimal layout when the interpreted reader selects smaller decimals.
+        fn widen(dt: &DataType) -> DataType {
+            match dt {
+                DataType::Decimal32(p, s) | DataType::Decimal64(p, s) => {
+                    DataType::Decimal128(*p, *s)
+                }
+                DataType::Struct(fields) => DataType::Struct(
+                    fields
+                        .iter()
+                        .map(|f| f.as_ref().clone().with_data_type(widen(f.data_type())))
+                        .collect(),
+                ),
+                DataType::List(f) => DataType::List(Arc::new(
+                    f.as_ref().clone().with_data_type(widen(f.data_type())),
+                )),
+                dt => dt.clone(),
+            }
+        }
+        let fields: Vec<_> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone().with_data_type(widen(f.data_type())))
+            .collect();
+        let columns = batch
+            .columns()
+            .iter()
+            .zip(&fields)
+            .map(|(a, f)| arrow::compute::cast(a, f.data_type()).unwrap())
+            .collect();
+        RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(fields)), columns).unwrap()
+    };
     let schema = batch.schema();
     (batch, schema)
 }
@@ -332,9 +386,10 @@ fn reference_decode(json: &str, body: &[u8], rows: usize) -> (RecordBatch, Schem
 /// production `packed_column_bytes` in `src/kafka/pooled_avro_decoder`.
 fn packed_column_bytes(data_type: &DataType) -> usize {
     match data_type {
-        DataType::Struct(children) => {
-            children.iter().map(|f| packed_column_bytes(f.data_type())).sum()
-        }
+        DataType::Struct(children) => children
+            .iter()
+            .map(|f| packed_column_bytes(f.data_type()))
+            .sum(),
         other => JitDecoder::fixed_size_for_type(other).unwrap_or(8),
     }
 }
@@ -342,7 +397,11 @@ fn packed_column_bytes(data_type: &DataType) -> usize {
 /// JIT decode via `JitDecoder` + `buffers_to_batch_owned`, mirroring the
 /// production allocation in `decode_with_jit`. Returns `Err` for unsupported
 /// shapes (the loud-rejection contract) rather than silently-wrong data.
-fn jit_decode(arrow_schema: &SchemaRef, body: &[u8], rows: usize) -> Result<RecordBatch, ArrowError> {
+fn jit_decode(
+    arrow_schema: &SchemaRef,
+    body: &[u8],
+    rows: usize,
+) -> Result<RecordBatch, ArrowError> {
     let decoder = JitDecoder::compile(arrow_schema)
         .map_err(|e| ArrowError::ComputeError(format!("JIT compile: {e}")))?;
 
@@ -400,9 +459,7 @@ fn jit_decode(arrow_schema: &SchemaRef, body: &[u8], rows: usize) -> Result<Reco
     }
 
     if rows > 0 {
-        decoder
-            .decode_checked(body, &outs, rows)
-            .map_err(ArrowError::ComputeError)?;
+        unsafe { decoder.decode_checked(body, &outs, rows) }.map_err(ArrowError::ComputeError)?;
     }
     buffers_to_batch_owned(arrow_schema, sets, rows)
 }
@@ -606,7 +663,7 @@ fn diff_list_long_pooled_chunked() {
     // and decode cleanly. (The Tier-2 failure that motivated this came from the
     // caller mapping the list child as nullable, compiling the wrong element
     // decoder — see boilstream's ArrowConverter fix.)
-    use super::jit_buffer_utils::{pooled_buffers_to_batch_owned, PooledBufferSet};
+    use super::jit_buffer_utils::{PooledBufferSet, pooled_buffers_to_batch_owned};
     let json = r#"{"type":"record","name":"R","fields":[
         {"name":"l","type":{"type":"array","items":"long"}}]}"#;
     let schema = ApacheSchema::parse_str(json).expect("apache parse");
@@ -628,7 +685,7 @@ fn diff_list_long_pooled_chunked() {
         OutputBuffer::new(bs.primary_ptr(), bs.primary_capacity()),
         OutputBuffer::new(bs.secondary_ptr(), bs.secondary_capacity()),
     ];
-    let res = decoder.decode_chunked(&body, &outs, rows);
+    let res = unsafe { decoder.decode_chunked(&body, &outs, rows) };
     assert_eq!(res.rows_decoded, rows, "chunked decode rows");
     let batch =
         pooled_buffers_to_batch_owned(&arrow_schema, vec![bs], res.rows_decoded).expect("convert");
@@ -641,7 +698,11 @@ fn diff_fixed1_three_rows() {
     // visible here.
     diff_single(
         Kind::Fixed(1),
-        vec![Scalar::Fixed(vec![1]), Scalar::Fixed(vec![2]), Scalar::Fixed(vec![3])],
+        vec![
+            Scalar::Fixed(vec![1]),
+            Scalar::Fixed(vec![2]),
+            Scalar::Fixed(vec![3]),
+        ],
     );
 }
 
@@ -678,8 +739,24 @@ fn diff_decimal128_bytes() {
         {"name":"d","type":{"type":"bytes","logicalType":"decimal","precision":18,"scale":4}}]}"#;
     let schema = ApacheSchema::parse_str(json).expect("apache parse");
     let vals: Vec<i128> = vec![
-        0, 1, -1, 127, 128, -128, -129, 255, 256, -256, 32767, -32768, 65535, -65536, 12_345_678,
-        -12_345_678, 999_999_999_999_999_999, -999_999_999_999_999_999,
+        0,
+        1,
+        -1,
+        127,
+        128,
+        -128,
+        -129,
+        255,
+        256,
+        -256,
+        32767,
+        -32768,
+        65535,
+        -65536,
+        12_345_678,
+        -12_345_678,
+        999_999_999_999_999_999,
+        -999_999_999_999_999_999,
     ];
     let mut body = Vec::new();
     for v in &vals {
@@ -692,7 +769,10 @@ fn diff_decimal128_bytes() {
     let (ref_batch, arrow_schema) = reference_decode(json, &body, vals.len());
     let jit_batch = jit_decode(&arrow_schema, &body, vals.len())
         .unwrap_or_else(|e| panic!("JIT bytes-decimal decode failed: {e}"));
-    assert_eq!(ref_batch, jit_batch, "bytes-backed Decimal128(18,4) JIT vs reference");
+    assert_eq!(
+        ref_batch, jit_batch,
+        "bytes-backed Decimal128(18,4) JIT vs reference"
+    );
 }
 
 #[test]
@@ -714,7 +794,10 @@ fn diff_decimal128_bytes_nullable() {
     let (ref_batch, arrow_schema) = reference_decode(json, &body, vals.len());
     let jit_batch = jit_decode(&arrow_schema, &body, vals.len())
         .unwrap_or_else(|e| panic!("JIT nullable bytes-decimal decode failed: {e}"));
-    assert_eq!(ref_batch, jit_batch, "nullable bytes-backed Decimal128 JIT vs reference");
+    assert_eq!(
+        ref_batch, jit_batch,
+        "nullable bytes-backed Decimal128 JIT vs reference"
+    );
 }
 
 #[test]
@@ -740,13 +823,19 @@ fn diff_decimal256_bytes() {
     let rows = bodies.len();
     let mut body = Vec::new();
     for bytes in &bodies {
-        let rec = Value::Record(vec![("d".into(), Value::Decimal(Decimal::from(bytes.clone())))]);
+        let rec = Value::Record(vec![(
+            "d".into(),
+            Value::Decimal(Decimal::from(bytes.clone())),
+        )]);
         body.extend_from_slice(&to_avro_datum(&schema, rec).expect("encode"));
     }
     let (ref_batch, arrow_schema) = reference_decode(json, &body, rows);
     let jit_batch = jit_decode(&arrow_schema, &body, rows)
         .unwrap_or_else(|e| panic!("JIT bytes-decimal256 decode failed: {e}"));
-    assert_eq!(ref_batch, jit_batch, "bytes-backed Decimal256(76,0) JIT vs reference");
+    assert_eq!(
+        ref_batch, jit_batch,
+        "bytes-backed Decimal256(76,0) JIT vs reference"
+    );
 }
 
 proptest! {
@@ -828,21 +917,14 @@ fn diff_decimal128_fixed16() {
     let (ref_batch, arrow_schema) = reference_decode(json, &body, vals.len());
     let jit_batch = jit_decode(&arrow_schema, &body, vals.len())
         .unwrap_or_else(|e| panic!("JIT decimal(fixed16) decode failed: {e}"));
-    assert_eq!(ref_batch, jit_batch, "Decimal128(10,2) fixed(16) JIT vs reference");
+    assert_eq!(
+        ref_batch, jit_batch,
+        "Decimal128(10,2) fixed(16) JIT vs reference"
+    );
 }
 
 // GAP (documented, not yet supported — found by this oracle):
-// - `bytes`-backed decimal (length-prefixed minimal two's-complement, the more
-//   common Avro decimal encoding) is mis-decoded: emit_decimal128_decode reads a
-//   fixed 16 raw bytes with NO length prefix, so it misreads the varint length
-//   byte as data → bounds violation or silent corruption. boilstream's
-//   ArrowConverter maps all decimals → Decimal128, so a bytes-backed producer
-//   would corrupt. Needs JIT support for length-prefixed decimal bytes, or a
-//   loud rejection of bytes-backed decimals at ingestion.
-// - Avro `duration` (fixed-12: months/days/MILLIS) → Arrow Interval(MonthDayNano):
-//   emit_interval_decode expects 16 Arrow-native bytes (months/days/NANOS), not
-//   the 12-byte Avro layout — incompatible. (boilstream maps Avro fixed→
-//   FixedSizeBinary, so it does not hit this Interval path.)
+// Bytes/fixed decimals and Avro duration now retain their wire metadata.
 
 #[test]
 fn diff_enum() {
@@ -863,7 +945,10 @@ fn diff_enum() {
     let (ref_batch, arrow_schema) = reference_decode(json, &body, idxs.len());
     let jit_batch = jit_decode(&arrow_schema, &body, idxs.len())
         .unwrap_or_else(|e| panic!("JIT enum decode failed: {e}"));
-    assert_eq!(ref_batch, jit_batch, "enum → Dictionary(Int32,Utf8) JIT vs reference");
+    assert_eq!(
+        ref_batch, jit_batch,
+        "enum → Dictionary(Int32,Utf8) JIT vs reference"
+    );
 }
 
 #[test]
@@ -878,7 +963,8 @@ fn diff_struct_with_decimal_and_enum() {
         {"name":"c","type":{"type":"enum","name":"E","symbols":["X","Y","Z"]}}]}}]}"#;
     let schema = ApacheSchema::parse_str(json).expect("apache parse");
     let syms = ["X", "Y", "Z"];
-    let rows: Vec<(i64, i128, i128, u32)> = vec![(1, 12345, 7, 0), (-9, -98765, -1, 2), (0, 0, 0, 1)];
+    let rows: Vec<(i64, i128, i128, u32)> =
+        vec![(1, 12345, 7, 0), (-9, -98765, -1, 2), (0, 0, 0, 1)];
     let mut body = Vec::new();
     for (a, d, f, c) in &rows {
         let rec = Value::Record(vec![(
@@ -886,7 +972,10 @@ fn diff_struct_with_decimal_and_enum() {
             Value::Record(vec![
                 ("a".into(), Value::Long(*a)),
                 ("d".into(), Value::Decimal(Decimal::from(i128_be_min(*d)))),
-                ("f".into(), Value::Decimal(Decimal::from(f.to_be_bytes().to_vec()))),
+                (
+                    "f".into(),
+                    Value::Decimal(Decimal::from(f.to_be_bytes().to_vec())),
+                ),
                 ("c".into(), Value::Enum(*c, syms[*c as usize].to_string())),
             ]),
         )]);
@@ -895,7 +984,10 @@ fn diff_struct_with_decimal_and_enum() {
     let (ref_batch, arrow_schema) = reference_decode(json, &body, rows.len());
     let jit_batch = jit_decode(&arrow_schema, &body, rows.len())
         .unwrap_or_else(|e| panic!("Struct<decimal,enum> decode failed: {e}"));
-    assert_eq!(ref_batch, jit_batch, "Struct<long,decimal,fixed-decimal,enum> JIT vs reference");
+    assert_eq!(
+        ref_batch, jit_batch,
+        "Struct<long,decimal,fixed-decimal,enum> JIT vs reference"
+    );
 }
 
 #[test]
@@ -912,7 +1004,10 @@ fn struct_with_unsupported_child_is_loudly_rejected() {
     ];
     for json in cases {
         let avro_schema: AvroSchema = serde_json::from_str(json).expect("parse");
-        let field = AvroFieldBuilder::new(&avro_schema).build().expect("build");
+        let field = AvroFieldBuilder::new(&avro_schema)
+            .with_jit_metadata()
+            .build()
+            .expect("build");
         let rd = RecordDecoder::try_new_with_options(field.data_type()).expect("rd");
         let arrow_schema = rd.schema().clone();
         assert!(
@@ -932,14 +1027,18 @@ fn diff_list_decimal_and_enum() {
     let lists: Vec<Vec<i128>> = vec![vec![], vec![1, -2, 12345], vec![999; 3]];
     let mut body = Vec::new();
     for l in &lists {
-        let arr =
-            Value::Array(l.iter().map(|v| Value::Decimal(Decimal::from(i128_be_min(*v)))).collect());
+        let arr = Value::Array(
+            l.iter()
+                .map(|v| Value::Decimal(Decimal::from(i128_be_min(*v))))
+                .collect(),
+        );
         body.extend_from_slice(
             &to_avro_datum(&schema_d, Value::Record(vec![("l".into(), arr)])).expect("encode"),
         );
     }
     let (ref_b, sch) = reference_decode(json_d, &body, lists.len());
-    let jit_b = jit_decode(&sch, &body, lists.len()).unwrap_or_else(|e| panic!("List<decimal>: {e}"));
+    let jit_b =
+        jit_decode(&sch, &body, lists.len()).unwrap_or_else(|e| panic!("List<decimal>: {e}"));
     assert_eq!(ref_b, jit_b, "List<decimal> JIT vs reference");
 
     // List<enum>
@@ -951,14 +1050,17 @@ fn diff_list_decimal_and_enum() {
     let mut body2 = Vec::new();
     for l in &elists {
         let arr = Value::Array(
-            l.iter().map(|i| Value::Enum(*i, syms[*i as usize].to_string())).collect(),
+            l.iter()
+                .map(|i| Value::Enum(*i, syms[*i as usize].to_string()))
+                .collect(),
         );
         body2.extend_from_slice(
             &to_avro_datum(&schema_e, Value::Record(vec![("l".into(), arr)])).expect("encode"),
         );
     }
     let (ref_e, sch_e) = reference_decode(json_e, &body2, elists.len());
-    let jit_e = jit_decode(&sch_e, &body2, elists.len()).unwrap_or_else(|e| panic!("List<enum>: {e}"));
+    let jit_e =
+        jit_decode(&sch_e, &body2, elists.len()).unwrap_or_else(|e| panic!("List<enum>: {e}"));
     assert_eq!(ref_e, jit_e, "List<enum> JIT vs reference");
 }
 
@@ -975,7 +1077,10 @@ fn list_with_unsupported_element_is_loudly_rejected() {
     ];
     for json in cases {
         let avro_schema: AvroSchema = serde_json::from_str(json).expect("parse");
-        let field = AvroFieldBuilder::new(&avro_schema).build().expect("build");
+        let field = AvroFieldBuilder::new(&avro_schema)
+            .with_jit_metadata()
+            .build()
+            .expect("build");
         let rd = RecordDecoder::try_new_with_options(field.data_type()).expect("rd");
         let arrow_schema = rd.schema().clone();
         assert!(
@@ -1010,7 +1115,10 @@ fn diff_struct_with_temporal() {
     let (ref_batch, arrow_schema) = reference_decode(json, &body, rows.len());
     let jit_batch = jit_decode(&arrow_schema, &body, rows.len())
         .unwrap_or_else(|e| panic!("Struct<long,date,timestamp> decode failed: {e}"));
-    assert_eq!(ref_batch, jit_batch, "Struct with temporal children JIT vs reference");
+    assert_eq!(
+        ref_batch, jit_batch,
+        "Struct with temporal children JIT vs reference"
+    );
 }
 
 #[test]
@@ -1052,9 +1160,17 @@ fn diff_nullable_scalars_edges() {
     let rows: Vec<Vec<Option<Scalar>>> = vec![
         vec![Some(Scalar::Long(1)), None, Some(Scalar::Bool(true))],
         vec![None, Some(Scalar::Str("x".into())), None],
-        vec![Some(Scalar::Long(-9)), Some(Scalar::Str("".into())), Some(Scalar::Bool(false))],
+        vec![
+            Some(Scalar::Long(-9)),
+            Some(Scalar::Str("".into())),
+            Some(Scalar::Bool(false)),
+        ],
         vec![None, None, None],
-        vec![Some(Scalar::Long(i64::MAX)), Some(Scalar::Str("ünï".into())), Some(Scalar::Bool(true))],
+        vec![
+            Some(Scalar::Long(i64::MAX)),
+            Some(Scalar::Str("ünï".into())),
+            Some(Scalar::Bool(true)),
+        ],
     ];
     assert_diff(&cols, &rows);
 }
@@ -1081,7 +1197,10 @@ fn gate_map_is_loudly_rejected() {
     let schema = ApacheSchema::parse_str(json).expect("apache parse");
     let rec = Value::Record(vec![(
         "m".into(),
-        Value::Map(std::collections::HashMap::from([("k".to_string(), Value::Long(1))])),
+        Value::Map(std::collections::HashMap::from([(
+            "k".to_string(),
+            Value::Long(1),
+        )])),
     )]);
     let body = to_avro_datum(&schema, rec).expect("encode map");
 
@@ -1114,10 +1233,26 @@ fn child_kind_strategy() -> impl Strategy<Value = Kind> {
         Just(Kind::TimeMicros),
         Just(Kind::TsMillis),
         Just(Kind::TsMicros),
-        Just(Kind::Decimal { precision: 38, scale: 0, fixed_size: None }),
-        Just(Kind::Decimal { precision: 76, scale: 0, fixed_size: None }),
-        Just(Kind::Decimal { precision: 38, scale: 0, fixed_size: Some(16) }),
-        Just(Kind::Decimal { precision: 76, scale: 0, fixed_size: Some(32) }),
+        Just(Kind::Decimal {
+            precision: 38,
+            scale: 0,
+            fixed_size: None
+        }),
+        Just(Kind::Decimal {
+            precision: 76,
+            scale: 0,
+            fixed_size: None
+        }),
+        Just(Kind::Decimal {
+            precision: 38,
+            scale: 0,
+            fixed_size: Some(16)
+        }),
+        Just(Kind::Decimal {
+            precision: 76,
+            scale: 0,
+            fixed_size: Some(32)
+        }),
         (1usize..=6).prop_map(|symbols| Kind::Enum { symbols }),
     ]
 }
@@ -1184,7 +1319,7 @@ proptest! {
             .map(|(i, k)| {
                 // Nested columns stay non-nullable (nullable-nested is a separate,
                 // not-yet-supported shape); leaves get random nullability.
-                let nullable = !k.is_nested() && *nullable_flags.get(i).unwrap_or(&false);
+                let nullable = *nullable_flags.get(i).unwrap_or(&false);
                 (k.clone(), nullable)
             })
             .collect();
@@ -1226,7 +1361,7 @@ proptest! {
             .iter()
             .enumerate()
             .map(|(i, k)| {
-                let nullable = !k.is_nested() && *nullable_flags.get(i).unwrap_or(&false);
+                let nullable = *nullable_flags.get(i).unwrap_or(&false);
                 (k.clone(), nullable)
             })
             .collect();

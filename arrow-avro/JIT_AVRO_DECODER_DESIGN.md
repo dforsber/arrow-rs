@@ -1,8 +1,43 @@
+# JIT Avro decoder: current contract
+
+The implementation specializes Avro wire decoding into Cranelift native code.
+Use `JitDecoder::compile_avro` to retain union order, decimal encoding/width,
+and duration metadata. `compile` accepts an Arrow schema with equivalent wire
+metadata supplied by the caller.
+
+Raw-pointer decode methods are unsafe: allocations must be writable, disjoint,
+and valid for their advertised capacities. Checked entry points validate fixed,
+offset, and validity capacities before calling native code. Native code checks
+variable output capacity per string/list block and validates scalar encodings.
+`decode_records_checked` additionally enforces each datum's framing boundary.
+The decoder owns and releases its executable memory.
+
+Supported nested layouts are one-level List/Struct with required, fixed-width
+scalar children; the outer column may be nullable. Map, general Union,
+FixedSizeList, large offsets, nullable nested children, and deeper nesting are
+rejected during compilation. Schema complexity is bounded before code generation.
+
+Buffer assembly trims to decoded lengths and uses fallible Arrow constructors.
+Byte-backed buffers may require alignment copies; Boolean and Struct conversion
+rearranges data. The API does not promise universal zero-copy conversion.
+
+BoilStream uses bounded chunks, overflow-only growth, a bounded connection cache,
+and exact Kafka datum boundaries. Its current contract and test commands live in
+`ingestion-agent/JIT_AVRO_STATUS.md` and `JIT_AVRO_GA_COVERAGE.md`.
+
+## Historical design notes and kernel measurements
+
+The notes below predate the hardening above. Performance tables compare raw JIT
+kernels with an OCF reader that includes schema and array work; they are not
+end-to-end speedup measurements. Use BoilStream's `jit_avro_ingestion_bench` for
+cached Confluent-record-to-Arrow comparisons. Unsupported historical prototypes
+are not part of the current contract.
+
 # JIT-Compiled Avro to Arrow Decoder Design
 
 ## Overview
 
-The JIT Avro decoder uses Cranelift to generate native machine code for Avro-to-Arrow conversion at runtime. The decoder is compiled once per schema and cached for the lifetime of the connection, providing ~5x faster decoding compared to interpreted approaches.
+The JIT Avro decoder uses Cranelift to generate native machine code for Avro-to-Arrow conversion at runtime. The decoder is compiled once per schema and cached for the lifetime of the connection, avoiding per-value interpreted dispatch.
 
 ## Architecture
 

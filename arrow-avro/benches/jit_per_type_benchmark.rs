@@ -30,7 +30,7 @@
 
 use arrow_avro::reader::jit_decoder::{JitDecoder, OutputBuffer};
 use arrow_schema::{DataType, Field, IntervalUnit, Schema, TimeUnit};
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::Arc;
 
@@ -67,18 +67,46 @@ fn bench_all_simple_types(c: &mut Criterion) {
         // Fixed
         Field::new("fixed_col", DataType::FixedSizeBinary(16), false),
         // Enum (Dictionary)
-        Field::new("enum_col", DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)), false),
+        Field::new(
+            "enum_col",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            false,
+        ),
         // Decimal128
         Field::new("decimal_col", DataType::Decimal128(38, 10), false),
         // Duration
-        Field::new("duration_col", DataType::Duration(TimeUnit::Microsecond), false),
+        Field::new(
+            "duration_col",
+            DataType::Duration(TimeUnit::Microsecond),
+            false,
+        ),
         // Interval
-        Field::new("interval_col", DataType::Interval(IntervalUnit::YearMonth), false),
+        Field::new(
+            "interval_col",
+            DataType::Interval(IntervalUnit::YearMonth),
+            false,
+        ),
         // Timestamps - all 4 time units
-        Field::new("ts_micros", DataType::Timestamp(TimeUnit::Microsecond, None), false),
-        Field::new("ts_millis", DataType::Timestamp(TimeUnit::Millisecond, None), false),
-        Field::new("ts_nanos", DataType::Timestamp(TimeUnit::Nanosecond, None), false),
-        Field::new("ts_seconds", DataType::Timestamp(TimeUnit::Second, None), false),
+        Field::new(
+            "ts_micros",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new(
+            "ts_millis",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new(
+            "ts_nanos",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
+        Field::new(
+            "ts_seconds",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        ),
     ]));
 
     // Generate combined data for all types
@@ -118,20 +146,20 @@ fn bench_all_simple_types(c: &mut Criterion) {
 
     group.bench_function("all_simple_types", |b| {
         b.iter(|| {
-            let mut out0 = vec![0u8; ROW_COUNT * 4];     // int32
-            let mut out1 = vec![0u8; ROW_COUNT * 8];     // int64
-            let mut out2 = vec![0u8; ROW_COUNT * 4];     // float32
-            let mut out3 = vec![0u8; ROW_COUNT * 8];     // float64
+            let mut out0 = vec![0u8; ROW_COUNT * 4]; // int32
+            let mut out1 = vec![0u8; ROW_COUNT * 8]; // int64
+            let mut out2 = vec![0u8; ROW_COUNT * 4]; // float32
+            let mut out3 = vec![0u8; ROW_COUNT * 8]; // float64
             let mut out4 = vec![0u8; ROW_COUNT]; // boolean (1 byte per row)
-            let mut out5 = vec![0u8; ROW_COUNT * 16];    // fixed
-            let mut out6 = vec![0u8; ROW_COUNT * 4];     // enum
-            let mut out7 = vec![0u8; ROW_COUNT * 16];    // decimal128
-            let mut out8 = vec![0u8; ROW_COUNT * 8];     // duration
-            let mut out9 = vec![0u8; ROW_COUNT * 4];     // interval
-            let mut out10 = vec![0u8; ROW_COUNT * 8];    // timestamp microseconds
-            let mut out11 = vec![0u8; ROW_COUNT * 8];    // timestamp milliseconds
-            let mut out12 = vec![0u8; ROW_COUNT * 8];    // timestamp nanoseconds
-            let mut out13 = vec![0u8; ROW_COUNT * 8];    // timestamp seconds
+            let mut out5 = vec![0u8; ROW_COUNT * 16]; // fixed
+            let mut out6 = vec![0u8; ROW_COUNT * 4]; // enum
+            let mut out7 = vec![0u8; ROW_COUNT * 16]; // decimal128
+            let mut out8 = vec![0u8; ROW_COUNT * 8]; // duration
+            let mut out9 = vec![0u8; ROW_COUNT * 4]; // interval
+            let mut out10 = vec![0u8; ROW_COUNT * 8]; // timestamp microseconds
+            let mut out11 = vec![0u8; ROW_COUNT * 8]; // timestamp milliseconds
+            let mut out12 = vec![0u8; ROW_COUNT * 8]; // timestamp nanoseconds
+            let mut out13 = vec![0u8; ROW_COUNT * 8]; // timestamp seconds
 
             let buffers = vec![
                 OutputBuffer::new(out0.as_mut_ptr(), out0.len()),
@@ -149,7 +177,8 @@ fn bench_all_simple_types(c: &mut Criterion) {
                 OutputBuffer::new(out12.as_mut_ptr(), out12.len()),
                 OutputBuffer::new(out13.as_mut_ptr(), out13.len()),
             ];
-            let result = decoder.decode_checked(&data, &buffers, ROW_COUNT).expect("decode");
+            let result =
+                unsafe { decoder.decode_checked(&data, &buffers, ROW_COUNT) }.expect("decode");
             black_box(result);
         });
     });
@@ -158,8 +187,5 @@ fn bench_all_simple_types(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_all_simple_types,
-);
+criterion_group!(benches, bench_all_simple_types,);
 criterion_main!(benches);
