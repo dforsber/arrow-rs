@@ -126,27 +126,46 @@ impl CompressionCodec {
     /// [8 bytes]:         uncompressed length
     /// [remaining bytes]: compressed data stream
     /// ```
+    #[cfg(test)]
     pub(crate) fn decompress_to_buffer(&self, input: &Buffer) -> Result<Buffer, ArrowError> {
-        // read the first 8 bytes to determine if the data is
-        // compressed
-        let decompressed_length = read_uncompressed_size(input);
-        let buffer = if decompressed_length == 0 {
-            // empty
-            Buffer::from([])
-        } else if decompressed_length == LENGTH_NO_COMPRESSED_DATA {
-            // no compression
-            input.slice(LENGTH_OF_PREFIX_DATA as usize)
-        } else if let Ok(decompressed_length) = usize::try_from(decompressed_length) {
-            // decompress data using the codec
-            let input_data = &input[(LENGTH_OF_PREFIX_DATA as usize)..];
-            let v = self.decompress(input_data, decompressed_length as _)?;
-            Buffer::from_vec(v)
-        } else {
-            return Err(ArrowError::IpcError(format!(
+        self.decompress_to_buffer_with_limit(input, usize::MAX)
+    }
+
+    /// Decode one IPC buffer within the caller's remaining decoded-byte budget.
+    ///
+    /// This bounds output bytes, not codec-internal history windows or the total
+    /// memory held by other buffers. Callers enforce aggregate admission separately.
+    pub(crate) fn decompress_to_buffer_with_limit(
+        &self,
+        input: &Buffer,
+        max_output_bytes: usize,
+    ) -> Result<Buffer, ArrowError> {
+        let decompressed_length = read_uncompressed_size(input)?;
+        let input_data = &input[(LENGTH_OF_PREFIX_DATA as usize)..];
+        if decompressed_length == LENGTH_NO_COMPRESSED_DATA {
+            if input_data.len() > max_output_bytes {
+                return Err(ArrowError::IpcError(format!(
+                    "Uncompressed IPC buffer length {} exceeds decoded-byte limit {max_output_bytes}",
+                    input_data.len()
+                )));
+            }
+            return Ok(input.slice(LENGTH_OF_PREFIX_DATA as usize));
+        }
+        let decompressed_length = usize::try_from(decompressed_length).map_err(|_| {
+            ArrowError::IpcError(format!(
                 "Invalid uncompressed length: {decompressed_length}"
+            ))
+        })?;
+        if decompressed_length > max_output_bytes {
+            return Err(ArrowError::IpcError(format!(
+                "Uncompressed IPC buffer length {decompressed_length} exceeds decoded-byte limit {max_output_bytes}"
             )));
-        };
-        Ok(buffer)
+        }
+        if decompressed_length == 0 {
+            return Ok(Buffer::from([]));
+        }
+        self.decompress(input_data, decompressed_length)
+            .map(Buffer::from_vec)
     }
 
     /// Compress the data in input buffer and write to output buffer
@@ -172,7 +191,7 @@ impl CompressionCodec {
         };
         if ret.len() != decompressed_size {
             return Err(ArrowError::IpcError(format!(
-                "Expected compressed length of {decompressed_size} got {}",
+                "Expected decompressed length of {decompressed_size} got {}",
                 ret.len()
             )));
         }
@@ -201,10 +220,7 @@ fn compress_lz4(_input: &[u8], _output: &mut Vec<u8>) -> Result<(), ArrowError> 
 
 #[cfg(feature = "lz4")]
 fn decompress_lz4(input: &[u8], decompressed_size: usize) -> Result<Vec<u8>, ArrowError> {
-    use std::io::Read;
-    let mut output = Vec::with_capacity(decompressed_size);
-    lz4_flex::frame::FrameDecoder::new(input).read_to_end(&mut output)?;
-    Ok(output)
+    read_decompressed(lz4_flex::frame::FrameDecoder::new(input), decompressed_size)
 }
 
 #[cfg(not(feature = "lz4"))]
@@ -240,10 +256,7 @@ fn compress_zstd(
 
 #[cfg(feature = "zstd")]
 fn decompress_zstd(input: &[u8], decompressed_size: usize) -> Result<Vec<u8>, ArrowError> {
-    use std::io::Read;
-    let mut output = Vec::with_capacity(decompressed_size);
-    zstd::Decoder::with_buffer(input)?.read_to_end(&mut output)?;
-    Ok(output)
+    read_decompressed(zstd::Decoder::with_buffer(input)?, decompressed_size)
 }
 
 #[cfg(not(feature = "zstd"))]
@@ -254,20 +267,233 @@ fn decompress_zstd(_input: &[u8], _decompressed_size: usize) -> Result<Vec<u8>, 
     ))
 }
 
+/// Grow from observed output, never directly from an untrusted declared length.
+/// The one-byte probe detects an oversized stream without retaining its expansion.
+#[cfg(any(feature = "lz4", feature = "zstd"))]
+fn read_decompressed(
+    mut reader: impl std::io::Read,
+    decompressed_size: usize,
+) -> Result<Vec<u8>, ArrowError> {
+    let mut output = Vec::new();
+    let mut scratch = [0_u8; 8192];
+    loop {
+        let remaining = decompressed_size - output.len();
+        let read_limit = remaining.min(scratch.len()).max(1);
+        let read = match reader.read(&mut scratch[..read_limit]) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if read == 0 {
+            return Ok(output);
+        }
+        if read > remaining {
+            return Err(ArrowError::IpcError(format!(
+                "Decompressed IPC buffer exceeds declared length {decompressed_size}"
+            )));
+        }
+        let required = output.len() + read;
+        if required > output.capacity() {
+            let capacity = output
+                .capacity()
+                .saturating_mul(2)
+                .max(required)
+                .min(decompressed_size);
+            output
+                .try_reserve_exact(capacity - output.len())
+                .map_err(|error| {
+                    ArrowError::MemoryError(format!(
+                        "Cannot allocate IPC decompression output: {error}"
+                    ))
+                })?;
+        }
+        output.extend_from_slice(&scratch[..read]);
+    }
+}
+
 /// Get the uncompressed length
 /// Notes:
 ///   LENGTH_NO_COMPRESSED_DATA: indicate that the data that follows is not compressed
 ///    0: indicate that there is no data
 ///   positive number: indicate the uncompressed length for the following data
 #[inline]
-fn read_uncompressed_size(buffer: &[u8]) -> i64 {
-    let len_buffer = &buffer[0..8];
-    // 64-bit little-endian signed integer
-    i64::from_le_bytes(len_buffer.try_into().unwrap())
+fn read_uncompressed_size(buffer: &[u8]) -> Result<i64, ArrowError> {
+    let prefix = buffer.get(..8).ok_or_else(|| {
+        ArrowError::IpcError(format!(
+            "IPC compression prefix requires 8 bytes, got {}",
+            buffer.len()
+        ))
+    })?;
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(prefix);
+    Ok(i64::from_le_bytes(bytes))
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{CompressionCodec, LENGTH_NO_COMPRESSED_DATA};
+    use arrow_buffer::Buffer;
+
+    #[test]
+    fn r6_short_compression_prefix_is_an_error() {
+        for len in 0..8 {
+            let input = Buffer::from(vec![0_u8; len]);
+            assert!(
+                CompressionCodec::Lz4Frame
+                    .decompress_to_buffer(&input)
+                    .is_err()
+            );
+            assert!(CompressionCodec::Zstd.decompress_to_buffer(&input).is_err());
+        }
+    }
+
+    #[test]
+    fn r6_uncompressed_framing_preserves_zero_copy_and_empty_data() {
+        for codec in [CompressionCodec::Lz4Frame, CompressionCodec::Zstd] {
+            let mut bytes = LENGTH_NO_COMPRESSED_DATA.to_le_bytes().to_vec();
+            bytes.extend_from_slice(b"uncompressed bytes");
+            let input = Buffer::from(bytes);
+            let result = codec.decompress_to_buffer(&input).unwrap();
+            assert_eq!(result.as_slice(), b"uncompressed bytes");
+            assert_eq!(result.as_ptr(), input.as_slice()[8..].as_ptr());
+            let input = Buffer::from(LENGTH_NO_COMPRESSED_DATA.to_le_bytes().to_vec());
+            assert!(codec.decompress_to_buffer(&input).unwrap().is_empty());
+            let input = Buffer::from(0_i64.to_le_bytes().to_vec());
+            assert!(codec.decompress_to_buffer(&input).unwrap().is_empty());
+            let input = Buffer::from((-2_i64).to_le_bytes().to_vec());
+            assert!(codec.decompress_to_buffer(&input).is_err());
+        }
+    }
+
+    #[test]
+    fn r6_explicit_output_limit_checks_uncompressed_and_declared_bytes() {
+        for codec in [CompressionCodec::Lz4Frame, CompressionCodec::Zstd] {
+            let mut input = LENGTH_NO_COMPRESSED_DATA.to_le_bytes().to_vec();
+            input.extend_from_slice(b"1234");
+            let input = Buffer::from(input);
+            assert_eq!(
+                codec
+                    .decompress_to_buffer_with_limit(&input, 4)
+                    .unwrap()
+                    .as_slice(),
+                b"1234"
+            );
+            assert!(codec.decompress_to_buffer_with_limit(&input, 3).is_err());
+            let input = Buffer::from(i64::MAX.to_le_bytes().to_vec());
+            let error = codec
+                .decompress_to_buffer_with_limit(&input, 1024)
+                .unwrap_err();
+            assert!(error.to_string().contains("exceeds decoded-byte limit"));
+        }
+    }
+
+    #[test]
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn r6_stream_expansion_stops_at_declared_length() {
+        use std::io::{self, Read};
+        struct CountingReader {
+            read_bytes: usize,
+            interrupted: bool,
+        }
+        impl Read for CountingReader {
+            fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                output.fill(42);
+                self.read_bytes += output.len();
+                Ok(output.len())
+            }
+        }
+        let mut reader = CountingReader {
+            read_bytes: 0,
+            interrupted: false,
+        };
+        assert!(super::read_decompressed(&mut reader, 17).is_err());
+        assert_eq!(
+            reader.read_bytes, 18,
+            "consume only the declaration and one overflow byte"
+        );
+        struct FailedReader;
+        impl Read for FailedReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::InvalidData, "decoder failed"))
+            }
+        }
+        let error = super::read_decompressed(FailedReader, 17).unwrap_err();
+        assert!(error.to_string().contains("decoder failed"));
+    }
+
+    #[cfg(any(feature = "lz4", feature = "zstd"))]
+    fn check_decompression_boundaries(codec: CompressionCodec) {
+        // Large enough to span many incremental reads, with actual codec framing.
+        let data = vec![42_u8; 131_073];
+        let mut compressed = Vec::new();
+        codec
+            .compress(&data, &mut compressed, &mut Default::default())
+            .unwrap();
+        let framed = |declared: i64| {
+            let mut bytes = declared.to_le_bytes().to_vec();
+            bytes.extend_from_slice(&compressed);
+            Buffer::from(bytes)
+        };
+        assert_eq!(
+            codec
+                .decompress_to_buffer(&framed(data.len() as i64))
+                .unwrap()
+                .as_slice(),
+            data
+        );
+        assert_eq!(
+            codec
+                .decompress_to_buffer_with_limit(&framed(data.len() as i64), data.len())
+                .unwrap()
+                .as_slice(),
+            data
+        );
+        assert!(
+            codec
+                .decompress_to_buffer_with_limit(&framed(data.len() as i64), data.len() - 1)
+                .is_err()
+        );
+        assert!(codec.decompress_to_buffer(&framed(1)).is_err());
+        assert!(
+            codec
+                .decompress_to_buffer(&framed(data.len() as i64 - 1))
+                .is_err()
+        );
+        assert!(
+            codec
+                .decompress_to_buffer(&framed(data.len() as i64 + 1))
+                .is_err()
+        );
+        // A forged length must not become a huge upfront allocation.
+        assert!(codec.decompress_to_buffer(&framed(i64::MAX)).is_err());
+        let mut corrupt = (data.len() as i64).to_le_bytes().to_vec();
+        corrupt.extend_from_slice(&[0xff; 32]);
+        assert!(codec.decompress_to_buffer(&Buffer::from(corrupt)).is_err());
+        let mut truncated = (data.len() as i64).to_le_bytes().to_vec();
+        truncated.extend_from_slice(&compressed[..compressed.len() / 2]);
+        assert!(
+            codec
+                .decompress_to_buffer(&Buffer::from(truncated))
+                .is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "lz4")]
+    fn r6_lz4_decompression_boundaries() {
+        check_decompression_boundaries(CompressionCodec::Lz4Frame);
+    }
+
+    #[test]
+    #[cfg(feature = "zstd")]
+    fn r6_zstd_decompression_boundaries() {
+        check_decompression_boundaries(CompressionCodec::Zstd);
+    }
+
     #[test]
     #[cfg(feature = "lz4")]
     fn test_lz4_compression() {

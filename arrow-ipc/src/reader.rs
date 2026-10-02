@@ -47,6 +47,30 @@ use crate::r#gen::Message::{self};
 use crate::{Block, CONTINUATION_MARKER, FieldNode, MetadataVersion};
 use DataType::*;
 
+/// Validate IPC descriptor ranges before slicing, including projected buffers.
+fn checked_buffer_range(buf: &crate::Buffer, data: &Buffer) -> Result<(usize, usize), ArrowError> {
+    let offset = usize::try_from(buf.offset())
+        .map_err(|_| ArrowError::IpcError("Negative IPC buffer offset".into()))?;
+    let length = usize::try_from(buf.length())
+        .map_err(|_| ArrowError::IpcError("Negative IPC buffer length".into()))?;
+    if offset
+        .checked_add(length)
+        .is_none_or(|end| end > data.len())
+    {
+        return Err(ArrowError::IpcError("IPC buffer range exceeds body".into()));
+    }
+    Ok((offset, length))
+}
+
+fn validate_validity_buffer(node: &FieldNode, buffer: &Buffer) -> Result<(), ArrowError> {
+    if node.null_count() > 0 && buffer.len() < (node.length() as usize).div_ceil(8) {
+        return Err(ArrowError::IpcError(
+            "IPC validity buffer is too short".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Read a buffer based on offset and length
 /// From <https://github.com/apache/arrow/blob/6a936c4ff5007045e86f65f1a6b6c3c955ad5103/format/Message.fbs#L58>
 /// Each constituent buffer is first compressed with the indicated
@@ -60,13 +84,23 @@ fn read_buffer(
     buf: &crate::Buffer,
     a_data: &Buffer,
     compression_codec: Option<CompressionCodec>,
+    remaining_decoded_bytes: usize,
 ) -> Result<Buffer, ArrowError> {
-    let start_offset = buf.offset() as usize;
-    let buf_data = a_data.slice_with_length(start_offset, buf.length() as usize);
+    let (start_offset, length) = checked_buffer_range(buf, a_data)?;
+    let buf_data = a_data.slice_with_length(start_offset, length);
     // corner case: empty buffer
     match (buf_data.is_empty(), compression_codec) {
-        (true, _) | (_, None) => Ok(buf_data),
-        (false, Some(decompressor)) => decompressor.decompress_to_buffer(&buf_data),
+        (true, _) | (_, None) => {
+            if buf_data.len() > remaining_decoded_bytes {
+                return Err(ArrowError::IpcError(
+                    "Decoded IPC buffers exceed byte limit".into(),
+                ));
+            }
+            Ok(buf_data)
+        }
+        (false, Some(decompressor)) => {
+            decompressor.decompress_to_buffer_with_limit(&buf_data, remaining_decoded_bytes)
+        }
     }
 }
 impl RecordBatchDecoder<'_> {
@@ -99,12 +133,7 @@ impl RecordBatchDecoder<'_> {
                 self.create_primitive_array(field_node, data_type, &buffers)
             }
             BinaryView | Utf8View => {
-                let count = variadic_counts
-                    .pop_front()
-                    .ok_or(ArrowError::IpcError(format!(
-                        "Missing variadic count for {data_type} column"
-                    )))?;
-                let count = count + 2; // view and null buffer.
+                let count = self.next_variadic_buffer_count(variadic_counts, data_type)?;
                 let buffers = (0..count)
                     .map(|_| self.next_buffer())
                     .collect::<Result<Vec<_>, _>>()?;
@@ -190,13 +219,11 @@ impl RecordBatchDecoder<'_> {
                     self.next_buffer()?;
                 }
 
-                let type_ids: ScalarBuffer<i8> =
-                    self.next_buffer()?.slice_with_length(0, len).into();
+                let type_ids = self.next_scalar_buffer::<i8>(len)?;
 
                 let value_offsets = match mode {
                     UnionMode::Dense => {
-                        let offsets: ScalarBuffer<i32> =
-                            self.next_buffer()?.slice_with_length(0, len * 4).into();
+                        let offsets = self.next_scalar_buffer::<i32>(len)?;
                         Some(offsets)
                     }
                     UnionMode::Sparse => None,
@@ -252,6 +279,7 @@ impl RecordBatchDecoder<'_> {
         buffers: &[Buffer],
     ) -> Result<ArrayRef, ArrowError> {
         let length = field_node.length() as usize;
+        validate_validity_buffer(field_node, &buffers[0])?;
         let null_buffer = (field_node.null_count() > 0).then_some(buffers[0].clone());
         let mut builder = match data_type {
             Utf8 | Binary | LargeBinary | LargeUtf8 => {
@@ -272,7 +300,11 @@ impl RecordBatchDecoder<'_> {
                     .add_buffer(buffers[1].clone())
                     .null_bit_buffer(null_buffer)
             }
-            t => unreachable!("Data type {:?} either unsupported or not primitive", t),
+            t => {
+                return Err(ArrowError::IpcError(format!(
+                    "Unsupported IPC array layout: {t:?}"
+                )));
+            }
         };
 
         builder = builder.null_count(field_node.null_count() as usize);
@@ -299,6 +331,7 @@ impl RecordBatchDecoder<'_> {
         buffers: &[Buffer],
         child_array: ArrayRef,
     ) -> Result<ArrayRef, ArrowError> {
+        validate_validity_buffer(field_node, &buffers[0])?;
         let null_buffer = (field_node.null_count() > 0).then_some(buffers[0].clone());
         let length = field_node.length() as usize;
         let child_data = child_array.into_data();
@@ -333,6 +366,7 @@ impl RecordBatchDecoder<'_> {
         let len = struct_node.length() as usize;
         let skip_validation = self.skip_validation.get();
 
+        validate_validity_buffer(struct_node, &null_buffer)?;
         let nulls = if null_count > 0 {
             let validity_buffer = BooleanBuffer::new(null_buffer, 0, len);
             let null_buffer = if skip_validation {
@@ -366,7 +400,7 @@ impl RecordBatchDecoder<'_> {
             // safety: flag can only be set via unsafe code
             unsafe { StructArray::new_unchecked(struct_fields.clone(), struct_arrays, nulls) }
         } else {
-            StructArray::try_new(struct_fields.clone(), struct_arrays, nulls)?
+            StructArray::try_new_with_length(struct_fields.clone(), struct_arrays, nulls, len)?
         };
 
         Ok(Arc::new(struct_array))
@@ -382,6 +416,7 @@ impl RecordBatchDecoder<'_> {
         value_array: ArrayRef,
     ) -> Result<ArrayRef, ArrowError> {
         if let Dictionary(_, _) = *data_type {
+            validate_validity_buffer(field_node, &buffers[0])?;
             let null_buffer = (field_node.null_count() > 0).then_some(buffers[0].clone());
             let builder = ArrayData::builder(data_type.clone())
                 .len(field_node.length() as usize)
@@ -428,11 +463,13 @@ pub struct RecordBatchDecoder<'a> {
     ///
     /// See [`FileDecoder::with_skip_validation`] for details.
     skip_validation: UnsafeFlag,
+    /// Aggregate logical bytes of materialized IPC buffers, excluding metadata.
+    remaining_decoded_bytes: usize,
 }
 
 impl<'a> RecordBatchDecoder<'a> {
     /// Create a reader for decoding arrays from an encoded [`RecordBatch`]
-    fn try_new(
+    pub fn try_new(
         buf: &'a Buffer,
         batch: crate::RecordBatch<'a>,
         schema: SchemaRef,
@@ -463,7 +500,17 @@ impl<'a> RecordBatchDecoder<'a> {
             projection: None,
             require_alignment: false,
             skip_validation: UnsafeFlag::new(),
+            remaining_decoded_bytes: usize::MAX,
         })
+    }
+
+    /// Limit the sum of decoded buffer lengths for this batch. The default is
+    /// unlimited. Compressed declarations are checked before expansion; projected
+    /// buffers are not materialized or charged. This excludes codec workspace,
+    /// schema/array metadata, and allocator overhead; it is not a process RSS cap.
+    pub fn with_max_decoded_bytes(mut self, limit: usize) -> Self {
+        self.remaining_decoded_bytes = limit;
+        self
     }
 
     /// Set the projection (default: None)
@@ -502,7 +549,7 @@ impl<'a> RecordBatchDecoder<'a> {
     }
 
     /// Read the record batch, consuming the reader
-    fn read_record_batch(mut self) -> Result<RecordBatch, ArrowError> {
+    pub fn read_record_batch(mut self) -> Result<RecordBatch, ArrowError> {
         let mut variadic_counts: VecDeque<i64> = self
             .batch
             .variadicBufferCounts()
@@ -510,7 +557,9 @@ impl<'a> RecordBatchDecoder<'a> {
             .flatten()
             .collect();
 
-        let options = RecordBatchOptions::new().with_row_count(Some(self.batch.length() as usize));
+        let rows = usize::try_from(self.batch.length())
+            .map_err(|_| ArrowError::IpcError("Negative IPC batch length".into()))?;
+        let options = RecordBatchOptions::new().with_row_count(Some(rows));
 
         let schema = Arc::clone(&self.schema);
         if let Some(projection) = self.projection {
@@ -541,7 +590,11 @@ impl<'a> RecordBatchDecoder<'a> {
                     ))
                 }
             } else {
-                assert!(variadic_counts.is_empty());
+                if !variadic_counts.is_empty() {
+                    return Err(ArrowError::IpcError(
+                        "Unused IPC variadic buffer counts".into(),
+                    ));
+                }
                 RecordBatch::try_new_with_options(schema, columns, &options)
             }
         } else {
@@ -562,26 +615,93 @@ impl<'a> RecordBatchDecoder<'a> {
                     ))
                 }
             } else {
-                assert!(variadic_counts.is_empty());
+                if !variadic_counts.is_empty() {
+                    return Err(ArrowError::IpcError(
+                        "Unused IPC variadic buffer counts".into(),
+                    ));
+                }
                 RecordBatch::try_new_with_options(schema, children, &options)
             }
         }
     }
 
     fn next_buffer(&mut self) -> Result<Buffer, ArrowError> {
-        read_buffer(self.buffers.next().unwrap(), self.data, self.compression)
+        let descriptor = self
+            .buffers
+            .next()
+            .ok_or_else(|| ArrowError::IpcError("Missing IPC buffer descriptor".into()))?;
+        let buffer = read_buffer(
+            descriptor,
+            self.data,
+            self.compression,
+            self.remaining_decoded_bytes,
+        )?;
+        self.remaining_decoded_bytes -= buffer.len();
+        Ok(buffer)
     }
 
-    fn skip_buffer(&mut self) {
-        self.buffers.next().unwrap();
+    fn next_scalar_buffer<T: ArrowNativeType>(
+        &mut self,
+        length: usize,
+    ) -> Result<ScalarBuffer<T>, ArrowError> {
+        let bytes = length
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| ArrowError::IpcError("IPC scalar buffer length overflow".into()))?;
+        let buffer = self.next_buffer()?;
+        if bytes > buffer.len() {
+            return Err(ArrowError::IpcError(
+                "IPC scalar buffer is too short".into(),
+            ));
+        }
+        let mut buffer = buffer.slice_with_length(0, bytes);
+        if buffer.as_ptr().align_offset(std::mem::align_of::<T>()) != 0 {
+            if self.require_alignment {
+                return Err(ArrowError::IpcError("Misaligned IPC scalar buffer".into()));
+            }
+            buffer = Buffer::from_slice_ref(buffer.as_slice());
+        }
+        Ok(buffer.into())
+    }
+
+    fn skip_buffer(&mut self) -> Result<(), ArrowError> {
+        let descriptor = self.buffers.next().ok_or_else(|| {
+            ArrowError::IpcError("Missing projected IPC buffer descriptor".into())
+        })?;
+        checked_buffer_range(descriptor, self.data)?;
+        Ok(())
+    }
+
+    fn next_variadic_buffer_count(
+        &self,
+        counts: &mut VecDeque<i64>,
+        data_type: &DataType,
+    ) -> Result<usize, ArrowError> {
+        let count = counts.pop_front().ok_or_else(|| {
+            ArrowError::IpcError(format!("Missing variadic count for {data_type} column"))
+        })?;
+        let count = usize::try_from(count)
+            .ok()
+            .and_then(|count| count.checked_add(2))
+            .filter(|count| *count <= self.buffers.len())
+            .ok_or_else(|| ArrowError::IpcError("Invalid IPC variadic buffer count".into()))?;
+        Ok(count)
     }
 
     fn next_node(&mut self, field: &Field) -> Result<&'a FieldNode, ArrowError> {
-        self.nodes.next().ok_or_else(|| {
+        let node = self.nodes.next().ok_or_else(|| {
             ArrowError::SchemaError(format!(
                 "Invalid data for schema. {field} refers to node not found in schema",
             ))
-        })
+        })?;
+        if usize::try_from(node.length()).is_err()
+            || node.null_count() < 0
+            || node.null_count() > node.length()
+        {
+            return Err(ArrowError::IpcError(
+                "Invalid IPC field length or null count".into(),
+            ));
+        }
+        Ok(node)
     }
 
     fn skip_field(
@@ -594,36 +714,30 @@ impl<'a> RecordBatchDecoder<'a> {
         match field.data_type() {
             Utf8 | Binary | LargeBinary | LargeUtf8 => {
                 for _ in 0..3 {
-                    self.skip_buffer()
+                    self.skip_buffer()?
                 }
             }
             Utf8View | BinaryView => {
-                let count = variadic_count
-                    .pop_front()
-                    .ok_or(ArrowError::IpcError(format!(
-                        "Missing variadic count for {} column",
-                        field.data_type()
-                    )))?;
-                let count = count + 2; // view and null buffer.
+                let count = self.next_variadic_buffer_count(variadic_count, field.data_type())?;
                 for _i in 0..count {
-                    self.skip_buffer()
+                    self.skip_buffer()?
                 }
             }
             FixedSizeBinary(_) => {
-                self.skip_buffer();
-                self.skip_buffer();
+                self.skip_buffer()?;
+                self.skip_buffer()?;
             }
             List(list_field) | LargeList(list_field) | Map(list_field, _) => {
-                self.skip_buffer();
-                self.skip_buffer();
+                self.skip_buffer()?;
+                self.skip_buffer()?;
                 self.skip_field(list_field, variadic_count)?;
             }
             FixedSizeList(list_field, _) => {
-                self.skip_buffer();
+                self.skip_buffer()?;
                 self.skip_field(list_field, variadic_count)?;
             }
             Struct(struct_fields) => {
-                self.skip_buffer();
+                self.skip_buffer()?;
 
                 // skip for each field
                 for struct_field in struct_fields {
@@ -635,14 +749,17 @@ impl<'a> RecordBatchDecoder<'a> {
                 self.skip_field(values_field, variadic_count)?;
             }
             Dictionary(_, _) => {
-                self.skip_buffer(); // Nulls
-                self.skip_buffer(); // Indices
+                self.skip_buffer()?; // Nulls
+                self.skip_buffer()?; // Indices
             }
             Union(fields, mode) => {
-                self.skip_buffer(); // Nulls
+                if self.version < MetadataVersion::V5 {
+                    self.skip_buffer()?; // V4 validity bitmap
+                }
+                self.skip_buffer()?; // Type IDs
 
                 match mode {
-                    UnionMode::Dense => self.skip_buffer(),
+                    UnionMode::Dense => self.skip_buffer()?,
                     UnionMode::Sparse => {}
                 };
 
@@ -651,9 +768,14 @@ impl<'a> RecordBatchDecoder<'a> {
                 }
             }
             Null => {} // No buffer increases
-            _ => {
-                self.skip_buffer();
-                self.skip_buffer();
+            t if t.is_primitive() || matches!(t, Boolean) => {
+                self.skip_buffer()?;
+                self.skip_buffer()?;
+            }
+            t => {
+                return Err(ArrowError::IpcError(format!(
+                    "Unsupported projected IPC array layout: {t:?}"
+                )));
             }
         };
         Ok(())
@@ -3154,3 +3276,7 @@ mod tests {
         assert!(reader.is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "reader_boundary_tests.rs"]
+mod r6_boundary_tests;
