@@ -103,6 +103,7 @@ enum FieldOp {
     Struct {
         fields: Vec<FieldOp>,
         nullable: bool,
+        recursive: bool,
     },
     /// Enum - read zigzag-encoded nonnegative int index
     Enum { nullable: bool },
@@ -142,10 +143,12 @@ pub enum ColumnType {
     Fixed,
     /// Variable-size column: offsets buffer + data buffer
     Variable,
+    /// Record with independent child buffers; inspect its recursive BufferSlot.
+    Record,
 }
 
 /// Buffer slot descriptor for a schema column
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct BufferSlot {
     /// Index of the primary buffer in the output_ptrs array
     /// For fixed-size: this is the data buffer
@@ -163,6 +166,30 @@ pub struct BufferSlot {
     pub element_size: i64,
     /// Raw Avro union tag for null (0 or 2).
     pub null_tag: i64,
+    /// Recursive record children, in Avro wire order. Empty for packed records
+    /// and scalar/list leaves. Each child has independent validity and offsets.
+    pub children: Vec<BufferSlot>,
+    /// Bytes per row in this slot's primary buffer. None denotes offsets.
+    /// Recursive record containers have zero primary bytes.
+    pub fixed_width: Option<usize>,
+}
+
+impl BufferSlot {
+    /// Visit this slot followed by its descendants in output pointer order.
+    pub fn visit<'a>(&'a self, visitor: &mut impl FnMut(&'a BufferSlot)) {
+        visitor(self);
+        for child in &self.children {
+            child.visit(visitor);
+        }
+    }
+
+    /// Required primary bytes, with checked arithmetic before allocation.
+    pub fn primary_capacity(&self, rows: usize) -> Option<usize> {
+        match self.fixed_width {
+            Some(width) => rows.checked_mul(width),
+            None => rows.checked_add(1)?.checked_mul(4),
+        }
+    }
 }
 
 /// Output buffer specification with capacity for bounds checking
@@ -405,18 +432,25 @@ impl JitDecoder {
         // Compute column types and buffer slots
         let column_types: Vec<ColumnType> = field_ops.iter().map(Self::op_to_column_type).collect();
 
-        // Build buffer slot mapping:
-        // - Fixed columns: 1 buffer (data), optionally +1 for validity
-        // - Variable columns: 2 buffers (offsets, data), optionally +1 for validity
-        let mut buffer_slots = Vec::with_capacity(num_columns);
-        let mut buffer_idx = 0usize;
-        for ((col_type, field_op), field) in column_types
-            .iter()
-            .zip(field_ops.iter())
-            .zip(schema.fields().iter())
-        {
-            let element_size = Self::op_to_element_size(field_op);
-            let is_nullable = field.is_nullable();
+        // Preserve packed scalar-record layout for existing callers. Records
+        // with nullable/variable/recursive children use independent child slots.
+        fn make_slot(field: &Field, op: &FieldOp, next: &mut usize) -> Result<BufferSlot, String> {
+            let primary = *next;
+            *next += 1;
+            let secondary = if JitDecoder::op_to_column_type(op) == ColumnType::Variable {
+                let index = *next;
+                *next += 1;
+                Some(index)
+            } else {
+                None
+            };
+            let validity = if field.is_nullable() {
+                let index = *next;
+                *next += 1;
+                Some(index)
+            } else {
+                None
+            };
             let null_tag = match field
                 .metadata()
                 .get("avro.union.null_index")
@@ -426,43 +460,44 @@ impl JitDecoder {
                 Some("1") => 2,
                 _ => return Err("Invalid nullable union index".into()),
             };
-            match col_type {
-                ColumnType::Fixed => {
-                    let validity = if is_nullable {
-                        let v = buffer_idx + 1;
-                        buffer_idx += 2; // data + validity
-                        Some(v)
-                    } else {
-                        buffer_idx += 1; // data only
-                        None
-                    };
-                    buffer_slots.push(BufferSlot {
-                        primary: buffer_idx - if is_nullable { 2 } else { 1 },
-                        secondary: None,
-                        validity,
-                        element_size,
-                        null_tag,
-                    });
+            let recursive = matches!(
+                op,
+                FieldOp::Struct {
+                    recursive: true,
+                    ..
                 }
-                ColumnType::Variable => {
-                    let validity = if is_nullable {
-                        let v = buffer_idx + 2;
-                        buffer_idx += 3; // offsets + data + validity
-                        Some(v)
-                    } else {
-                        buffer_idx += 2; // offsets + data only
-                        None
-                    };
-                    buffer_slots.push(BufferSlot {
-                        primary: buffer_idx - if is_nullable { 3 } else { 2 },
-                        secondary: Some(buffer_idx - if is_nullable { 2 } else { 1 }),
-                        validity,
-                        element_size,
-                        null_tag,
-                    });
+            );
+            let mut children = Vec::new();
+            if let (DataType::Struct(fields), FieldOp::Struct { fields: ops, .. }) =
+                (field.data_type(), op)
+            {
+                if recursive {
+                    for (child, child_op) in fields.iter().zip(ops) {
+                        children.push(make_slot(child, child_op, next)?);
+                    }
                 }
             }
+            Ok(BufferSlot {
+                primary,
+                secondary,
+                validity,
+                null_tag,
+                children,
+                element_size: JitDecoder::op_to_element_size(op),
+                fixed_width: if recursive {
+                    Some(0)
+                } else {
+                    JitDecoder::fixed_size_for_type(field.data_type())
+                },
+            })
         }
+        let mut buffer_idx = 0;
+        let buffer_slots = schema
+            .fields()
+            .iter()
+            .zip(&field_ops)
+            .map(|(field, op)| make_slot(field, op, &mut buffer_idx))
+            .collect::<Result<Vec<_>, _>>()?;
         let total_buffers = buffer_idx;
 
         // Create output position variables for each BUFFER (not column)
@@ -552,7 +587,11 @@ impl JitDecoder {
         // For each variable-length column, write the final offset (offset[row_count])
         // For Bytes/String: offset = total_bytes (element_size = 1)
         // For List/Map: offset = total_element_count (element_size = sizeof(element))
+        let mut all_slots = Vec::new();
         for slot in &buffer_slots {
+            slot.visit(&mut |slot| all_slots.push(slot));
+        }
+        for slot in &all_slots {
             if let Some(data_buf_idx) = slot.secondary {
                 // This is a variable-length column
                 let buf_idx = slot.primary; // offsets buffer index
@@ -651,6 +690,9 @@ impl JitDecoder {
     fn op_to_column_type(op: &FieldOp) -> ColumnType {
         match op {
             FieldOp::Bytes { .. } | FieldOp::List { .. } => ColumnType::Variable,
+            FieldOp::Struct {
+                recursive: true, ..
+            } => ColumnType::Record,
             _ => ColumnType::Fixed,
         }
     }
@@ -666,6 +708,26 @@ impl JitDecoder {
             // Fixed-size types: not used for offsets
             _ => 1,
         }
+    }
+
+    fn packed_struct_child(op: &FieldOp) -> bool {
+        matches!(
+            op,
+            FieldOp::Boolean { nullable: false }
+                | FieldOp::Int32 { nullable: false }
+                | FieldOp::Int64 { nullable: false }
+                | FieldOp::Float32 { nullable: false }
+                | FieldOp::Float64 { nullable: false }
+                | FieldOp::Decimal128 {
+                    nullable: false,
+                    ..
+                }
+                | FieldOp::Decimal256 {
+                    nullable: false,
+                    ..
+                }
+                | FieldOp::Enum { nullable: false }
+        )
     }
 
     /// Get byte size of element type (must match emit_list_decode's element_size
@@ -718,40 +780,14 @@ impl JitDecoder {
                     .iter()
                     .map(|f| Self::field_to_op(f.as_ref()))
                     .collect::<Result<Vec<_>, _>>()?;
-                // emit_struct_decode handles non-nullable scalars (incl. temporal,
-                // which map to int/long), decimal128/256, and enum. Any other
-                // child (string/bytes/fixed/nullable/nested) is silently skipped
-                // → reject at compile time so the caller loud-rejects instead.
-                for op in &child_ops {
-                    let supported = matches!(
-                        op,
-                        FieldOp::Boolean { nullable: false }
-                            | FieldOp::Int32 { nullable: false }
-                            | FieldOp::Int64 { nullable: false }
-                            | FieldOp::Float32 { nullable: false }
-                            | FieldOp::Float64 { nullable: false }
-                            | FieldOp::Decimal128 {
-                                nullable: false,
-                                ..
-                            }
-                            | FieldOp::Decimal256 {
-                                nullable: false,
-                                ..
-                            }
-                            | FieldOp::Enum { nullable: false }
-                    );
-                    if !supported {
-                        return Err(
-                            "JIT struct decode supports non-nullable scalar/decimal/enum \
-                             children only; rejecting struct with an unsupported child to \
-                             avoid silent corruption"
-                                .to_string(),
-                        );
-                    }
-                }
+                // Keep the established packed layout only for shapes its
+                // specialized emitter handles. Rich records are decoded by
+                // recursively invoking the same checked leaf emitters.
+                let recursive = !child_ops.iter().all(Self::packed_struct_child);
                 Ok(FieldOp::Struct {
                     fields: child_ops,
                     nullable,
+                    recursive,
                 })
             }
             // Dictionary/Enum - store indices as i32
@@ -877,6 +913,73 @@ impl JitDecoder {
         error_block: Block,
         output_overflow_block: Block,
     ) {
+        if let FieldOp::Struct {
+            fields,
+            nullable,
+            recursive: true,
+        } = op
+        {
+            let value_block = builder.create_block();
+            let done = builder.create_block();
+            if *nullable {
+                let (tag, next) = Self::emit_varint_decode(
+                    builder,
+                    input_ptr,
+                    input_len,
+                    cursor_var,
+                    error_block,
+                );
+                builder.def_var(cursor_var, next);
+                let valid = builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedLessThanOrEqual, tag, 2);
+                let even = builder.ins().band_imm(tag, 1);
+                let even = builder.ins().icmp_imm(IntCC::Equal, even, 0);
+                let valid = builder.ins().band(valid, even);
+                Self::emit_require(builder, valid, error_block);
+                let is_null = builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, tag, buffer_slot.null_tag);
+                let null_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(is_null, null_block, &[], value_block, &[]);
+                builder.switch_to_block(null_block);
+                Self::emit_absent_record(builder, buffer_slot, output_ptrs, output_vars, ptr_type);
+                builder.ins().jump(done, &[]);
+                builder.seal_block(null_block);
+            } else {
+                builder.ins().jump(value_block, &[]);
+            }
+            builder.switch_to_block(value_block);
+            for (child, slot) in fields.iter().zip(&buffer_slot.children) {
+                Self::emit_field_decode(
+                    builder,
+                    child,
+                    slot,
+                    input_ptr,
+                    input_len,
+                    output_ptrs,
+                    output_caps,
+                    cursor_var,
+                    row_var,
+                    output_vars,
+                    ptr_type,
+                    memcpy_func_ref,
+                    error_block,
+                    output_overflow_block,
+                );
+            }
+            if let Some(validity) = buffer_slot.validity {
+                let row = builder.use_var(row_var);
+                Self::emit_set_validity_bit(builder, output_ptrs, validity, row, ptr_type);
+            }
+            builder.ins().jump(done, &[]);
+            builder.seal_block(value_block);
+            builder.seal_block(done);
+            builder.switch_to_block(done);
+            return;
+        }
         // For fixed-size types, use primary buffer only
         // For variable-size types (Bytes), use primary=offsets, secondary=data
         let buf_idx = buffer_slot.primary;
@@ -1679,6 +1782,7 @@ impl JitDecoder {
             FieldOp::Struct {
                 fields: child_ops,
                 nullable,
+                recursive: _,
             } => {
                 // Struct: decode each child field sequentially
                 // Output is flattened: all field data concatenated together
@@ -2369,6 +2473,66 @@ impl JitDecoder {
 
     /// Emit Cranelift IR for Avro struct/record decoding
     ///
+    /// A null record still contributes one row to every descendant Arrow
+    /// array. It consumes no child wire bytes. Variable offsets repeat; fixed
+    /// leaves receive initialized placeholders, including dictionary keys.
+    fn emit_absent_record(
+        builder: &mut FunctionBuilder,
+        slot: &BufferSlot,
+        output_ptrs: Value,
+        output_vars: &[Variable],
+        ptr_type: Type,
+    ) {
+        if !slot.children.is_empty() {
+            for child in &slot.children {
+                Self::emit_absent_record(builder, child, output_ptrs, output_vars, ptr_type);
+            }
+            return;
+        }
+        let address = builder
+            .ins()
+            .iadd_imm(output_ptrs, (slot.primary * 8) as i64);
+        let ptr = builder
+            .ins()
+            .load(ptr_type, MemFlags::trusted(), address, 0);
+        let pos = builder.use_var(output_vars[slot.primary]);
+        let ptr = builder.ins().iadd(ptr, pos);
+        if let Some(data) = slot.secondary {
+            let bytes = builder.use_var(output_vars[data]);
+            let count = builder.ins().udiv_imm(bytes, slot.element_size);
+            let count = builder.ins().ireduce(types::I32, count);
+            builder.ins().store(MemFlags::trusted(), count, ptr, 0);
+            let next = builder.ins().iadd_imm(pos, 4);
+            builder.def_var(output_vars[slot.primary], next);
+        } else {
+            let width = slot.fixed_width.expect("fixed leaf");
+            if width > 0 {
+                let index = builder.declare_var(types::I64);
+                let zero = builder.ins().iconst(types::I64, 0);
+                builder.def_var(index, zero);
+                let body = builder.create_block();
+                let done = builder.create_block();
+                builder.ins().jump(body, &[]);
+                builder.switch_to_block(body);
+                let offset = builder.use_var(index);
+                let dest = builder.ins().iadd(ptr, offset);
+                let byte = builder.ins().iconst(types::I8, 0);
+                builder.ins().store(MemFlags::trusted(), byte, dest, 0);
+                let next = builder.ins().iadd_imm(offset, 1);
+                builder.def_var(index, next);
+                let more = builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedLessThan, next, width as i64);
+                builder.ins().brif(more, body, &[], done, &[]);
+                builder.seal_block(body);
+                builder.seal_block(done);
+                builder.switch_to_block(done);
+                let next = builder.ins().iadd_imm(pos, width as i64);
+                builder.def_var(output_vars[slot.primary], next);
+            }
+        }
+    }
+
     /// Structs decode each field sequentially in schema order.
     /// Output is flattened: all field data written sequentially to a single buffer.
     fn emit_struct_decode(
@@ -3623,18 +3787,21 @@ impl JitDecoder {
         row_count: usize,
         record_ends: Option<&[usize]>,
     ) -> Result<usize, String> {
-        for slot in &self.buffer_slots {
+        let mut invalid_validity = false;
+        self.visit_buffer_slots(&mut |slot| {
             if let Some(index) = slot.validity {
                 let bytes = row_count.div_ceil(8);
                 if output_capacities[index] < bytes {
-                    return Err("Output buffer overflow: validity buffer too small".into());
-                }
-                if bytes != 0 {
-                    // SAFETY: the public unsafe call contract requires writable,
-                    // non-aliasing buffers for their advertised capacities.
+                    invalid_validity = true;
+                } else if bytes != 0 {
+                    // SAFETY: public unsafe contract guarantees writable,
+                    // non-aliasing allocations for advertised capacities.
                     unsafe { std::ptr::write_bytes(output_buffers[index], 0, bytes) };
                 }
             }
+        });
+        if invalid_validity {
+            return Err("Output buffer overflow: validity buffer too small".into());
         }
         let decode_fn = self.decode_fn;
         let input_ptr = input.as_ptr();
@@ -3689,13 +3856,14 @@ impl JitDecoder {
 
     /// Calculate the exact required capacity for a fixed-size column
     ///
-    /// Returns `Some(size)` for fixed-size columns, `None` for variable-length columns.
+    /// Returns `Some(size)` for packed fixed-size columns; `None` for variable
+    /// or recursive record columns. Use the slot tree to plan recursive buffers.
     pub fn required_capacity(&self, col_idx: usize, row_count: usize) -> Option<usize> {
-        if col_idx >= self.schema.fields().len() {
+        let slot = self.buffer_slots.get(col_idx)?;
+        if !slot.children.is_empty() {
             return None;
         }
-        let field = &self.schema.fields()[col_idx];
-        Self::fixed_size_for_type(field.data_type()).and_then(|size| size.checked_mul(row_count))
+        slot.fixed_width?.checked_mul(row_count)
     }
 
     /// Get the fixed size in bytes for a data type, if it's fixed-size
@@ -3728,6 +3896,10 @@ impl JitDecoder {
             DataType::List(_) | DataType::LargeList(_) | DataType::Map(_, _) => None,
             // Complex types - treat as variable for safety
             DataType::Struct(fields) => fields.iter().try_fold(0usize, |size, f| {
+                let op = Self::field_to_op(f).ok()?;
+                if !Self::packed_struct_child(&op) {
+                    return None;
+                }
                 size.checked_add(Self::fixed_size_for_type(f.data_type())?)
             }),
             DataType::Union(_, _) | DataType::FixedSizeList(_, _) => None,
@@ -3737,7 +3909,9 @@ impl JitDecoder {
 
     /// Check if the schema has any variable-length columns
     pub fn has_variable_columns(&self) -> bool {
-        self.column_types.contains(&ColumnType::Variable)
+        let mut variable = false;
+        self.visit_buffer_slots(&mut |slot| variable |= slot.secondary.is_some());
+        variable
     }
 
     /// Get the total number of output buffers needed
@@ -3750,6 +3924,13 @@ impl JitDecoder {
     /// Get the buffer slot for a column
     pub fn buffer_slot(&self, col_idx: usize) -> Option<&BufferSlot> {
         self.buffer_slots.get(col_idx)
+    }
+
+    /// Visit every slot in the native pointer order, including record children.
+    pub fn visit_buffer_slots(&self, visitor: &mut impl FnMut(&BufferSlot)) {
+        for slot in &self.buffer_slots {
+            slot.visit(visitor);
+        }
     }
 
     /// Get the column type for a column
@@ -3812,50 +3993,25 @@ impl JitDecoder {
             ));
         }
 
-        // Validate buffer capacities
-        for (col_idx, field) in self.schema.fields().iter().enumerate() {
-            let slot = &self.buffer_slots[col_idx];
-            if let Some(required) = Self::fixed_size_for_type(field.data_type()) {
-                let required_capacity = required
-                    .checked_mul(row_count)
-                    .ok_or("Output size overflow")?;
-                let actual_capacity = output_buffers[slot.primary].capacity;
-                if actual_capacity < required_capacity {
-                    return Err(format!(
-                        "Column '{}' requires {} bytes ({} rows × {} bytes/row) but buffer has {} bytes capacity",
-                        field.name(),
-                        required_capacity,
-                        row_count,
-                        required,
-                        actual_capacity
-                    ));
+        for (field, root) in self.schema.fields().iter().zip(&self.buffer_slots) {
+            let mut error = None;
+            root.visit(&mut |slot| {
+                if error.is_some() { return; }
+                match slot.primary_capacity(row_count) {
+                    Some(required) if output_buffers[slot.primary].capacity >= required => {},
+                    Some(required) => error = Some(format!(
+                        "Output buffer overflow: Column '{}' buffer {} requires {} bytes but has {}",
+                        field.name(), slot.primary, required, output_buffers[slot.primary].capacity)),
+                    None => error = Some("Output size overflow".into()),
                 }
-            }
-            if let Some(validity) = slot.validity {
-                if output_buffers[validity].capacity < row_count.div_ceil(8) {
-                    return Err(format!(
-                        "Column '{}' validity buffer is too small",
-                        field.name()
-                    ));
+                if let Some(index) = slot.validity {
+                    if output_buffers[index].capacity < row_count.div_ceil(8) {
+                        error = Some(format!("Output buffer overflow: Column '{}' validity buffer {} is too small", field.name(), index));
+                    }
                 }
-            }
-            // Validate variable-length column offsets buffer capacity
-            if slot.secondary.is_some() {
-                // Offsets buffer needs (row_count + 1) * 4 bytes for i32 offsets
-                let offsets_required = row_count
-                    .checked_add(1)
-                    .and_then(|n| n.checked_mul(4))
-                    .ok_or("Offset size overflow")?;
-                let offsets_actual = output_buffers[slot.primary].capacity;
-                if offsets_actual < offsets_required {
-                    return Err(format!(
-                        "Column '{}' offsets buffer requires {} bytes ({} offsets × 4 bytes) but buffer has {} bytes capacity",
-                        field.name(),
-                        offsets_required,
-                        row_count + 1,
-                        offsets_actual
-                    ));
-                }
+            });
+            if let Some(error) = error {
+                return Err(error);
             }
         }
 
@@ -3970,31 +4126,22 @@ impl JitDecoder {
     fn compute_max_rows(&self, output_buffers: &[OutputBuffer]) -> usize {
         let mut max_rows = usize::MAX;
 
-        for (col_idx, field) in self.schema.fields().iter().enumerate() {
-            let slot = &self.buffer_slots[col_idx];
-
-            // Check fixed-size columns
-            if let Some(elem_size) = Self::fixed_size_for_type(field.data_type()) {
-                let capacity = output_buffers[slot.primary].capacity;
-                let rows_that_fit = capacity.checked_div(elem_size).unwrap_or(usize::MAX);
-                max_rows = max_rows.min(rows_that_fit);
+        self.visit_buffer_slots(&mut |slot| {
+            if let Some(width) = slot.fixed_width {
+                max_rows = max_rows.min(
+                    output_buffers[slot.primary]
+                        .capacity
+                        .checked_div(width)
+                        .unwrap_or(usize::MAX),
+                );
+            } else {
+                max_rows =
+                    max_rows.min((output_buffers[slot.primary].capacity / 4).saturating_sub(1));
             }
-
-            if let Some(validity) = slot.validity {
-                max_rows = max_rows.min(output_buffers[validity].capacity.saturating_mul(8));
+            if let Some(index) = slot.validity {
+                max_rows = max_rows.min(output_buffers[index].capacity.saturating_mul(8));
             }
-            // Check offsets buffer for variable-length columns
-            if slot.secondary.is_some() {
-                // Offsets buffer needs (row_count + 1) * 4 bytes
-                let offsets_capacity = output_buffers[slot.primary].capacity;
-                let rows_that_fit = if offsets_capacity >= 4 {
-                    (offsets_capacity / 4).saturating_sub(1)
-                } else {
-                    0
-                };
-                max_rows = max_rows.min(rows_that_fit);
-            }
-        }
+        });
 
         max_rows
     }

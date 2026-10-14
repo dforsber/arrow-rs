@@ -382,18 +382,6 @@ fn reference_decode(json: &str, body: &[u8], rows: usize) -> (RecordBatch, Schem
     (batch, schema)
 }
 
-/// Packed primary-buffer byte size for a fixed-scalar column. Mirrors the
-/// production `packed_column_bytes` in `src/kafka/pooled_avro_decoder`.
-fn packed_column_bytes(data_type: &DataType) -> usize {
-    match data_type {
-        DataType::Struct(children) => children
-            .iter()
-            .map(|f| packed_column_bytes(f.data_type()))
-            .sum(),
-        other => JitDecoder::fixed_size_for_type(other).unwrap_or(8),
-    }
-}
-
 /// JIT decode via `JitDecoder` + `buffers_to_batch_owned`, mirroring the
 /// production allocation in `decode_with_jit`. Returns `Err` for unsupported
 /// shapes (the loud-rejection contract) rather than silently-wrong data.
@@ -416,46 +404,12 @@ fn jit_decode(
     // Generous: a list element can expand vs its wire size (e.g. a ~3-byte
     // bytes-decimal → 16 output bytes), so size for the worst case.
     let var_data_cap = (body.len() * 32 + 4096).max(64);
-    let mut sets: Vec<BufferSet> = Vec::with_capacity(arrow_schema.fields().len());
-    for (ci, field) in arrow_schema.fields().iter().enumerate() {
-        let slot = decoder
-            .buffer_slot(ci)
-            .ok_or_else(|| ArrowError::ComputeError(format!("missing buffer slot {ci}")))?;
-        let nullable = field.is_nullable();
-        let validity_bytes = if nullable { rows.div_ceil(8) } else { 0 };
-        let bs = if slot.secondary.is_some() {
-            let offsets = (rows + 1) * 4;
-            let mut b = BufferSet::new_variable(offsets, var_data_cap);
-            if nullable {
-                b = b.with_validity(validity_bytes);
-            }
-            b
-        } else {
-            // Exactly rows*elem bytes — NOT max(1). A spare byte would make a
-            // FixedSizeBinary(1) column report length 1 for an empty batch
-            // (length = bytes/size). Production sizes this as row_count*elem too.
-            let elem = packed_column_bytes(field.data_type());
-            let mut b = BufferSet::new_fixed(rows * elem);
-            if nullable {
-                b = b.with_validity(validity_bytes);
-            }
-            b
-        };
-        sets.push(bs);
-    }
-
-    let mut outs: Vec<OutputBuffer> = Vec::new();
-    for (ci, bs) in sets.iter_mut().enumerate() {
-        let slot = decoder.buffer_slot(ci).unwrap();
-        outs.push(OutputBuffer::new(bs.primary_ptr(), bs.primary.len()));
-        if slot.secondary.is_some() {
-            let cap = bs.secondary.as_ref().unwrap().len();
-            outs.push(OutputBuffer::new(bs.secondary_ptr(), cap));
-        }
-        if slot.validity.is_some() {
-            let cap = bs.validity.as_ref().unwrap().len();
-            outs.push(OutputBuffer::new(bs.validity_ptr(), cap));
-        }
+    let mut sets: Vec<BufferSet> = (0..decoder.num_columns())
+        .map(|i| BufferSet::for_slot(decoder.buffer_slot(i).unwrap(), rows, var_data_cap))
+        .collect();
+    let mut outs = Vec::new();
+    for bs in &mut sets {
+        bs.append_output_buffers(&mut outs);
     }
 
     if rows > 0 {
@@ -992,15 +946,15 @@ fn diff_struct_with_decimal_and_enum() {
 
 #[test]
 fn struct_with_unsupported_child_is_loudly_rejected() {
-    // Still unsupported as struct children: nullable, string/bytes, fixed (raw),
-    // nested. Must reject (silent-skip otherwise).
+    // Recursive structs use the checked leaf emitters, but unsupported leaf
+    // layouts remain fail-closed rather than being skipped.
     let cases = [
         r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
-            {"name":"a","type":["null","long"]}]}}]}"#,
+            {"name":"a","type":{"type":"map","values":"long"}}]}}]}"#,
         r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
-            {"name":"a","type":"string"}]}}]}"#,
+            {"name":"a","type":{"type":"array","items":"string"}}]}}]}"#,
         r#"{"type":"record","name":"R","fields":[{"name":"s","type":{"type":"record","name":"I","fields":[
-            {"name":"a","type":{"type":"fixed","size":8,"name":"F8"}}]}}]}"#,
+            {"name":"a","type":["null","long","string"]}]}}]}"#,
     ];
     for json in cases {
         let avro_schema: AvroSchema = serde_json::from_str(json).expect("parse");
@@ -1392,3 +1346,58 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn diff_recursive_nullable_record_children() {
+    let json = r#"{"type":"record","name":"R","fields":[{"name":"s","type":["null",{"type":"record","name":"S","fields":[{"name":"label","type":["string","null"]},{"name":"inner","type":[{"type":"record","name":"Inner","fields":[{"name":"v","type":["null","long"]},{"name":"tag","type":{"type":"fixed","name":"Tag","size":3}}]},"null"]}]}]}]}"#;
+    let schema = ApacheSchema::parse_str(json).unwrap();
+    let mut body = Vec::new();
+    for i in 0..19 {
+        let s = if i % 5 == 0 {
+            Value::Union(0, Box::new(Value::Null))
+        } else {
+            Value::Union(
+                1,
+                Box::new(Value::Record(vec![
+                    (
+                        "label".into(),
+                        if i % 3 == 0 {
+                            Value::Union(1, Box::new(Value::Null))
+                        } else {
+                            Value::Union(0, Box::new(Value::String(format!("row-{i}-λ"))))
+                        },
+                    ),
+                    (
+                        "inner".into(),
+                        if i % 4 == 0 {
+                            Value::Union(1, Box::new(Value::Null))
+                        } else {
+                            Value::Union(
+                                0,
+                                Box::new(Value::Record(vec![
+                                    (
+                                        "v".into(),
+                                        if i % 2 == 0 {
+                                            Value::Union(0, Box::new(Value::Null))
+                                        } else {
+                                            Value::Union(1, Box::new(Value::Long(-i)))
+                                        },
+                                    ),
+                                    ("tag".into(), Value::Fixed(3, vec![i as u8, 0, 255])),
+                                ])),
+                            )
+                        },
+                    ),
+                ])),
+            )
+        };
+        body.extend(to_avro_datum(&schema, Value::Record(vec![("s".into(), s)])).unwrap());
+    }
+    let (expected, arrow_schema) = reference_decode(json, &body, 19);
+    let actual =
+        jit_decode(&arrow_schema, &body, 19).expect("recursive nullable children must decode");
+    assert_eq!(expected, actual);
+}
+
+#[path = "jit_nested_tests.rs"]
+mod nested;

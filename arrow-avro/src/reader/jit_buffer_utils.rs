@@ -29,10 +29,10 @@ use arrow_schema::{ArrowError, DataType, Field, IntervalUnit, SchemaRef, TimeUni
 use bytes::BytesMut;
 use std::sync::Arc;
 
-use super::jit_decoder::JitDecoder;
+use super::jit_decoder::{BufferSlot, JitDecoder, OutputBuffer};
 
 /// A set of buffers for a single column
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BufferSet {
     /// Primary buffer (data for fixed-size, offsets for variable-size)
     pub primary: Vec<u8>,
@@ -44,9 +44,52 @@ pub struct BufferSet {
     pub primary_len: usize,
     /// Actual number of bytes used in secondary buffer
     pub secondary_len: usize,
+    /// Independent buffers for rich record children, in schema order.
+    /// Empty for scalar leaves and the established packed scalar record layout.
+    pub children: Vec<Self>,
 }
 
 impl BufferSet {
+    /// Allocate one slot tree. Callers enforcing a memory budget must first
+    /// sum every slot's checked capacities, then reserve before calling this.
+    pub fn for_slot(slot: &BufferSlot, rows: usize, variable_capacity: usize) -> Self {
+        let primary = slot
+            .primary_capacity(rows)
+            .expect("JIT primary capacity overflow");
+        let mut buffers = if slot.secondary.is_some() {
+            Self::new_variable(primary, variable_capacity)
+        } else {
+            Self::new_fixed(primary)
+        };
+        if slot.validity.is_some() {
+            buffers = buffers.with_validity(rows.div_ceil(8));
+        }
+        buffers.children = slot
+            .children
+            .iter()
+            .map(|child| Self::for_slot(child, rows, variable_capacity))
+            .collect();
+        buffers
+    }
+
+    /// Append native pointers in the same preorder as the compiled slot tree.
+    /// Allocations must stay alive and exclusively borrowed during decoding.
+    pub fn append_output_buffers(&mut self, output: &mut Vec<OutputBuffer>) {
+        output.push(OutputBuffer::new(
+            self.primary.as_mut_ptr(),
+            self.primary.len(),
+        ));
+        if let Some(data) = &mut self.secondary {
+            output.push(OutputBuffer::new(data.as_mut_ptr(), data.len()));
+        }
+        if let Some(validity) = &mut self.validity {
+            output.push(OutputBuffer::new(validity.as_mut_ptr(), validity.len()));
+        }
+        for child in &mut self.children {
+            child.append_output_buffers(output);
+        }
+    }
+
     /// Convert validity to NullBuffer (zero-copy, consumes validity)
     fn into_null_buffer(validity: Option<Vec<u8>>, row_count: usize) -> Option<NullBuffer> {
         validity.map(|v| {
@@ -65,6 +108,7 @@ impl BufferSet {
             validity: None,
             primary_len: 0,
             secondary_len: 0,
+            children: Vec::new(),
         }
     }
 
@@ -76,6 +120,7 @@ impl BufferSet {
             validity: None,
             primary_len: 0,
             secondary_len: 0,
+            children: Vec::new(),
         }
     }
 
@@ -118,9 +163,52 @@ pub struct PooledBufferSet {
     pub primary_len: usize,
     /// Actual number of bytes used in secondary buffer
     pub secondary_len: usize,
+    /// Independent buffers for rich record children, in schema order.
+    /// Empty for scalar leaves and the established packed scalar record layout.
+    pub children: Vec<Self>,
 }
 
 impl PooledBufferSet {
+    /// Allocate one slot tree. Callers enforcing a memory budget must first
+    /// sum every slot's checked capacities, then reserve before calling this.
+    pub fn for_slot(slot: &BufferSlot, rows: usize, variable_capacity: usize) -> Self {
+        let primary = slot
+            .primary_capacity(rows)
+            .expect("JIT primary capacity overflow");
+        let mut buffers = if slot.secondary.is_some() {
+            Self::new_variable(primary, variable_capacity)
+        } else {
+            Self::new_fixed(primary)
+        };
+        if slot.validity.is_some() {
+            buffers = buffers.with_validity(rows.div_ceil(8));
+        }
+        buffers.children = slot
+            .children
+            .iter()
+            .map(|child| Self::for_slot(child, rows, variable_capacity))
+            .collect();
+        buffers
+    }
+
+    /// Append native pointers in the same preorder as the compiled slot tree.
+    /// Allocations must stay alive and exclusively borrowed during decoding.
+    pub fn append_output_buffers(&mut self, output: &mut Vec<OutputBuffer>) {
+        output.push(OutputBuffer::new(
+            self.primary.as_mut_ptr(),
+            self.primary.len(),
+        ));
+        if let Some(data) = &mut self.secondary {
+            output.push(OutputBuffer::new(data.as_mut_ptr(), data.len()));
+        }
+        if let Some(validity) = &mut self.validity {
+            output.push(OutputBuffer::new(validity.as_mut_ptr(), validity.len()));
+        }
+        for child in &mut self.children {
+            child.append_output_buffers(output);
+        }
+    }
+
     /// Create a new pooled buffer set from pre-allocated BytesMut buffers
     ///
     /// This constructor takes ownership of pre-allocated buffers from a pool.
@@ -137,6 +225,7 @@ impl PooledBufferSet {
             validity,
             primary_len: 0,
             secondary_len: 0,
+            children: Vec::new(),
         }
     }
 
@@ -150,6 +239,7 @@ impl PooledBufferSet {
             validity: None,
             primary_len: 0,
             secondary_len: 0,
+            children: Vec::new(),
         }
     }
 
@@ -165,6 +255,7 @@ impl PooledBufferSet {
             validity: None,
             primary_len: 0,
             secondary_len: 0,
+            children: Vec::new(),
         }
     }
 
@@ -322,6 +413,35 @@ pub fn pooled_buffer_to_array(
     mut buffer_set: PooledBufferSet,
     row_count: usize,
 ) -> Result<ArrayRef, ArrowError> {
+    if !buffer_set.children.is_empty() {
+        let DataType::Struct(fields) = field.data_type() else {
+            return Err(ArrowError::InvalidArgumentError(
+                "Child buffers require a struct".into(),
+            ));
+        };
+        if buffer_set.children.len() != fields.len()
+            || buffer_set
+                .validity
+                .as_ref()
+                .is_some_and(|v| v.len() < row_count.div_ceil(8))
+            || field.is_nullable() && buffer_set.validity.is_none()
+        {
+            return Err(ArrowError::InvalidArgumentError(
+                "Invalid recursive record buffers".into(),
+            ));
+        }
+        let nulls = PooledBufferSet::into_null_buffer(buffer_set.validity, row_count);
+        let children = fields
+            .iter()
+            .zip(buffer_set.children)
+            .map(|(field, child)| pooled_buffer_to_array(field, child, row_count))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Arc::new(StructArray::try_new(
+            fields.clone(),
+            children,
+            nulls,
+        )?));
+    }
     let (primary_len, data_len) = used_lengths(
         field,
         &buffer_set.primary,
@@ -659,6 +779,13 @@ pub fn pooled_buffer_to_array(
         // Struct<scalar children>: de-interleave the JIT's row-major packed buffer
         // into columnar child arrays (see buffer_to_array_owned).
         DataType::Struct(child_fields) => {
+            if child_fields.is_empty() {
+                return Ok(Arc::new(StructArray::new_empty_fields(
+                    row_count,
+                    PooledBufferSet::into_null_buffer(validity, row_count),
+                )));
+            }
+
             let sizes: Vec<usize> = child_fields
                 .iter()
                 .map(|f| {
@@ -762,37 +889,18 @@ pub fn allocate_pooled_buffer_sets(
     row_count: usize,
     avg_var_bytes: usize,
 ) -> Vec<PooledBufferSet> {
-    let schema = decoder.schema();
-    let mut buffer_sets = Vec::with_capacity(schema.fields().len());
-
-    for (col_idx, field) in schema.fields().iter().enumerate() {
-        let slot = decoder.buffer_slot(col_idx).unwrap();
-        let nullable = field.is_nullable();
-        let validity_bytes = if nullable { row_count.div_ceil(8) } else { 0 };
-
-        let buffer_set = if slot.secondary.is_some() {
-            // Variable-length column
-            let offsets_size = (row_count + 1) * 4; // i32 offsets
-            let data_size = row_count * avg_var_bytes;
-            let mut bs = PooledBufferSet::new_variable(offsets_size, data_size);
-            if nullable {
-                bs = bs.with_validity(validity_bytes);
-            }
-            bs
-        } else {
-            // Fixed-size column
-            let elem_size = JitDecoder::fixed_size_for_type(field.data_type()).unwrap_or(8);
-            let mut bs = PooledBufferSet::new_fixed(row_count * elem_size);
-            if nullable {
-                bs = bs.with_validity(validity_bytes);
-            }
-            bs
-        };
-
-        buffer_sets.push(buffer_set);
-    }
-
-    buffer_sets
+    let variable_capacity = row_count
+        .checked_mul(avg_var_bytes)
+        .expect("JIT variable capacity overflow");
+    (0..decoder.num_columns())
+        .map(|i| {
+            PooledBufferSet::for_slot(
+                decoder.buffer_slot(i).unwrap(),
+                row_count,
+                variable_capacity,
+            )
+        })
+        .collect()
 }
 
 /// Convert a single column's buffers to an Arrow ArrayRef
@@ -817,6 +925,7 @@ pub fn buffer_to_array(
             validity: buffer_set.validity.clone(),
             primary_len: buffer_set.primary_len,
             secondary_len: buffer_set.secondary_len,
+            children: buffer_set.children.clone(),
         },
         row_count,
     )
@@ -839,6 +948,35 @@ pub fn buffer_to_array_owned(
     mut buffer_set: BufferSet,
     row_count: usize,
 ) -> Result<ArrayRef, ArrowError> {
+    if !buffer_set.children.is_empty() {
+        let DataType::Struct(fields) = field.data_type() else {
+            return Err(ArrowError::InvalidArgumentError(
+                "Child buffers require a struct".into(),
+            ));
+        };
+        if buffer_set.children.len() != fields.len()
+            || buffer_set
+                .validity
+                .as_ref()
+                .is_some_and(|v| v.len() < row_count.div_ceil(8))
+            || field.is_nullable() && buffer_set.validity.is_none()
+        {
+            return Err(ArrowError::InvalidArgumentError(
+                "Invalid recursive record buffers".into(),
+            ));
+        }
+        let nulls = BufferSet::into_null_buffer(buffer_set.validity, row_count);
+        let children = fields
+            .iter()
+            .zip(buffer_set.children)
+            .map(|(field, child)| buffer_to_array_owned(field, child, row_count))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Arc::new(StructArray::try_new(
+            fields.clone(),
+            children,
+            nulls,
+        )?));
+    }
     let (primary_len, data_len) = used_lengths(
         field,
         &buffer_set.primary,
@@ -1144,6 +1282,7 @@ pub fn buffer_to_array_owned(
                     validity: None,
                     primary_len: 0,
                     secondary_len: 0,
+                    children: Vec::new(),
                 },
                 total_elems,
             )?;
@@ -1161,6 +1300,13 @@ pub fn buffer_to_array_owned(
         // (Arrow's layout). Scalar children only (the JIT's struct codegen does
         // not emit nullable/complex children).
         DataType::Struct(child_fields) => {
+            if child_fields.is_empty() {
+                return Ok(Arc::new(StructArray::new_empty_fields(
+                    row_count,
+                    BufferSet::into_null_buffer(validity, row_count),
+                )));
+            }
+
             let sizes: Vec<usize> = child_fields
                 .iter()
                 .map(|f| {
@@ -1191,6 +1337,7 @@ pub fn buffer_to_array_owned(
                         validity: None,
                         primary_len: 0,
                         secondary_len: 0,
+                        children: Vec::new(),
                     },
                     row_count,
                 )?);
@@ -1303,37 +1450,18 @@ pub fn allocate_buffer_sets(
     row_count: usize,
     avg_var_bytes: usize,
 ) -> Vec<BufferSet> {
-    let schema = decoder.schema();
-    let mut buffer_sets = Vec::with_capacity(schema.fields().len());
-
-    for (col_idx, field) in schema.fields().iter().enumerate() {
-        let slot = decoder.buffer_slot(col_idx).unwrap();
-        let nullable = field.is_nullable();
-        let validity_bytes = if nullable { row_count.div_ceil(8) } else { 0 };
-
-        let buffer_set = if slot.secondary.is_some() {
-            // Variable-length column
-            let offsets_size = (row_count + 1) * 4; // i32 offsets
-            let data_size = row_count * avg_var_bytes;
-            let mut bs = BufferSet::new_variable(offsets_size, data_size);
-            if nullable {
-                bs = bs.with_validity(validity_bytes);
-            }
-            bs
-        } else {
-            // Fixed-size column
-            let elem_size = JitDecoder::fixed_size_for_type(field.data_type()).unwrap_or(8);
-            let mut bs = BufferSet::new_fixed(row_count * elem_size);
-            if nullable {
-                bs = bs.with_validity(validity_bytes);
-            }
-            bs
-        };
-
-        buffer_sets.push(buffer_set);
-    }
-
-    buffer_sets
+    let variable_capacity = row_count
+        .checked_mul(avg_var_bytes)
+        .expect("JIT variable capacity overflow");
+    (0..decoder.num_columns())
+        .map(|i| {
+            BufferSet::for_slot(
+                decoder.buffer_slot(i).unwrap(),
+                row_count,
+                variable_capacity,
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
