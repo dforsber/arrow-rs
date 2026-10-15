@@ -163,7 +163,7 @@ fn short_struct_validity_returns_error() {
 }
 
 #[test]
-fn unsupported_layout_returns_error() {
+fn incomplete_list_view_layout_returns_error() {
     let mut fixture = Fixture::primitive();
     fixture.schema = Arc::new(Schema::new(vec![Field::new(
         "v",
@@ -457,4 +457,143 @@ fn struct_parent_length_must_match_its_children_even_without_nulls() {
     ];
     fixture.body = Buffer::from_slice_ref([1_i32, 2, 3]);
     assert!(fixture.decode(None).is_err());
+}
+
+fn list_view_batch<O: OffsetSizeTrait>() -> RecordBatch {
+    // Overlapping, out-of-order and empty ranges; parent NULL differs from a
+    // list containing a NULL child. Slice away a prefix to exercise offsets.
+    let list = GenericListViewArray::<O>::new(
+        Arc::new(Field::new("item", DataType::Int32, true)),
+        ScalarBuffer::from(vec![
+            O::usize_as(2),
+            O::usize_as(0),
+            O::usize_as(3),
+            O::usize_as(1),
+        ]),
+        ScalarBuffer::from(vec![
+            O::usize_as(2),
+            O::usize_as(2),
+            O::usize_as(0),
+            O::usize_as(3),
+        ]),
+        Arc::new(Int32Array::from(vec![Some(10), None, Some(30), Some(40)])),
+        Some(NullBuffer::from(vec![true, true, true, false])),
+    );
+    RecordBatch::try_from_iter(vec![
+        ("view", Arc::new(list.slice(1, 3)) as ArrayRef),
+        (
+            "tail",
+            Arc::new(Int32Array::from(vec![91, 92, 93])) as ArrayRef,
+        ),
+    ])
+    .unwrap()
+}
+
+#[test]
+fn list_view_roundtrip_projection_and_decoded_budget() {
+    #[allow(unused_mut)]
+    let mut compressions = vec![None];
+    #[cfg(feature = "lz4")]
+    compressions.push(Some(crate::CompressionType::LZ4_FRAME));
+    #[cfg(feature = "zstd")]
+    compressions.push(Some(crate::CompressionType::ZSTD));
+    for batch in [list_view_batch::<i32>(), list_view_batch::<i64>()] {
+        for compression in &compressions {
+            let encoded = encode(&batch, MetadataVersion::V5, *compression);
+            let message = crate::root_as_message(&encoded.ipc_message).unwrap();
+            let body = Buffer::from(encoded.arrow_data);
+            let dictionaries = HashMap::new();
+            for (projection, limit, pass) in [
+                (None, usize::MAX, true),
+                (Some([0].as_slice()), usize::MAX, true),
+                (Some([1].as_slice()), 13, true),
+                (Some([1].as_slice()), 12, false),
+                (Some([].as_slice()), 0, true),
+                (None, 1, false),
+            ] {
+                let result = RecordBatchDecoder::try_new(
+                    &body,
+                    message.header_as_record_batch().unwrap(),
+                    batch.schema(),
+                    &dictionaries,
+                    &MetadataVersion::V5,
+                )
+                .unwrap()
+                .with_projection(projection)
+                .with_max_decoded_bytes(limit)
+                .read_record_batch();
+                if pass {
+                    let expected = projection
+                        .map(|p| batch.project(p).unwrap())
+                        .unwrap_or_else(|| batch.clone());
+                    assert_eq!(
+                        result.unwrap(),
+                        expected,
+                        "compression={compression:?}, projection={projection:?}"
+                    );
+                } else {
+                    assert!(result.is_err(), "limit={limit}");
+                }
+            }
+        }
+    }
+}
+
+fn empty_list_view_fixture(large: bool) -> Fixture {
+    let mut fixture = Fixture::primitive();
+    let item = Arc::new(Field::new("item", DataType::Int32, true));
+    let dt = if large {
+        DataType::LargeListView(item)
+    } else {
+        DataType::ListView(item)
+    };
+    fixture.schema = Arc::new(Schema::new(vec![Field::new("view", dt, true)]));
+    fixture.rows = 9;
+    fixture.nodes = vec![crate::FieldNode::new(9, 1), crate::FieldNode::new(0, 0)];
+    let width = if large { 8 } else { 4 };
+    fixture.buffers = vec![
+        crate::Buffer::new(0, 2),
+        crate::Buffer::new(8, 9 * width),
+        crate::Buffer::new(80, 9 * width),
+        crate::Buffer::new(0, 0),
+        crate::Buffer::new(0, 0),
+    ];
+    let mut body = vec![0_u8; 160];
+    body[0] = 0xfe;
+    body[1] = 1;
+    fixture.body = Buffer::from(body);
+    fixture
+}
+
+#[test]
+fn list_view_short_validity_is_an_error_without_panicking() {
+    for large in [false, true] {
+        let mut fixture = empty_list_view_fixture(large);
+        let decoded = fixture.decode(None).unwrap();
+        assert_eq!(decoded.num_rows(), 9);
+        assert_eq!(decoded.column(0).null_count(), 1);
+        assert!(decoded.column(0).is_null(0));
+        fixture.buffers[0] = crate::Buffer::new(0, 1);
+        assert!(fixture.decode(None).is_err());
+    }
+}
+
+#[test]
+fn list_view_missing_and_invalid_descriptors_are_errors_even_when_projected_out() {
+    for large in [false, true] {
+        for projection in [None, Some([].as_slice())] {
+            for count in 0..5 {
+                let mut fixture = empty_list_view_fixture(large);
+                fixture.buffers.truncate(count);
+                assert!(fixture.decode(projection).is_err(), "count={count}");
+            }
+            for index in 0..5 {
+                for (offset, length) in [(-1, 0), (0, -1), (160, 1), (i64::MAX, i64::MAX)] {
+                    let mut fixture = empty_list_view_fixture(large);
+                    fixture.buffers[index] = crate::Buffer::new(offset, length);
+                    assert!(fixture.decode(projection).is_err(), "index={index}");
+                }
+            }
+        }
+    }
 }

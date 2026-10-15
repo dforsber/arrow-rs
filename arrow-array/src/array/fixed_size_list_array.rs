@@ -462,7 +462,8 @@ impl From<FixedSizeListArray> for ArrayData {
     }
 }
 
-impl Array for FixedSizeListArray {
+/// SAFETY: Correctly implements the contract of Arrow Arrays
+unsafe impl Array for FixedSizeListArray {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -623,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "assertion failed: (offset + length) <= self.len()")]
+    #[should_panic(expected = "assertion failed: end <= self.len()")]
     // Different error messages, so skip for now
     // https://github.com/apache/arrow-rs/issues/1545
     #[cfg(not(feature = "force_validate"))]

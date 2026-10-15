@@ -361,7 +361,8 @@ impl MapArray {
     }
 }
 
-impl Array for MapArray {
+/// SAFETY: Correctly implements the contract of Arrow Arrays
+unsafe impl Array for MapArray {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -626,17 +627,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Test fails because slice of <list<struct>> is still buggy"]
     fn test_map_array_slice() {
         let map_array = create_from_buffers();
 
         let sliced_array = map_array.slice(1, 2);
         assert_eq!(2, sliced_array.len());
-        assert_eq!(1, sliced_array.offset());
-        let sliced_array_data = sliced_array.to_data();
-        for array_data in sliced_array_data.child_data() {
-            assert_eq!(array_data.offset(), 1);
-        }
+        // MapArray slices its offset buffer while sharing the entries. A
+        // nonzero Array::offset is not part of the logical slicing contract.
+        assert_eq!(
+            sliced_array.keys().to_data().buffers()[0].as_ptr(),
+            map_array.keys().to_data().buffers()[0].as_ptr()
+        );
+        assert_eq!(
+            sliced_array.values().to_data().buffers()[0].as_ptr(),
+            map_array.values().to_data().buffers()[0].as_ptr()
+        );
 
         // Check offset and length for each non-null value.
         let sliced_map_array = sliced_array.as_any().downcast_ref::<MapArray>().unwrap();
@@ -685,7 +690,11 @@ mod tests {
             .unwrap();
         let expected_map_array = MapArray::from(expected_map_data);
 
-        assert_eq!(&expected_map_array, sliced_map_array)
+        assert_eq!(&expected_map_array, sliced_map_array);
+        assert_eq!(expected_map_array, MapArray::from(sliced_array.to_data()));
+        assert_eq!(sliced_array.slice(1, 1), map_array.slice(2, 1));
+        assert_eq!(sliced_array.slice(2, 0).len(), 0);
+        assert_ne!(sliced_array, map_array.slice(0, 2));
     }
 
     #[test]

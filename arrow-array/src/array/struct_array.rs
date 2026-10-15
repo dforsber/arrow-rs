@@ -401,7 +401,8 @@ impl TryFrom<Vec<(&str, ArrayRef)>> for StructArray {
     }
 }
 
-impl Array for StructArray {
+/// SAFETY: Correctly implements the contract of Arrow Arrays
+unsafe impl Array for StructArray {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -642,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "assertion failed: (offset + length) <= self.len()")]
+    #[should_panic(expected = "assertion failed: end <= self.len()")]
     fn test_struct_array_from_data_with_offset_and_length_error() {
         let int_arr = Int32Array::from(vec![1, 2, 3, 4, 5]);
         let int_field = Field::new("x", DataType::Int32, false);
