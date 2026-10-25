@@ -2339,33 +2339,129 @@ async fn test_boolean() {
     .run();
 }
 
-// struct array
-// BUG
-// https://github.com/apache/datafusion/issues/10609
-// Note that: since I have not worked on struct array before, there may be a bug in the test code rather than the real bug in the code
-#[ignore]
-#[tokio::test]
-async fn test_struct() {
-    // This creates a parquet files of 1 column named "struct"
-    // The file is created by 1 record batch with 3 rows in the struct array
-    let reader = TestReader {
-        scenario: Scenario::StructArray,
-        row_per_group: 5,
-    }
-    .build()
-    .await;
+// A struct has several physical leaves, not one ordered Parquet column. Its
+// aggregate bounds must stay unknown rather than borrowing a child's bounds.
+#[test]
+fn test_struct_statistics_are_unknown_and_leaf_statistics_remain_exact() {
+    let values = struct_array(vec![
+        (Some(1), Some(6.0), Some(12.0)),
+        (Some(-999), Some(999.0), Some(999.0)), // masked by the parent null
+        (None, Some(8.5), Some(14.0)),
+        (Some(2), None, None),
+        (None, None, None), // valid parent, all-null leaves, short final group
+    ]);
+    let values = values
+        .as_any()
+        .downcast_ref::<arrow_array::StructArray>()
+        .unwrap();
+    let nested = arrow_array::StructArray::new(
+        values.fields().clone(),
+        values.columns().to_vec(),
+        Some(arrow_buffer::NullBuffer::from(vec![
+            true, false, true, true, true,
+        ])),
+    );
+    let nested_type = nested.data_type().clone();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("struct", nested_type.clone(), true),
+        // Same name as the first leaf: the scalar must map to its own column.
+        Field::new("int32_col", DataType::Int32, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(nested),
+            Arc::new(Int32Array::from(vec![
+                Some(91),
+                None,
+                Some(92),
+                Some(93),
+                None,
+            ])),
+        ],
+    )
+    .unwrap();
+    let reader = build_parquet_file(2, Some(EnabledStatistics::Page), None, vec![batch.clone()]);
+    let row_groups = reader.metadata().row_groups();
+    assert_eq!(
+        row_groups.iter().map(|g| g.num_rows()).collect::<Vec<_>>(),
+        [2, 2, 1]
+    );
+    let converter =
+        StatisticsConverter::try_new("struct", reader.schema(), reader.parquet_schema()).unwrap();
+    assert_eq!(converter.parquet_column_index(), None);
     Test {
         reader: &reader,
-        expected_min: Arc::new(struct_array(vec![(Some(1), Some(6.0), Some(12.0))])),
-        expected_max: Arc::new(struct_array(vec![(Some(2), Some(8.5), Some(14.0))])),
-        expected_null_counts: UInt64Array::from(vec![0]),
-        expected_row_counts: Some(UInt64Array::from(vec![3])),
-        expected_max_value_exact: BooleanArray::from(vec![true, true, true]),
-        expected_min_value_exact: BooleanArray::from(vec![true, true, true]),
+        expected_min: new_null_array(&nested_type, 3),
+        expected_max: new_null_array(&nested_type, 3),
+        expected_null_counts: UInt64Array::from(vec![None; 3]),
+        expected_row_counts: None,
+        expected_max_value_exact: BooleanArray::from(vec![None; 3]),
+        expected_min_value_exact: BooleanArray::from(vec![None; 3]),
         column_name: "struct",
         check: Check::RowGroup,
     }
     .run();
+    let scalar =
+        StatisticsConverter::try_new("int32_col", reader.schema(), reader.parquet_schema())
+            .unwrap();
+    assert_eq!(scalar.parquet_column_index(), Some(3));
+    Test {
+        reader: &reader,
+        expected_min: Arc::new(Int32Array::from(vec![Some(91), Some(92), None])),
+        expected_max: Arc::new(Int32Array::from(vec![Some(91), Some(93), None])),
+        expected_null_counts: UInt64Array::from(vec![1, 0, 1]),
+        expected_row_counts: Some(UInt64Array::from(vec![2, 2, 1])),
+        expected_max_value_exact: BooleanArray::from(vec![true, true, false]),
+        expected_min_value_exact: BooleanArray::from(vec![true, true, false]),
+        column_name: "int32_col",
+        check: Check::RowGroup,
+    }
+    .run();
+    let expected = [
+        (Some(1), Some(6.0), Some(12.0)),
+        (Some(2), Some(8.5), Some(14.0)),
+        (None, None, None),
+    ];
+    for (group, (int, float, double)) in row_groups.iter().zip(expected) {
+        assert_eq!(group.num_columns(), 4);
+        for (index, name) in ["int32_col", "float32_col", "float64_col"]
+            .iter()
+            .enumerate()
+        {
+            let column = group.column(index);
+            assert_eq!(
+                column.column_path().parts(),
+                &["struct".to_string(), name.to_string()]
+            );
+            let stats = column.statistics().unwrap();
+            assert_eq!(stats.null_count_opt(), Some(1));
+            match (index, stats) {
+                (0, Statistics::Int32(s)) => {
+                    assert_eq!(s.min_opt().copied(), int);
+                    assert_eq!(s.max_opt().copied(), int);
+                }
+                (1, Statistics::Float(s)) => {
+                    assert_eq!(s.min_opt().copied(), float);
+                    assert_eq!(s.max_opt().copied(), float);
+                }
+                (2, Statistics::Double(s)) => {
+                    assert_eq!(s.min_opt().copied(), double);
+                    assert_eq!(s.max_opt().copied(), double);
+                }
+                _ => panic!("wrong physical leaf type: {stats:?}"),
+            }
+        }
+    }
+    let actual = reader
+        .build()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        arrow::compute::concat_batches(&schema, &actual).unwrap(),
+        batch
+    );
 }
 
 // UTF8
