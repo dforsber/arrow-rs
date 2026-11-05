@@ -91,7 +91,7 @@ arrow-array = { version = "57.3.1", path = "./arrow-array" }
 arrow-buffer = { version = "57.3.1", path = "./arrow-buffer" }
 arrow-cast = { version = "57.3.1", path = "./arrow-cast" }
 arrow-csv = { version = "57.3.1", path = "./arrow-csv" }
-arrow-data = { version = "57.3.1", path = "./arrow-data" }
+arrow-data = { version = "57.3.2", path = "./arrow-data" }
 arrow-ipc = { version = "57.3.1", path = "./arrow-ipc" }
 arrow-json = { version = "57.3.1", path = "./arrow-json" }
 arrow-ord = { version = "57.3.1", path = "./arrow-ord" }

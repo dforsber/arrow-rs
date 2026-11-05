@@ -17,7 +17,7 @@
 
 [package]
 name = "arrow-data"
-version = { workspace = true }
+version = "57.3.2"
 description = "Array data abstractions for Apache Arrow"
 homepage = { workspace = true }
 repository = { workspace = true }
